@@ -156,6 +156,10 @@ function doPost(e) {
       case 'add_to_weekly':
         result = handleAddToWeekly(taskId);
         break;
+      case 'schedule_focus_time':
+      case 'carve_personal_time':
+        result = handleScheduleFocusTime(taskId);
+        break;
       case 'mark_handled':
         result = handleMarkHandled(taskId);
         break;
@@ -541,6 +545,12 @@ function handleAddToWeekly(taskId) {
   updateTask(taskId, { Meeting_Action: MEETING_ACTION.WEEKLY });
   addToWeeklyAgenda(taskId);
   return { success: true, message: 'Added to weekly agenda' };
+}
+
+function handleScheduleFocusTime(taskId) {
+  updateTask(taskId, { Meeting_Action: MEETING_ACTION.SELF });
+  scheduleFocusTime(taskId);
+  return { success: true, message: 'Focus time scheduled' };
 }
 
 function handleMarkHandled(taskId) {

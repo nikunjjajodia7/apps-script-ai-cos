@@ -96,15 +96,15 @@ function processVoiceNote(fileId) {
     const taskId = createTaskFromVoice(parsedData);
     Logger.log(`Task created with ID: ${taskId}`);
     
-    // Send confirmation to Boss
-    Logger.log('Sending confirmation email to Boss...');
-    const summary = formatTaskSummary(parsedData, taskId);
-    try {
-      sendBossConfirmation(taskId, summary);
-      Logger.log('Confirmation email sent');
-    } catch (e) {
-      Logger.log('Warning: Could not send confirmation email: ' + e.toString());
-    }
+    // Boss confirmation email disabled - no longer sending emails when tasks are created
+    // Logger.log('Sending confirmation email to Boss...');
+    // const summary = formatTaskSummary(parsedData, taskId);
+    // try {
+    //   sendBossConfirmation(taskId, summary);
+    //   Logger.log('Confirmation email sent');
+    // } catch (e) {
+    //   Logger.log('Warning: Could not send confirmation email: ' + e.toString());
+    // }
     
     Logger.log(`=== Voice note processed successfully. Task ID: ${taskId} ===`);
     
@@ -152,13 +152,19 @@ function createTaskFromVoice(parsedData) {
       Status: status,
       Assignee_Email: assigneeEmail || '',
       Due_Date: parsedData.due_date || '',
-      Project_Tag: '', // Could be inferred in future
+      Project_Tag: parsedData.project_tag || '',
       AI_Confidence: parsedData.confidence || 0.5,
       Tone_Detected: parsedData.tone || 'normal',
       Context_Hidden: parsedData.context || '',
       Created_By: 'Voice',
-      Priority: parsedData.tone === 'urgent' ? 'High' : 'Medium',
+      Priority: parsedData.priority || (parsedData.tone === 'urgent' ? 'High' : 'Medium'),
     };
+    
+    // Add due time to context if specified
+    if (parsedData.due_time) {
+      taskData.Context_Hidden = (taskData.Context_Hidden || '') + 
+        (taskData.Context_Hidden ? '\n' : '') + `Due time: ${parsedData.due_time}`;
+    }
     
     // Add ambiguities to context if any
     if (parsedData.ambiguities && parsedData.ambiguities.length > 0) {

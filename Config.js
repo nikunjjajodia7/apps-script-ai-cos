@@ -174,6 +174,15 @@ const CONFIG = {
   // Model names
   GEMINI_FLASH_MODEL: 'gemini-2.0-flash-exp',
   GEMINI_PRO_MODEL: 'gemini-2.0-pro-exp',
+  
+  // Speech-to-Text API
+  SPEECH_TO_TEXT_ENABLED: () => getConfigValue('SPEECH_TO_TEXT_ENABLED', 'true') === 'true',
+  SPEECH_TO_TEXT_MODEL: () => getConfigValue('SPEECH_TO_TEXT_MODEL', 'latest_long'),
+  SPEECH_TO_TEXT_LANGUAGE: () => getConfigValue('SPEECH_TO_TEXT_LANGUAGE', 'en-US'),
+  SPEECH_TO_TEXT_ALTERNATIVE_LANGUAGES: () => {
+    const altLangs = getConfigValue('SPEECH_TO_TEXT_ALTERNATIVE_LANGUAGES', '');
+    return altLangs ? altLangs.split(',').map(lang => lang.trim()).filter(lang => lang) : [];
+  },
 };
 
 // Sheet names

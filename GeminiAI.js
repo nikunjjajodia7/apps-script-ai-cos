@@ -79,10 +79,297 @@ function callGeminiPro(prompt, options = {}) {
 }
 
 /**
+ * Transcribe audio file with speaker diarization using Google Cloud Speech-to-Text API
+ * Returns transcript with speaker labels
+ */
+function transcribeAudioWithDiarization(audioFileId) {
+  try {
+    Logger.log('Starting audio transcription with speaker diarization...');
+    const file = DriveApp.getFileById(audioFileId);
+    const fileName = file.getName();
+    Logger.log(`File: ${fileName}`);
+    
+    const audioBlob = file.getBlob();
+    const mimeType = audioBlob.getContentType();
+    Logger.log(`MIME type: ${mimeType}`);
+    
+    // Check file size (Speech-to-Text has limits)
+    const fileSize = audioBlob.getBytes().length;
+    Logger.log(`File size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
+    
+    if (fileSize > 60 * 1024 * 1024) { // 60MB limit for Speech-to-Text
+      throw new Error('Audio file too large (max 60MB for Speech-to-Text API)');
+    }
+    
+    const base64Audio = Utilities.base64Encode(audioBlob.getBytes());
+    Logger.log('Audio encoded to base64');
+    
+    const projectId = CONFIG.VERTEX_AI_PROJECT_ID();
+    
+    if (!projectId) {
+      throw new Error('VERTEX_AI_PROJECT_ID not configured in Config sheet');
+    }
+    
+    Logger.log(`Project ID: ${projectId}`);
+    
+    // Speech-to-Text API endpoint
+    const url = `https://speech.googleapis.com/v1/projects/${projectId}/locations/global:recognize`;
+    Logger.log(`API URL: ${url}`);
+    
+    // Map MIME types to Speech-to-Text encoding
+    let encoding = 'LINEAR16';
+    let sampleRateHertz = 16000;
+    
+    if (mimeType.includes('webm') || mimeType.includes('opus')) {
+      encoding = 'WEBM_OPUS';
+      sampleRateHertz = 48000;
+    } else if (mimeType.includes('mp3')) {
+      encoding = 'MP3';
+      sampleRateHertz = 44100;
+    } else if (mimeType.includes('m4a') || mimeType.includes('aac')) {
+      encoding = 'MPEG4_AAC';
+      sampleRateHertz = 44100;
+    } else if (mimeType.includes('wav')) {
+      encoding = 'LINEAR16';
+      sampleRateHertz = 16000;
+    }
+    
+    // Build config object
+    const config = {
+      encoding: encoding,
+      sampleRateHertz: sampleRateHertz,
+      languageCode: CONFIG.SPEECH_TO_TEXT_LANGUAGE(),
+      model: CONFIG.SPEECH_TO_TEXT_MODEL(),
+      enableSpeakerDiarization: true,
+      diarizationSpeakerCount: 10, // Maximum number of speakers to detect
+      enableAutomaticPunctuation: true,
+      enableWordTimeOffsets: true,
+    };
+    
+    // Add alternative language codes for multilingual support (e.g., Hinglish)
+    const alternativeLanguages = CONFIG.SPEECH_TO_TEXT_ALTERNATIVE_LANGUAGES();
+    if (alternativeLanguages && alternativeLanguages.length > 0) {
+      config.alternativeLanguageCodes = alternativeLanguages;
+      Logger.log(`Multilingual mode enabled. Primary: ${config.languageCode}, Alternatives: ${alternativeLanguages.join(', ')}`);
+    }
+    
+    const payload = {
+      config: config,
+      audio: {
+        content: base64Audio
+      }
+    };
+    
+    Logger.log('Sending request to Speech-to-Text API...');
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      headers: {
+        'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+        'Content-Type': 'application/json',
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+    
+    const responseCode = response.getResponseCode();
+    Logger.log(`Response code: ${responseCode}`);
+    
+    if (responseCode !== 200) {
+      const errorText = response.getContentText();
+      Logger.log(`Error response: ${errorText}`);
+      logError(ERROR_TYPE.API_ERROR, 'transcribeAudioWithDiarization', `Speech-to-Text API error (${responseCode}): ${errorText}`);
+      throw new Error(`Speech-to-Text API error (${responseCode}): ${errorText}`);
+    }
+    
+    const result = JSON.parse(response.getContentText());
+    Logger.log('Response parsed successfully');
+    
+    if (!result.results || result.results.length === 0) {
+      Logger.log('No transcription results returned');
+      throw new Error('No transcription results returned from Speech-to-Text API');
+    }
+    
+    // Format transcript with speaker labels
+    let transcriptWithSpeakers = '';
+    const speakerSegments = [];
+    
+    // Extract all words with speaker tags
+    result.results.forEach((result, resultIndex) => {
+      if (result.alternatives && result.alternatives[0] && result.alternatives[0].words) {
+        result.alternatives[0].words.forEach(word => {
+          if (word.speakerTag !== undefined) {
+            speakerSegments.push({
+              speaker: word.speakerTag,
+              word: word.word,
+              startTime: word.startTime,
+              endTime: word.endTime
+            });
+          }
+        });
+      }
+    });
+    
+    // Group words by speaker and format
+    if (speakerSegments.length > 0) {
+      let currentSpeaker = speakerSegments[0].speaker;
+      let currentSegment = `[Speaker ${currentSpeaker}]: ${speakerSegments[0].word}`;
+      
+      for (let i = 1; i < speakerSegments.length; i++) {
+        const segment = speakerSegments[i];
+        if (segment.speaker === currentSpeaker) {
+          currentSegment += ' ' + segment.word;
+        } else {
+          transcriptWithSpeakers += currentSegment + '\n\n';
+          currentSpeaker = segment.speaker;
+          currentSegment = `[Speaker ${currentSpeaker}]: ${segment.word}`;
+        }
+      }
+      transcriptWithSpeakers += currentSegment;
+    } else {
+      // Fallback: use alternative transcript without speaker labels
+      result.results.forEach((result, index) => {
+        if (result.alternatives && result.alternatives[0] && result.alternatives[0].transcript) {
+          transcriptWithSpeakers += result.alternatives[0].transcript;
+          if (index < result.results.length - 1) {
+            transcriptWithSpeakers += ' ';
+          }
+        }
+      });
+    }
+    
+    Logger.log(`Transcript with speaker diarization received (${transcriptWithSpeakers.length} characters)`);
+    Logger.log(`Detected ${new Set(speakerSegments.map(s => s.speaker)).size} speakers`);
+    
+    return transcriptWithSpeakers;
+    
+  } catch (error) {
+    Logger.log('ERROR in transcribeAudioWithDiarization: ' + error.toString());
+    Logger.log('Stack: ' + (error.stack || 'No stack trace'));
+    logError(ERROR_TYPE.API_ERROR, 'transcribeAudioWithDiarization', error.toString(), null, error.stack);
+    throw error;
+  }
+}
+
+/**
  * Transcribe audio file using Gemini (multimodal)
  * Note: This requires the audio file to be accessible
+ * @deprecated Use transcribeAudioWithDiarization() for speaker identification
+ * Falls back to this method if Speech-to-Text is disabled or fails
  */
 function transcribeAudio(audioFileId) {
+  // Check if Speech-to-Text is enabled, use it if available
+  if (CONFIG.SPEECH_TO_TEXT_ENABLED()) {
+    try {
+      Logger.log('Speech-to-Text enabled, attempting diarization...');
+      return transcribeAudioWithDiarization(audioFileId);
+    } catch (error) {
+      Logger.log('Speech-to-Text failed, falling back to Gemini: ' + error.toString());
+      // Continue to Gemini fallback
+    }
+  }
+  
+  try {
+    Logger.log('Starting audio transcription with Gemini...');
+    const file = DriveApp.getFileById(audioFileId);
+    const fileName = file.getName();
+    Logger.log(`File: ${fileName}`);
+    
+    const audioBlob = file.getBlob();
+    const mimeType = audioBlob.getContentType();
+    Logger.log(`MIME type: ${mimeType}`);
+    
+    // Check file size (Vertex AI has limits)
+    const fileSize = audioBlob.getBytes().length;
+    Logger.log(`File size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
+    
+    if (fileSize > 20 * 1024 * 1024) { // 20MB limit
+      throw new Error('Audio file too large (max 20MB)');
+    }
+    
+    const base64Audio = Utilities.base64Encode(audioBlob.getBytes());
+    Logger.log('Audio encoded to base64');
+    
+    const projectId = CONFIG.VERTEX_AI_PROJECT_ID();
+    const location = CONFIG.VERTEX_AI_LOCATION();
+    
+    if (!projectId) {
+      throw new Error('VERTEX_AI_PROJECT_ID not configured in Config sheet');
+    }
+    
+    Logger.log(`Project ID: ${projectId}, Location: ${location}`);
+    
+    const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${CONFIG.GEMINI_FLASH_MODEL}:generateContent`;
+    Logger.log(`API URL: ${url}`);
+    
+    const payload = {
+      contents: [{
+        role: 'user',
+        parts: [
+          {
+            text: `Transcribe this audio file accurately. Follow these guidelines:
+- Preserve all spoken words exactly as spoken
+- Include proper punctuation (periods, commas, question marks)
+- Preserve numbers, dates, and times in their spoken form
+- Keep names, email addresses, and technical terms exactly as spoken
+- Do not add commentary, explanations, or corrections
+- If audio quality is poor, transcribe what you can hear and indicate unclear parts with [unclear]
+- Return only the transcribed text, nothing else`
+          },
+          {
+            inlineData: {
+              mimeType: mimeType,
+              data: base64Audio
+            }
+          }
+        ]
+      }],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 4096,
+      }
+    };
+    
+    Logger.log('Sending request to Vertex AI...');
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      headers: {
+        'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+        'Content-Type': 'application/json',
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+    
+    const responseCode = response.getResponseCode();
+    Logger.log(`Response code: ${responseCode}`);
+    
+    if (responseCode !== 200) {
+      const errorText = response.getContentText();
+      Logger.log(`Error response: ${errorText}`);
+      logError(ERROR_TYPE.API_ERROR, 'transcribeAudio', `Audio transcription error (${responseCode}): ${errorText}`);
+      throw new Error(`Audio transcription error (${responseCode}): ${errorText}`);
+    }
+    
+    const result = JSON.parse(response.getContentText());
+    Logger.log('Response parsed successfully');
+    
+    if (!result.candidates || !result.candidates[0] || !result.candidates[0].content || !result.candidates[0].content.parts || !result.candidates[0].content.parts[0]) {
+      Logger.log('Unexpected response structure: ' + JSON.stringify(result));
+      throw new Error('Unexpected response structure from Vertex AI');
+    }
+    
+    const transcript = result.candidates[0].content.parts[0].text;
+    Logger.log(`Transcript received (${transcript.length} characters)`);
+    
+    return transcript;
+    
+  } catch (error) {
+    Logger.log('ERROR in transcribeAudio: ' + error.toString());
+    Logger.log('Stack: ' + (error.stack || 'No stack trace'));
+    logError(ERROR_TYPE.API_ERROR, 'transcribeAudio', error.toString(), null, error.stack);
+    throw error;
+  }
+}
   try {
     Logger.log('Starting audio transcription...');
     const file = DriveApp.getFileById(audioFileId);
@@ -121,7 +408,14 @@ function transcribeAudio(audioFileId) {
         role: 'user',
         parts: [
           {
-            text: 'Transcribe this audio file. Return only the spoken text, no additional commentary.'
+            text: `Transcribe this audio file accurately. Follow these guidelines:
+- Preserve all spoken words exactly as spoken
+- Include proper punctuation (periods, commas, question marks)
+- Preserve numbers, dates, and times in their spoken form
+- Keep names, email addresses, and technical terms exactly as spoken
+- Do not add commentary, explanations, or corrections
+- If audio quality is poor, transcribe what you can hear and indicate unclear parts with [unclear]
+- Return only the transcribed text, nothing else`
           },
           {
             inlineData: {
@@ -183,26 +477,108 @@ function transcribeAudio(audioFileId) {
  * Parse voice command and extract structured data
  */
 function parseVoiceCommand(transcript) {
-  const prompt = `You are a task management assistant. Parse the following voice command and extract structured information.
+  const prompt = `You are an expert task management assistant. Parse the following voice command transcript and extract all relevant information with high accuracy.
 
 Voice command transcript: "${transcript}"
 
-Extract the following information and return ONLY a valid JSON object (no markdown, no code blocks):
+Extract the following information and return ONLY a valid JSON object (no markdown, no code blocks, no explanations):
+
 {
-  "task_name": "concise task title",
-  "assignee_email": "email if mentioned, or null",
-  "assignee_name": "name if mentioned, or null",
+  "task_name": "concise, clear task title (3-8 words, action-oriented)",
+  "assignee_email": "full email address if mentioned explicitly, or null",
+  "assignee_name": "full name if mentioned (first and last name if available), or null",
   "due_date": "date in YYYY-MM-DD format if mentioned, or null",
-  "due_date_text": "original text about due date, or null",
-  "context": "additional context or details",
-  "tone": "urgent, normal, or calm",
-  "confidence": 0.0-1.0 confidence score,
-  "ambiguities": ["list of any ambiguous elements"]
+  "due_date_text": "exact original text about due date/timing (e.g., 'next Monday', 'by Friday', 'in 2 days'), or null",
+  "due_time": "time if mentioned (HH:MM format in 24-hour), or null",
+  "priority": "High, Medium, or Low based on urgency indicators (urgent, ASAP, important = High; normal = Medium; low priority, whenever = Low), or null if not mentioned",
+  "project_tag": "project name or tag if mentioned, or null",
+  "context": "all additional details, background, requirements, constraints, or important notes mentioned",
+  "tone": "urgent, normal, or calm based on speaker's tone and urgency words",
+  "confidence": 0.0-1.0 confidence score (be accurate: 0.9+ if very clear, 0.7-0.9 if mostly clear, 0.5-0.7 if some ambiguity, <0.5 if unclear)",
+  "ambiguities": ["specific list of what is unclear or ambiguous (e.g., 'assignee name unclear', 'due date format ambiguous')"]
 }
 
-If the assignee is mentioned by name but not email, try to infer the email from common patterns, or set to null.
-If due date is relative (e.g., "next Monday"), calculate the actual date.
-Be conservative with confidence scores - if anything is unclear, lower the confidence.`;
+EXTRACTION GUIDELINES:
+
+1. Task Name:
+   - Extract the core action/objective (e.g., "Review Q4 report" not "I need to review the Q4 report")
+   - Remove filler words like "please", "I want", "can you"
+   - Keep it concise but descriptive
+
+2. Assignee:
+   - Look for: "assign to [name]", "give to [name]", "[name] should", "[name] will", "send to [name]"
+   - Extract full name if possible (first + last)
+   - If only first name mentioned, use just first name
+   - Email: only if explicitly stated (e.g., "john@company.com")
+
+3. Due Date:
+   - Relative dates: "today" = today's date, "tomorrow" = tomorrow, "next Monday" = next Monday, "Friday" = this or next Friday
+   - Absolute dates: "January 15th", "15th of January", "01/15/2024" → convert to YYYY-MM-DD
+   - Preserve original text in due_date_text for reference
+   - If time mentioned (e.g., "by 3 PM", "before noon"), extract in due_time field
+
+4. Priority:
+   - High: urgent, ASAP, immediately, critical, important, high priority, rush
+   - Medium: normal, standard, regular (default if not mentioned)
+   - Low: low priority, whenever, no rush, eventually
+
+5. Project/Tag:
+   - Look for: "for [project]", "related to [project]", "under [project]", project names mentioned
+
+6. Context:
+   - Include: why the task exists, background info, specific requirements, constraints, dependencies
+   - Include: location, tools needed, people involved, budget constraints, etc.
+   - Be comprehensive but concise
+
+7. Tone:
+   - Urgent: rushed speech, urgent words, time pressure mentioned
+   - Normal: standard conversational tone
+   - Calm: relaxed, no rush indicated
+
+8. Confidence:
+   - 0.9-1.0: All key info clear (task, assignee, date all clear)
+   - 0.7-0.9: Most info clear, minor ambiguities
+   - 0.5-0.7: Some key info missing or unclear
+   - <0.5: Major ambiguities or unclear command
+
+9. Ambiguities:
+   - List specific unclear elements: "assignee name unclear", "due date ambiguous", "task scope vague"
+
+EXAMPLES:
+
+Input: "Please assign John Smith to review the quarterly financial report by next Friday, it's urgent"
+Output: {
+  "task_name": "Review quarterly financial report",
+  "assignee_email": null,
+  "assignee_name": "John Smith",
+  "due_date": "2024-01-19",
+  "due_date_text": "next Friday",
+  "due_time": null,
+  "priority": "High",
+  "project_tag": null,
+  "context": "Quarterly financial report needs review",
+  "tone": "urgent",
+  "confidence": 0.95,
+  "ambiguities": []
+}
+
+Input: "I need someone to update the website homepage, maybe by end of week"
+Output: {
+  "task_name": "Update website homepage",
+  "assignee_email": null,
+  "assignee_name": null,
+  "due_date": "2024-01-19",
+  "due_date_text": "end of week",
+  "due_time": null,
+  "priority": "Medium",
+  "project_tag": null,
+  "context": "Website homepage needs updating",
+  "tone": "normal",
+  "confidence": 0.75,
+  "ambiguities": ["assignee not specified"]
+}
+
+Now parse this voice command: "${transcript}"`;
 
   try {
     const response = callGeminiFlash(prompt);

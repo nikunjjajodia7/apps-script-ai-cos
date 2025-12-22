@@ -61,7 +61,7 @@ function processMeetingAudio(fileId) {
     Logger.log(`Meeting data extracted: ${JSON.stringify(meetingData)}`);
     
     // Create meeting summary document (Pipeline A)
-    const summaryDoc = createMeetingSummaryDoc(meetingData, fileName);
+    const summaryDoc = createMeetingSummaryDoc(meetingData, fileName, transcript);
     
     // Add to Knowledge_Lake
     addToKnowledgeLake(summaryDoc.getUrl(), meetingData.executive_summary, fileName);
@@ -81,22 +81,102 @@ function processMeetingAudio(fileId) {
 }
 
 /**
+ * Get or create the MoM subfolder within Meeting_lake folder
+ */
+function getOrCreateMoMFolder() {
+  try {
+    const meetingLakeFolderId = CONFIG.MEETING_LAKE_FOLDER_ID();
+    if (!meetingLakeFolderId) {
+      throw new Error('MEETING_LAKE_FOLDER_ID not configured');
+    }
+    
+    const meetingLakeFolder = DriveApp.getFolderById(meetingLakeFolderId);
+    const folders = meetingLakeFolder.getFolders();
+    
+    // Check if MoM folder already exists
+    while (folders.hasNext()) {
+      const folder = folders.next();
+      if (folder.getName() === 'MoM') {
+        Logger.log('MoM folder found: ' + folder.getId());
+        return folder;
+      }
+    }
+    
+    // Create MoM folder if it doesn't exist
+    const momFolder = meetingLakeFolder.createFolder('MoM');
+    Logger.log('Created MoM folder: ' + momFolder.getId());
+    return momFolder;
+    
+  } catch (error) {
+    logError(ERROR_TYPE.DATA_ERROR, 'getOrCreateMoMFolder', error.toString(), null, error.stack);
+    throw error;
+  }
+}
+
+/**
  * Create meeting summary document
  */
-function createMeetingSummaryDoc(meetingData, audioFileName) {
+function createMeetingSummaryDoc(meetingData, audioFileName, transcript) {
   try {
-    const doc = DocumentApp.create(`Meeting Summary - ${audioFileName} - ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd')}`);
+    const doc = DocumentApp.create(`MoM - ${audioFileName} - ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd')}`);
     const body = doc.getBody();
     
-    // Title
-    body.appendParagraph('Meeting Summary').setHeading(DocumentApp.ParagraphHeading.HEADING1);
+    // Title & Metadata
+    body.appendParagraph('Minutes of Meeting (MoM)').setHeading(DocumentApp.ParagraphHeading.HEADING1);
     body.appendParagraph(`Date: ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMMM d, yyyy')}`);
     body.appendParagraph(`Source: ${audioFileName}`);
     body.appendParagraph('');
     
+    // Full Transcript Section
+    if (transcript) {
+      body.appendParagraph('Full Transcript').setHeading(DocumentApp.ParagraphHeading.HEADING2);
+      
+      // Check if transcript has speaker labels (from diarization)
+      const hasSpeakerLabels = transcript.includes('[Speaker');
+      if (hasSpeakerLabels) {
+        body.appendParagraph('Complete verbatim transcription with speaker identification:');
+        body.appendParagraph('');
+        // Split transcript by speaker segments (double newlines separate speakers)
+        const transcriptParagraphs = transcript.split(/\n\n+/);
+        transcriptParagraphs.forEach(para => {
+          if (para.trim()) {
+            // Format speaker labels with bold
+            const speakerMatch = para.match(/^(\[Speaker \d+\]:\s*)(.*)/);
+            if (speakerMatch) {
+              const speakerLabel = speakerMatch[1];
+              const speakerText = speakerMatch[2];
+              const paraElement = body.appendParagraph(speakerLabel + speakerText);
+              // Make speaker label bold
+              const startOffset = 0;
+              const endOffset = speakerLabel.length;
+              paraElement.editAsText().setBold(startOffset, endOffset - 1, true);
+            } else {
+              body.appendParagraph(para.trim());
+            }
+          }
+        });
+      } else {
+        body.appendParagraph('Complete verbatim transcription of the meeting:');
+        body.appendParagraph('');
+        // Split transcript into paragraphs for better readability
+        const transcriptParagraphs = transcript.split(/\n\n+/);
+        transcriptParagraphs.forEach(para => {
+          if (para.trim()) {
+            body.appendParagraph(para.trim());
+          }
+        });
+      }
+      body.appendParagraph('');
+    }
+    
     // Executive Summary
     body.appendParagraph('Executive Summary').setHeading(DocumentApp.ParagraphHeading.HEADING2);
     body.appendParagraph(meetingData.executive_summary || 'No summary available.');
+    body.appendParagraph('');
+    
+    // Detailed MoM (using executive summary as detailed notes)
+    body.appendParagraph('Detailed Minutes of Meeting').setHeading(DocumentApp.ParagraphHeading.HEADING2);
+    body.appendParagraph(meetingData.executive_summary || 'No detailed notes available.');
     body.appendParagraph('');
     
     // Decisions Made
@@ -112,10 +192,14 @@ function createMeetingSummaryDoc(meetingData, audioFileName) {
     // Action Items
     if (meetingData.action_items && meetingData.action_items.length > 0) {
       body.appendParagraph('Action Items').setHeading(DocumentApp.ParagraphHeading.HEADING2);
-      meetingData.action_items.forEach(item => {
+      body.appendParagraph('The following action items have been extracted and will be created as tasks in Tasks_DB:');
+      body.appendParagraph('');
+      meetingData.action_items.forEach((item, index) => {
         const itemText = `${item.description} - Owner: ${item.owner || 'TBD'} - Deadline: ${item.deadline || 'TBD'}`;
         body.appendListItem(itemText);
       });
+      body.appendParagraph('');
+      body.appendParagraph('Note: Action items are automatically created as tasks in the Tasks_DB sheet.');
       body.appendParagraph('');
     }
     
@@ -123,10 +207,23 @@ function createMeetingSummaryDoc(meetingData, audioFileName) {
     if (meetingData.risks_sentiment) {
       body.appendParagraph('Risks & Sentiment').setHeading(DocumentApp.ParagraphHeading.HEADING2);
       body.appendParagraph(meetingData.risks_sentiment);
+      body.appendParagraph('');
     }
     
-    // Save and return
+    // Save document
     doc.saveAndClose();
+    
+    // Move document to MoM subfolder
+    try {
+      const momFolder = getOrCreateMoMFolder();
+      const docFile = DriveApp.getFileById(doc.getId());
+      docFile.moveTo(momFolder);
+      Logger.log(`MoM document moved to MoM subfolder: ${momFolder.getName()}`);
+    } catch (folderError) {
+      Logger.log(`Warning: Could not move document to MoM folder: ${folderError.toString()}`);
+      // Continue even if folder move fails
+    }
+    
     return doc;
     
   } catch (error) {
