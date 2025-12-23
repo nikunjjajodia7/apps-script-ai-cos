@@ -40,12 +40,25 @@ function onVoiceFileAdded(e) {
  * Main function to process a voice note
  */
 function processVoiceNote(fileId) {
+  let file = null;
+  let fileName = '';
+  let voiceInboxFolderId = null;
+  
   try {
     Logger.log(`=== Processing voice note: ${fileId} ===`);
     
-    const file = DriveApp.getFileById(fileId);
-    const fileName = file.getName();
+    file = DriveApp.getFileById(fileId);
+    fileName = file.getName();
     Logger.log(`File name: ${fileName}`);
+    
+    // Check if file has already been processed (marked with prefix)
+    if (fileName.startsWith('[PROCESSED]') || fileName.startsWith('[UNCLEAR]')) {
+      Logger.log(`File ${fileName} has already been processed, skipping`);
+      return;
+    }
+    
+    // Get Voice_Inbox folder ID for later cleanup
+    voiceInboxFolderId = CONFIG.VOICE_INBOX_FOLDER_ID();
     
     // Check file type (should be audio)
     const mimeType = file.getMimeType();
@@ -59,6 +72,7 @@ function processVoiceNote(fileId) {
     
     // Transcribe audio using Gemini
     let transcript;
+    let transcriptionFailed = false;
     try {
       Logger.log('Starting audio transcription with Gemini...');
       transcript = transcribeAudio(fileId);
@@ -66,6 +80,7 @@ function processVoiceNote(fileId) {
     } catch (error) {
       Logger.log('ERROR: Transcription failed: ' + error.toString());
       Logger.log('Creating task with low confidence...');
+      transcriptionFailed = true;
       try {
         logError(ERROR_TYPE.API_ERROR, 'processVoiceNote', `Transcription failed: ${error.toString()}`, null, error.stack);
       } catch (e) {
@@ -83,6 +98,9 @@ function processVoiceNote(fileId) {
         ambiguities: ['Transcription failed']
       });
       Logger.log('Created task with low confidence. Task ID: ' + taskId);
+      
+      // Mark file as unclear so it won't be processed again
+      markFileAsUnclear(file, fileName);
       return;
     }
     
@@ -96,15 +114,33 @@ function processVoiceNote(fileId) {
     const taskId = createTaskFromVoice(parsedData);
     Logger.log(`Task created with ID: ${taskId}`);
     
-    // Boss confirmation email disabled - no longer sending emails when tasks are created
-    // Logger.log('Sending confirmation email to Boss...');
-    // const summary = formatTaskSummary(parsedData, taskId);
-    // try {
-    //   sendBossConfirmation(taskId, summary);
-    //   Logger.log('Confirmation email sent');
-    // } catch (e) {
-    //   Logger.log('Warning: Could not send confirmation email: ' + e.toString());
-    // }
+    // Check confidence level to determine file handling
+    const confidence = parsedData.confidence || 0.5;
+    const confidenceThreshold = CONFIG.AI_CONFIDENCE_THRESHOLD();
+    const hasAmbiguities = parsedData.ambiguities && parsedData.ambiguities.length > 0;
+    const isClear = confidence >= confidenceThreshold && !hasAmbiguities;
+    
+    if (isClear) {
+      // Voice was clear - delete the file from Voice_Inbox
+      Logger.log(`Voice note was clear (confidence: ${confidence}). Deleting file from Voice_Inbox...`);
+      try {
+        file.setTrashed(true);
+        Logger.log(`File ${fileName} deleted successfully`);
+      } catch (deleteError) {
+        Logger.log(`Warning: Could not delete file: ${deleteError.toString()}`);
+        // Fallback: rename to mark as processed
+        try {
+          file.setName(`[PROCESSED] ${fileName}`);
+          Logger.log(`File renamed to mark as processed`);
+        } catch (renameError) {
+          Logger.log(`Warning: Could not rename file: ${renameError.toString()}`);
+        }
+      }
+    } else {
+      // Voice was unclear - mark file so it won't be processed again
+      Logger.log(`Voice note was unclear (confidence: ${confidence}, ambiguities: ${hasAmbiguities}). Marking file to prevent reprocessing...`);
+      markFileAsUnclear(file, fileName);
+    }
     
     Logger.log(`=== Voice note processed successfully. Task ID: ${taskId} ===`);
     
@@ -120,6 +156,27 @@ function processVoiceNote(fileId) {
 }
 
 /**
+ * Mark file as unclear so it won't be processed again
+ */
+function markFileAsUnclear(file, originalFileName) {
+  try {
+    if (!file) return;
+    
+    // Check if already marked
+    if (originalFileName.startsWith('[UNCLEAR]')) {
+      return;
+    }
+    
+    // Rename file to mark it as unclear
+    const newName = `[UNCLEAR] ${originalFileName}`;
+    file.setName(newName);
+    Logger.log(`File marked as unclear: ${newName}`);
+  } catch (error) {
+    Logger.log(`Warning: Could not mark file as unclear: ${error.toString()}`);
+  }
+}
+
+/**
  * Create task from parsed voice command data
  */
 function createTaskFromVoice(parsedData) {
@@ -128,13 +185,29 @@ function createTaskFromVoice(parsedData) {
     let assigneeEmail = parsedData.assignee_email;
     
     if (!assigneeEmail && parsedData.assignee_name) {
-      // Try to find staff by name
-      const staff = getSheetData(SHEETS.STAFF_DB);
-      const matchedStaff = staff.find(s => 
-        s.Name && s.Name.toLowerCase().includes(parsedData.assignee_name.toLowerCase())
-      );
-      if (matchedStaff) {
-        assigneeEmail = matchedStaff.Email;
+      // Try to find staff by name (improved matching)
+      assigneeEmail = findStaffEmailByName(parsedData.assignee_name);
+      if (assigneeEmail) {
+        Logger.log(`Matched name "${parsedData.assignee_name}" to email: ${assigneeEmail}`);
+      }
+    }
+    
+    // Resolve project tag if project name was provided
+    let projectTag = parsedData.project_tag;
+    
+    if (!projectTag) {
+      // Try to find project by name in task name or context
+      const searchText = `${parsedData.task_name || ''} ${parsedData.context || ''}`.toLowerCase();
+      projectTag = findProjectTagByName(searchText);
+      if (projectTag) {
+        Logger.log(`Matched project from context to tag: ${projectTag}`);
+      }
+    } else {
+      // If project_tag was provided, verify it exists in PROJECTS_DB
+      const project = getProject(projectTag);
+      if (!project) {
+        Logger.log(`Project tag "${projectTag}" not found in PROJECTS_DB, trying to match by name...`);
+        projectTag = findProjectTagByName(projectTag);
       }
     }
     
@@ -152,7 +225,7 @@ function createTaskFromVoice(parsedData) {
       Status: status,
       Assignee_Email: assigneeEmail || '',
       Due_Date: parsedData.due_date || '',
-      Project_Tag: parsedData.project_tag || '',
+      Project_Tag: projectTag || '',
       AI_Confidence: parsedData.confidence || 0.5,
       Tone_Detected: parsedData.tone || 'normal',
       Context_Hidden: parsedData.context || '',

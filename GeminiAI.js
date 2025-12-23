@@ -586,37 +586,98 @@ Return ONLY the email body text (no subject line, no signature - those will be a
  * Classify email reply type
  */
 function classifyReplyType(replyContent) {
-  const prompt = `Analyze this email reply and classify it into one of these categories:
-1. ACCEPTANCE - The assignee accepts the task and deadline
-2. DATE_CHANGE - The assignee requests a different due date
-3. SCOPE_QUESTION - The assignee has questions about scope or needs clarification
-4. ROLE_REJECTION - The assignee says this is not their responsibility
-5. OTHER - Something else
+  const prompt = `You are an expert at analyzing email replies about task assignments. Classify this email reply into one of these categories:
+
+1. ACCEPTANCE - The assignee accepts the task and agrees to the deadline. Examples: "I accept", "I'll do it", "Got it", "Will complete by deadline", "Acknowledged" (if accepting)
+2. DATE_CHANGE - The assignee requests a different due date or mentions a date that's not feasible. Look for: "not feasible", "can't make that date", "need more time", "deadline is", "by [date]", "feasible as deadline", "propose [date]", "suggest [date]", "prefer [date]"
+3. SCOPE_QUESTION - The assignee has questions about what needs to be done, needs clarification, or asks "what does this mean", "can you clarify", "I need more details"
+4. ROLE_REJECTION - The assignee says this is not their job, responsibility, or role. Examples: "not my responsibility", "wrong person", "not my role", "should be assigned to"
+5. OTHER - Something else that doesn't fit the above categories
+
+IMPORTANT: If the email mentions a date that's different from the original deadline, or says a date is "not feasible" and proposes another date, classify as DATE_CHANGE.
 
 Email reply: "${replyContent}"
 
-Return ONLY a JSON object:
+Return ONLY a valid JSON object (no markdown, no code blocks):
 {
-  "type": "one of the categories above",
+  "type": "ACCEPTANCE|DATE_CHANGE|SCOPE_QUESTION|ROLE_REJECTION|OTHER",
   "confidence": 0.0-1.0,
-  "extracted_date": "proposed date in YYYY-MM-DD format if DATE_CHANGE, or null",
-  "reasoning": "brief explanation"
+  "extracted_date": "proposed date in YYYY-MM-DD format if DATE_CHANGE (convert dates like '10th Jan', 'Jan 10', '10/01/2025' to YYYY-MM-DD), or null",
+  "reasoning": "brief explanation of why this classification was chosen"
 }`;
 
+  let response = null;
   try {
-    const response = callGeminiPro(prompt, { temperature: 0.3 });
+    response = callGeminiPro(prompt, { temperature: 0.2 });
     let jsonText = response.trim();
+    
+    // Remove markdown code blocks if present
     if (jsonText.startsWith('```')) {
       jsonText = jsonText.replace(/^```json\n?/, '').replace(/```$/, '');
+      jsonText = jsonText.replace(/^```\n?/, '').replace(/```$/, '');
     }
-    return JSON.parse(jsonText);
+    
+    // Try to extract JSON if wrapped in text
+    const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      jsonText = jsonMatch[0];
+    }
+    
+    const result = JSON.parse(jsonText);
+    
+    // Fallback: If classification failed but we detect a date, try DATE_CHANGE
+    if (result.type === 'OTHER' && result.confidence < 0.7) {
+      const datePatterns = [
+        /(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})/i,
+        /((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})/i,
+        /(\d{1,2}\/\d{1,2}\/\d{4})/,
+        /(\d{4}-\d{2}-\d{2})/,
+        /(feasible|deadline|by|before|until).*?(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)/i,
+      ];
+      
+      for (const pattern of datePatterns) {
+        const match = replyContent.match(pattern);
+        if (match) {
+          Logger.log(`Fallback: Detected date pattern in OTHER classification: ${match[0]}`);
+          result.type = 'DATE_CHANGE';
+          result.confidence = 0.6;
+          result.reasoning = 'Date detected in email content';
+          break;
+        }
+      }
+    }
+    
+    return result;
   } catch (error) {
+    Logger.log(`ERROR in classifyReplyType: ${error.toString()}`);
+    Logger.log(`Response was: ${response ? response.substring(0, 200) : 'null'}`);
     logError(ERROR_TYPE.API_ERROR, 'classifyReplyType', error.toString());
+    
+    // Fallback: Try to detect date change manually
+    const datePatterns = [
+      /(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})/i,
+      /((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})/i,
+      /(not feasible|can't make|need more time|deadline|by|before).*?(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)/i,
+    ];
+    
+    for (const pattern of datePatterns) {
+      const match = replyContent.match(pattern);
+      if (match) {
+        Logger.log(`Fallback detection: Found date change pattern: ${match[0]}`);
+        return {
+          type: 'DATE_CHANGE',
+          confidence: 0.7,
+          extracted_date: null, // Will be extracted by extractDateFromText
+          reasoning: 'Date change detected via fallback pattern matching'
+        };
+      }
+    }
+    
     return {
       type: 'OTHER',
       confidence: 0.5,
       extracted_date: null,
-      reasoning: 'Failed to classify reply'
+      reasoning: 'Failed to classify reply - no patterns detected'
     };
   }
 }

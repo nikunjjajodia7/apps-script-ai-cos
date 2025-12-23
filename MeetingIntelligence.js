@@ -272,17 +272,21 @@ function createTasksFromActionItems(actionItems, meetingContext) {
     
     actionItems.forEach((item, index) => {
       try {
-        // Resolve owner email if name was provided
+        // Resolve owner email if name was provided (using improved matching)
         let assigneeEmail = null;
         if (item.owner) {
-          // Try to find staff by name
-          const staff = getSheetData(SHEETS.STAFF_DB);
-          const matchedStaff = staff.find(s => 
-            s.Name && s.Name.toLowerCase().includes(item.owner.toLowerCase())
-          );
-          if (matchedStaff) {
-            assigneeEmail = matchedStaff.Email;
+          assigneeEmail = findStaffEmailByName(item.owner);
+          if (assigneeEmail) {
+            Logger.log(`Matched action item owner "${item.owner}" to email: ${assigneeEmail}`);
           }
+        }
+        
+        // Try to find project from action item description or meeting context
+        let projectTag = null;
+        const searchText = `${item.description || ''} ${meetingContext.meetingName || ''}`.toLowerCase();
+        projectTag = findProjectTagByName(searchText);
+        if (projectTag) {
+          Logger.log(`Matched project from action item to tag: ${projectTag}`);
         }
         
         // Create task
@@ -291,6 +295,7 @@ function createTasksFromActionItems(actionItems, meetingContext) {
           Status: assigneeEmail ? TASK_STATUS.DRAFT : TASK_STATUS.REVIEW_AI_ASSIST,
           Assignee_Email: assigneeEmail || '',
           Due_Date: item.deadline || '',
+          Project_Tag: projectTag || '',
           Context_Hidden: `From meeting: ${meetingContext.meetingName} on ${Utilities.formatDate(meetingContext.meetingDate, Session.getScriptTimeZone(), 'yyyy-MM-dd')}`,
           Created_By: 'Meeting',
           Priority: 'Medium',

@@ -456,6 +456,12 @@ function checkVoiceInbox() {
       
       Logger.log(`File ${fileCount}: ${fileName} (Modified: ${lastModified}, Type: ${mimeType})`);
       
+      // Skip files that have already been processed
+      if (fileName.startsWith('[PROCESSED]') || fileName.startsWith('[UNCLEAR]')) {
+        Logger.log(`  -> Skipping (already processed): ${fileName}`);
+        continue;
+      }
+      
       // Process files modified in the last hour (changed from 5 minutes for testing)
       if (lastModified > oneHourAgo) {
         Logger.log(`  -> Processing: ${fileName}`);

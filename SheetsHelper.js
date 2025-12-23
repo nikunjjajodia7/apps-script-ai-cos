@@ -205,6 +205,152 @@ function getProject(projectTag) {
 }
 
 /**
+ * Find staff email by name (fuzzy matching)
+ * Tries multiple matching strategies for better accuracy
+ */
+function findStaffEmailByName(name) {
+  if (!name) return null;
+  
+  try {
+    const staff = getSheetData(SHEETS.STAFF_DB);
+    if (!staff || staff.length === 0) {
+      Logger.log('STAFF_DB is empty, cannot match name');
+      return null;
+    }
+    
+    const searchName = name.trim().toLowerCase();
+    
+    // Strategy 1: Exact match (case insensitive)
+    let matched = staff.find(s => 
+      s.Name && s.Name.toLowerCase() === searchName
+    );
+    if (matched) {
+      Logger.log(`Exact match found: "${name}" -> ${matched.Email}`);
+      return matched.Email;
+    }
+    
+    // Strategy 2: Contains match (name contains search term or vice versa)
+    matched = staff.find(s => {
+      if (!s.Name) return false;
+      const staffName = s.Name.toLowerCase();
+      return staffName.includes(searchName) || searchName.includes(staffName);
+    });
+    if (matched) {
+      Logger.log(`Contains match found: "${name}" -> ${matched.Email}`);
+      return matched.Email;
+    }
+    
+    // Strategy 3: First name match
+    const firstName = searchName.split(' ')[0];
+    if (firstName.length >= 3) {
+      matched = staff.find(s => {
+        if (!s.Name) return false;
+        const staffFirstName = s.Name.toLowerCase().split(' ')[0];
+        return staffFirstName === firstName;
+      });
+      if (matched) {
+        Logger.log(`First name match found: "${name}" -> ${matched.Email}`);
+        return matched.Email;
+      }
+    }
+    
+    // Strategy 4: Last name match
+    const nameParts = searchName.split(' ');
+    if (nameParts.length > 1) {
+      const lastName = nameParts[nameParts.length - 1];
+      if (lastName.length >= 3) {
+        matched = staff.find(s => {
+          if (!s.Name) return false;
+          const staffNameParts = s.Name.toLowerCase().split(' ');
+          if (staffNameParts.length > 1) {
+            const staffLastName = staffNameParts[staffNameParts.length - 1];
+            return staffLastName === lastName;
+          }
+          return false;
+        });
+        if (matched) {
+          Logger.log(`Last name match found: "${name}" -> ${matched.Email}`);
+          return matched.Email;
+        }
+      }
+    }
+    
+    Logger.log(`No match found for name: "${name}"`);
+    return null;
+  } catch (error) {
+    Logger.log(`Error finding staff by name: ${error.toString()}`);
+    return null;
+  }
+}
+
+/**
+ * Find project tag by name (fuzzy matching)
+ * Searches in Project_Name and Project_Tag fields
+ */
+function findProjectTagByName(searchText) {
+  if (!searchText) return null;
+  
+  try {
+    const projects = getSheetData(SHEETS.PROJECTS_DB);
+    if (!projects || projects.length === 0) {
+      Logger.log('PROJECTS_DB is empty, cannot match project');
+      return null;
+    }
+    
+    const searchLower = searchText.toLowerCase();
+    
+    // Strategy 1: Exact match in Project_Name
+    let matched = projects.find(p => 
+      p.Project_Name && p.Project_Name.toLowerCase() === searchLower
+    );
+    if (matched && matched.Project_Tag) {
+      Logger.log(`Exact project match found: "${searchText}" -> ${matched.Project_Tag}`);
+      return matched.Project_Tag;
+    }
+    
+    // Strategy 2: Contains match in Project_Name
+    matched = projects.find(p => {
+      if (!p.Project_Name) return false;
+      const projectName = p.Project_Name.toLowerCase();
+      return projectName.includes(searchLower) || searchLower.includes(projectName);
+    });
+    if (matched && matched.Project_Tag) {
+      Logger.log(`Contains project match found: "${searchText}" -> ${matched.Project_Tag}`);
+      return matched.Project_Tag;
+    }
+    
+    // Strategy 3: Match in Project_Tag itself
+    matched = projects.find(p => 
+      p.Project_Tag && p.Project_Tag.toLowerCase() === searchLower
+    );
+    if (matched && matched.Project_Tag) {
+      Logger.log(`Project tag match found: "${searchText}" -> ${matched.Project_Tag}`);
+      return matched.Project_Tag;
+    }
+    
+    // Strategy 4: Word-by-word matching (for multi-word project names)
+    const searchWords = searchLower.split(/\s+/).filter(w => w.length >= 3);
+    if (searchWords.length > 0) {
+      matched = projects.find(p => {
+        if (!p.Project_Name) return false;
+        const projectName = p.Project_Name.toLowerCase();
+        return searchWords.some(word => projectName.includes(word));
+      });
+      if (matched && matched.Project_Tag) {
+        Logger.log(`Word-based project match found: "${searchText}" -> ${matched.Project_Tag}`);
+        return matched.Project_Tag;
+      }
+    }
+    
+    Logger.log(`No project match found for: "${searchText}"`);
+    return null;
+  } catch (error) {
+    Logger.log(`Error finding project by name: ${error.toString()}`);
+    return null;
+  }
+}
+
+/**
  * Log interaction to task's Interaction_Log
  * This function directly updates the sheet to avoid recursive loops
  */

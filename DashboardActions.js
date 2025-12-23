@@ -561,17 +561,42 @@ function handleMarkHandled(taskId) {
 // Frontend API handlers
 function handleCreateTask(postData) {
   try {
-    const { taskName, assigneeEmail, dueDate, priority, description } = postData;
+    const { taskName, assigneeEmail, assigneeName, dueDate, priority, description, projectId, projectName } = postData;
     
     if (!taskName) {
       return { success: false, error: 'taskName is required' };
     }
     
+    // Resolve assignee email if name was provided
+    let finalAssigneeEmail = assigneeEmail;
+    if (!finalAssigneeEmail && assigneeName) {
+      finalAssigneeEmail = findStaffEmailByName(assigneeName);
+      if (finalAssigneeEmail) {
+        Logger.log(`Matched name "${assigneeName}" to email: ${finalAssigneeEmail}`);
+      }
+    }
+    
+    // Resolve project tag if project name was provided
+    let projectTag = projectId;
+    if (!projectTag && projectName) {
+      projectTag = findProjectTagByName(projectName);
+      if (projectTag) {
+        Logger.log(`Matched project name "${projectName}" to tag: ${projectTag}`);
+      }
+    }
+    
+    // Also try to find project from task name or description
+    if (!projectTag) {
+      const searchText = `${taskName} ${description || ''}`.toLowerCase();
+      projectTag = findProjectTagByName(searchText);
+    }
+    
     // Create task data object
     const taskData = {
       Task_Name: taskName,
-      Status: assigneeEmail ? TASK_STATUS.ASSIGNED : TASK_STATUS.NEW,
-      Assignee_Email: assigneeEmail || '',
+      Status: finalAssigneeEmail ? TASK_STATUS.ASSIGNED : TASK_STATUS.NEW,
+      Assignee_Email: finalAssigneeEmail || '',
+      Project_Tag: projectTag || '',
       Priority: priority || 'Medium',
       Context_Hidden: description || '',
       Created_By: 'Manual'
@@ -631,7 +656,19 @@ function handleUpdateTask(postData) {
     // Map frontend field names to sheet column names
     const updates = {};
     if (fieldsToUpdate.taskName !== undefined) updates.Task_Name = fieldsToUpdate.taskName;
-    if (fieldsToUpdate.assigneeEmail !== undefined) updates.Assignee_Email = fieldsToUpdate.assigneeEmail;
+    
+    // Handle assignee - support both email and name
+    if (fieldsToUpdate.assigneeEmail !== undefined) {
+      updates.Assignee_Email = fieldsToUpdate.assigneeEmail;
+    } else if (fieldsToUpdate.assigneeName !== undefined && fieldsToUpdate.assigneeName) {
+      const matchedEmail = findStaffEmailByName(fieldsToUpdate.assigneeName);
+      if (matchedEmail) {
+        updates.Assignee_Email = matchedEmail;
+        Logger.log(`Matched name "${fieldsToUpdate.assigneeName}" to email: ${matchedEmail}`);
+      } else {
+        Logger.log(`Could not match name "${fieldsToUpdate.assigneeName}" to any staff member`);
+      }
+    }
     if (fieldsToUpdate.status !== undefined) updates.Status = fieldsToUpdate.status;
     if (fieldsToUpdate.priority !== undefined) updates.Priority = fieldsToUpdate.priority;
     if (fieldsToUpdate.dueDate !== undefined) {
@@ -642,7 +679,19 @@ function handleUpdateTask(postData) {
       }
     }
     if (fieldsToUpdate.description !== undefined) updates.Context_Hidden = fieldsToUpdate.description;
-    if (fieldsToUpdate.projectId !== undefined) updates.Project_Tag = fieldsToUpdate.projectId;
+    
+    // Handle project - support both projectId (tag) and projectName
+    if (fieldsToUpdate.projectId !== undefined) {
+      updates.Project_Tag = fieldsToUpdate.projectId;
+    } else if (fieldsToUpdate.projectName !== undefined && fieldsToUpdate.projectName) {
+      const matchedTag = findProjectTagByName(fieldsToUpdate.projectName);
+      if (matchedTag) {
+        updates.Project_Tag = matchedTag;
+        Logger.log(`Matched project name "${fieldsToUpdate.projectName}" to tag: ${matchedTag}`);
+      } else {
+        Logger.log(`Could not match project name "${fieldsToUpdate.projectName}" to any project`);
+      }
+    }
     
     // Update the task
     const updated = updateTask(taskId, updates);

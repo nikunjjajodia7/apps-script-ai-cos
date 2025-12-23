@@ -112,6 +112,21 @@ function processReplyEmail(taskId, message) {
     const classification = classifyReplyType(emailContent);
     Logger.log(`Reply classified as: ${classification.type} (confidence: ${classification.confidence})`);
     Logger.log(`Reasoning: ${classification.reasoning || 'N/A'}`);
+    Logger.log(`Extracted date: ${classification.extracted_date || 'None'}`);
+    
+    // Additional check: If classified as OTHER but contains date-related keywords, reclassify
+    if (classification.type === 'OTHER' && classification.confidence < 0.7) {
+      const dateKeywords = ['not feasible', 'deadline', 'by', 'before', 'need more time', 'can\'t make', 'feasible', 'propose', 'suggest'];
+      const hasDateKeyword = dateKeywords.some(keyword => emailContent.toLowerCase().includes(keyword));
+      const hasDatePattern = /(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})/i.test(emailContent);
+      
+      if (hasDateKeyword && hasDatePattern) {
+        Logger.log('Reclassifying OTHER to DATE_CHANGE based on date keywords and patterns');
+        classification.type = 'DATE_CHANGE';
+        classification.confidence = 0.7;
+        classification.reasoning = 'Reclassified based on date keywords and patterns';
+      }
+    }
     
     // Process based on classification
     if (classification.type === 'ACCEPTANCE') {
@@ -203,11 +218,13 @@ function handleDateChangeReply(taskId, proposedDate, emailContent, messageId) {
     finalProposedDate = extractDateFromText(emailContent);
   }
   
+  // Update task status to REVIEW_DATE so it shows up in Lovable
   updateTask(taskId, {
     Proposed_Date: finalProposedDate || '',
     Status: TASK_STATUS.REVIEW_DATE,
   });
   
+  Logger.log(`Task ${taskId} status updated to REVIEW_DATE`);
   logInteraction(taskId, `Assignee requested date change to ${finalProposedDate || 'unspecified date'} (Message ID: ${messageId})`);
   
   // Notify boss about date change request
