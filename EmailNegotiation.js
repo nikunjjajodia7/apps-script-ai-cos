@@ -210,12 +210,14 @@ function handleAcceptanceReply(taskId, emailContent, messageId) {
  */
 function handleDateChangeReply(taskId, proposedDate, emailContent, messageId) {
   Logger.log(`Handling DATE_CHANGE reply for task ${taskId}`);
-  Logger.log(`Proposed date: ${proposedDate || 'Not extracted'}`);
+  Logger.log(`Proposed date from AI: ${proposedDate || 'Not extracted'}`);
   
   // Try to extract date from email content if AI didn't extract it
   let finalProposedDate = proposedDate;
   if (!finalProposedDate) {
+    Logger.log('AI did not extract date, trying manual extraction...');
     finalProposedDate = extractDateFromText(emailContent);
+    Logger.log(`Manual extraction result: ${finalProposedDate || 'No date found'}`);
   }
   
   // Update task status to REVIEW_DATE so it shows up in Lovable
@@ -367,29 +369,43 @@ function notifyBossOfReviewRequest(taskId, reviewType, emailContent, proposedDat
  * Extract date from text (helper function)
  */
 function extractDateFromText(text) {
-  // Try common date patterns
+  Logger.log(`Extracting date from text: ${text.substring(0, 200)}...`);
+  
+  // Try common date patterns (order matters - try more specific first)
   const datePatterns = [
-    /(\d{4}-\d{2}-\d{2})/,  // YYYY-MM-DD
-    /(\d{1,2}\/\d{1,2}\/\d{4})/,  // MM/DD/YYYY
-    /(\d{1,2}-\d{1,2}-\d{4})/,  // MM-DD-YYYY
-    /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}/i,
-    /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}/i,
+    // "10th Jan 2025" or "10 Jan 2025" format
+    /(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})/i,
+    // "Jan 10th, 2025" or "January 10, 2025" format
+    /((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})/i,
+    // YYYY-MM-DD
+    /(\d{4}-\d{2}-\d{2})/,
+    // MM/DD/YYYY or DD/MM/YYYY
+    /(\d{1,2}\/\d{1,2}\/\d{4})/,
+    // MM-DD-YYYY
+    /(\d{1,2}-\d{1,2}-\d{4})/,
+    // Full month names
+    /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}/i,
   ];
   
   for (const pattern of datePatterns) {
     const match = text.match(pattern);
     if (match) {
       try {
-        const date = new Date(match[1]);
+        Logger.log(`Found date pattern match: ${match[0]}`);
+        const date = new Date(match[0]);
         if (!isNaN(date.getTime())) {
-          return Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+          const formatted = Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+          Logger.log(`Parsed date: ${formatted}`);
+          return formatted;
         }
       } catch (e) {
+        Logger.log(`Error parsing date ${match[0]}: ${e.toString()}`);
         // Continue to next pattern
       }
     }
   }
   
+  Logger.log('No date pattern matched');
   return null;
 }
 

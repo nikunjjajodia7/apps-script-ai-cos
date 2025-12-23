@@ -615,7 +615,7 @@ function handleCreateTask(postData) {
     const taskId = createTask(taskData);
     
     // Send assignment email if assignee is provided
-    if (assigneeEmail && taskData.Status === TASK_STATUS.ASSIGNED) {
+    if (finalAssigneeEmail && taskData.Status === TASK_STATUS.ASSIGNED) {
       try {
         sendTaskAssignmentEmail(taskId);
       } catch (emailError) {
@@ -669,6 +669,7 @@ function handleUpdateTask(postData) {
         Logger.log(`Could not match name "${fieldsToUpdate.assigneeName}" to any staff member`);
       }
     }
+    
     if (fieldsToUpdate.status !== undefined) updates.Status = fieldsToUpdate.status;
     if (fieldsToUpdate.priority !== undefined) updates.Priority = fieldsToUpdate.priority;
     if (fieldsToUpdate.dueDate !== undefined) {
@@ -692,6 +693,7 @@ function handleUpdateTask(postData) {
         Logger.log(`Could not match project name "${fieldsToUpdate.projectName}" to any project`);
       }
     }
+    if (fieldsToUpdate.projectId !== undefined) updates.Project_Tag = fieldsToUpdate.projectId;
     
     // Update the task
     const updated = updateTask(taskId, updates);
@@ -869,26 +871,47 @@ function handleFileUpload(e) {
       fileData = postData.fileData; // base64 string
       fileName = postData.fileName;
       mimeType = postData.mimeType || 'audio/webm';
+      Logger.log('Parsed JSON - type: ' + type + ', fileName: ' + fileName);
     } catch (parseError) {
       // If not JSON, try to get from parameters or raw blob
       type = e.parameter.type || 'task';
       fileData = e.postData.contents; // raw blob data
       fileName = e.parameter.fileName;
       mimeType = e.parameter.mimeType || 'audio/webm';
+      Logger.log('Using parameters - type: ' + type + ', fileName: ' + fileName);
     }
     
+    // Normalize type to lowercase for comparison
+    type = (type || 'task').toLowerCase().trim();
+    
     if (type !== 'task' && type !== 'meeting') {
+      Logger.log('ERROR: Invalid type: ' + type);
       return ContentService.createTextOutput(JSON.stringify({
         success: false,
         error: 'Type must be "task" or "meeting"'
       })).setMimeType(ContentService.MimeType.JSON);
     }
     
+    Logger.log('File type determined: ' + type);
+    
     // Get folder ID based on type
     // Tasks go to VOICE_INBOX_FOLDER_ID, meetings go to MEETING_LAKE_FOLDER_ID
-    const folderId = type === 'task' 
-      ? CONFIG.VOICE_INBOX_FOLDER_ID()
-      : CONFIG.MEETING_LAKE_FOLDER_ID();
+    let folderId;
+    if (type === 'task') {
+      folderId = CONFIG.VOICE_INBOX_FOLDER_ID();
+      Logger.log('Type is "task" - using VOICE_INBOX_FOLDER_ID: ' + (folderId || 'NOT CONFIGURED'));
+    } else if (type === 'meeting') {
+      folderId = CONFIG.MEETING_LAKE_FOLDER_ID();
+      Logger.log('Type is "meeting" - using MEETING_LAKE_FOLDER_ID: ' + (folderId || 'NOT CONFIGURED'));
+    } else {
+      Logger.log('ERROR: Unexpected type after validation: ' + type);
+      return ContentService.createTextOutput(JSON.stringify({
+        success: false,
+        error: 'Invalid type: ' + type
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    Logger.log('Final folder ID selected: ' + (folderId || 'NOT CONFIGURED'));
     
     if (!folderId) {
       const configKey = type === 'task' 
@@ -937,11 +960,12 @@ function handleFileUpload(e) {
     
     // Get the target folder
     const folder = DriveApp.getFolderById(folderId);
+    Logger.log('Target folder: ' + folder.getName() + ' (ID: ' + folderId + ')');
     
     // Create file in Drive
     const file = folder.createFile(fileBlob.setName(fileName));
     
-    Logger.log(`File uploaded: ${file.getName()} (ID: ${file.getId()})`);
+    Logger.log(`File uploaded: ${file.getName()} (ID: ${file.getId()}) to folder: ${folder.getName()}`);
     
     // If it's a task recording, trigger processing immediately (optional)
     if (type === 'task') {
