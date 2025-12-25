@@ -3,6 +3,37 @@
  * Handles task assignment emails and reply processing
  */
 
+// ============================================
+// ⭐⭐ REPROCESS TASK REPLY - START HERE ⭐⭐
+// ============================================
+// 
+// TO USE THIS FUNCTION:
+// 
+// 1. Find your Task ID:
+//    - Look in your Tasks_DB Google Sheet, column "Task_ID"
+//    - Or check the task card in Lovable dashboard
+//    - Format: TASK-20251222235746 (example)
+//
+// 2. Scroll down to find the function "reprocessMyTask" below
+//    (It's around line 910, or search for "reprocessMyTask")
+//
+// 3. You'll see this line:
+//    const taskId = 'PUT-TASK-ID-HERE';
+//
+// 4. Replace 'PUT-TASK-ID-HERE' with your actual task ID
+//    Example: const taskId = 'TASK-20251222235746';
+//
+// 5. Save the file (Ctrl+S or Cmd+S)
+//
+// 6. In Apps Script:
+//    - Click the function dropdown (top left, shows function names)
+//    - Select "reprocessMyTask"
+//    - Click the Run button (▶️)
+//
+// 7. Check the execution log (View → Execution log) for results
+//
+// ============================================
+
 /**
  * Trigger when task status changes to "Assigned"
  * Note: This should be called from updateTask or via onChange trigger
@@ -84,13 +115,17 @@ function processReplyEmail(taskId, message) {
     }
     
     // Get email content
-    const emailContent = message.getPlainBody();
+    const rawEmailContent = message.getPlainBody();
     const senderEmail = extractEmailFromString(message.getFrom());
     const messageId = message.getId();
     
     Logger.log(`Sender: ${senderEmail}`);
     Logger.log(`Message ID: ${messageId}`);
-    Logger.log(`Email preview: ${emailContent.substring(0, 200)}...`);
+    Logger.log(`Raw email preview: ${rawEmailContent.substring(0, 200)}...`);
+    
+    // Clean email content - remove quoted replies and signatures
+    const emailContent = cleanEmailContent(rawEmailContent);
+    Logger.log(`Cleaned email content: ${emailContent.substring(0, 200)}...`);
     
     // Verify sender is the assignee (allow for email variations)
     const assigneeEmail = extractEmailFromString(task.Assignee_Email);
@@ -107,16 +142,18 @@ function processReplyEmail(taskId, message) {
       return;
     }
     
-    // Classify reply type using AI
+    // Classify reply type using AI (pass original due date for context)
     Logger.log('Classifying reply type using AI...');
-    const classification = classifyReplyType(emailContent);
+    const originalDueDate = task.Due_Date ? Utilities.formatDate(new Date(task.Due_Date), Session.getScriptTimeZone(), 'yyyy-MM-dd') : null;
+    Logger.log(`Original task due date: ${originalDueDate || 'Not set'}`);
+    const classification = classifyReplyType(emailContent, originalDueDate);
     Logger.log(`Reply classified as: ${classification.type} (confidence: ${classification.confidence})`);
     Logger.log(`Reasoning: ${classification.reasoning || 'N/A'}`);
     Logger.log(`Extracted date: ${classification.extracted_date || 'None'}`);
     
     // Additional check: If classified as OTHER but contains date-related keywords, reclassify
     if (classification.type === 'OTHER' && classification.confidence < 0.7) {
-      const dateKeywords = ['not feasible', 'deadline', 'by', 'before', 'need more time', 'can\'t make', 'feasible', 'propose', 'suggest'];
+      const dateKeywords = ['not feasible', 'deadline', 'by', 'before', 'need more time', 'can\'t make', 'feasible', 'propose', 'suggest', '10th', 'jan', 'january'];
       const hasDateKeyword = dateKeywords.some(keyword => emailContent.toLowerCase().includes(keyword));
       const hasDatePattern = /(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})/i.test(emailContent);
       
@@ -125,6 +162,28 @@ function processReplyEmail(taskId, message) {
         classification.type = 'DATE_CHANGE';
         classification.confidence = 0.7;
         classification.reasoning = 'Reclassified based on date keywords and patterns';
+        
+        // Try to extract date if not already extracted
+        if (!classification.extracted_date) {
+          const extractedDate = extractDateFromText(emailContent);
+          if (extractedDate) {
+            classification.extracted_date = extractedDate;
+            Logger.log(`Extracted date from text: ${extractedDate}`);
+          }
+        }
+      }
+    }
+    
+    // Additional fallback: Manual date extraction if still OTHER
+    if (classification.type === 'OTHER') {
+      const manuallyExtractedDate = extractDateFromText(emailContent);
+      if (manuallyExtractedDate) {
+        Logger.log(`Manual date extraction found: ${manuallyExtractedDate}`);
+        Logger.log('Reclassifying OTHER to DATE_CHANGE based on manual date detection');
+        classification.type = 'DATE_CHANGE';
+        classification.extracted_date = manuallyExtractedDate;
+        classification.confidence = 0.7;
+        classification.reasoning = 'Reclassified based on manual date extraction';
       }
     }
     
@@ -167,6 +226,64 @@ function extractEmailFromString(emailString) {
   
   // Otherwise return as-is
   return emailString.trim();
+}
+
+/**
+ * Clean email content by removing quoted replies and signatures
+ * This ensures we only process the actual reply, not quoted text
+ */
+function cleanEmailContent(emailContent) {
+  if (!emailContent) return '';
+  
+  let cleaned = emailContent;
+  
+  // Remove quoted sections (common patterns):
+  // - Lines starting with ">" (standard email quote)
+  // - "On [date] [person] wrote:" followed by quoted text
+  // - "From:" followed by quoted text
+  // - "-----Original Message-----" and everything after
+  // - "________________________________" (signature separator)
+  
+  // Remove everything after common quote markers
+  const quoteMarkers = [
+    /^On .+ wrote:.*$/m,  // "On Thu, Dec 25, 2025 at 10:05 PM ... wrote:"
+    /^From:.*$/m,         // "From: ..."
+    /^-----Original Message-----.*$/m,
+    /^________________________________.*$/m,
+    /^_{10,}.*$/m,        // Multiple underscores
+    /^={10,}.*$/m,        // Multiple equals signs
+  ];
+  
+  for (const marker of quoteMarkers) {
+    const match = cleaned.match(marker);
+    if (match) {
+      const index = cleaned.indexOf(match[0]);
+      if (index > 0) {
+        cleaned = cleaned.substring(0, index).trim();
+      }
+    }
+  }
+  
+  // Remove lines starting with ">" (quoted text)
+  cleaned = cleaned.split('\n')
+    .filter(line => !line.trim().startsWith('>'))
+    .join('\n');
+  
+  // Remove email signatures (common patterns)
+  const signaturePatterns = [
+    /Best regards,.*$/is,
+    /Regards,.*$/is,
+    /Thanks,.*$/is,
+    /Sincerely,.*$/is,
+    /Sent from.*$/is,
+    /Get Outlook.*$/is,
+  ];
+  
+  for (const pattern of signaturePatterns) {
+    cleaned = cleaned.replace(pattern, '');
+  }
+  
+  return cleaned.trim();
 }
 
 /**
@@ -224,6 +341,7 @@ function handleDateChangeReply(taskId, proposedDate, emailContent, messageId) {
   updateTask(taskId, {
     Proposed_Date: finalProposedDate || '',
     Status: TASK_STATUS.REVIEW_DATE,
+    Employee_Reply: emailContent, // Store full employee reply
   });
   
   Logger.log(`Task ${taskId} status updated to REVIEW_DATE`);
@@ -246,6 +364,7 @@ function handleScopeQuestionReply(taskId, emailContent, messageId) {
   updateTask(taskId, {
     Status: TASK_STATUS.REVIEW_SCOPE,
     Interaction_Log: newLog,
+    Employee_Reply: emailContent, // Store full employee reply
   });
   
   logInteraction(taskId, `Assignee has scope questions (Message ID: ${messageId})`);
@@ -267,6 +386,7 @@ function handleRoleRejectionReply(taskId, emailContent, messageId) {
   updateTask(taskId, {
     Status: TASK_STATUS.REVIEW_ROLE,
     Interaction_Log: newLog,
+    Employee_Reply: emailContent, // Store full employee reply
   });
   
   logInteraction(taskId, `Assignee claims task is not their responsibility (Message ID: ${messageId})`);
@@ -371,29 +491,151 @@ function notifyBossOfReviewRequest(taskId, reviewType, emailContent, proposedDat
 function extractDateFromText(text) {
   Logger.log(`Extracting date from text: ${text.substring(0, 200)}...`);
   
+  // Clean the text first to remove quoted sections
+  const cleanedText = cleanEmailContent(text);
+  Logger.log(`Cleaned text for date extraction: ${cleanedText.substring(0, 200)}...`);
+  
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth();
+  const currentDay = now.getDate();
+  
   // Try common date patterns (order matters - try more specific first)
+  // Prioritize patterns that match "7th of Jan 2026" format
   const datePatterns = [
-    // "10th Jan 2025" or "10 Jan 2025" format
-    /(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})/i,
-    // "Jan 10th, 2025" or "January 10, 2025" format
-    /((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})/i,
+    // "7th of Jan 2026" or "7th of January 2026" format
+    {
+      pattern: /(\d{1,2})(?:st|nd|rd|th)?\s+of\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})/i,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.indexOf(match[2].toLowerCase().substring(0, 3));
+        const year = parseInt(match[3]);
+        if (month >= 0 && day >= 1 && day <= 31) {
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
+    // "7th of Jan" or "7th of January" format without year
+    {
+      pattern: /(\d{1,2})(?:st|nd|rd|th)?\s+of\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b/i,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.indexOf(match[2].toLowerCase().substring(0, 3));
+        if (month >= 0 && day >= 1 && day <= 31) {
+          const testDate = new Date(currentYear, month, day);
+          const year = (testDate < now) ? currentYear + 1 : currentYear;
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
+    // "10th Jan 2025" or "10 Jan 2025" format with year
+    {
+      pattern: /(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})/i,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.indexOf(match[2].toLowerCase().substring(0, 3));
+        const year = parseInt(match[3]);
+        if (month >= 0 && day >= 1 && day <= 31) {
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
+    // "Jan 10th, 2025" or "January 10, 2025" format with year
+    {
+      pattern: /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})/i,
+      parser: function(match) {
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.indexOf(match[1].toLowerCase().substring(0, 3));
+        const day = parseInt(match[2]);
+        const year = parseInt(match[3]);
+        if (month >= 0 && day >= 1 && day <= 31) {
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
+    // "10th Jan" or "10 Jan" format without year - assume current or next year
+    {
+      pattern: /(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b/i,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.indexOf(match[2].toLowerCase().substring(0, 3));
+        if (month >= 0 && day >= 1 && day <= 31) {
+          // If date has passed this year, assume next year
+          const testDate = new Date(currentYear, month, day);
+          const year = (testDate < now) ? currentYear + 1 : currentYear;
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
+    // "Jan 10th" or "January 10" format without year
+    {
+      pattern: /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?\b/i,
+      parser: function(match) {
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.indexOf(match[1].toLowerCase().substring(0, 3));
+        const day = parseInt(match[2]);
+        if (month >= 0 && day >= 1 && day <= 31) {
+          const testDate = new Date(currentYear, month, day);
+          const year = (testDate < now) ? currentYear + 1 : currentYear;
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
     // YYYY-MM-DD
-    /(\d{4}-\d{2}-\d{2})/,
-    // MM/DD/YYYY or DD/MM/YYYY
-    /(\d{1,2}\/\d{1,2}\/\d{4})/,
-    // MM-DD-YYYY
-    /(\d{1,2}-\d{1,2}-\d{4})/,
-    // Full month names
-    /(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}/i,
+    {
+      pattern: /(\d{4})-(\d{2})-(\d{2})/,
+      parser: function(match) {
+        return new Date(parseInt(match[1]), parseInt(match[2]) - 1, parseInt(match[3]));
+      }
+    },
+    // DD/MM/YYYY (more common internationally)
+    {
+      pattern: /(\d{1,2})\/(\d{1,2})\/(\d{4})/,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const month = parseInt(match[2]) - 1;
+        const year = parseInt(match[3]);
+        // Validate: if month > 12, it's probably MM/DD/YYYY format
+        if (month > 11) {
+          return new Date(year, day - 1, month);
+        }
+        return new Date(year, month, day);
+      }
+    },
+    // Full month names with year
+    {
+      pattern: /(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})/i,
+      parser: function(match) {
+        const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+        const month = monthNames.indexOf(match[1].toLowerCase());
+        const day = parseInt(match[2]);
+        const year = parseInt(match[3]);
+        if (month >= 0 && day >= 1 && day <= 31) {
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
   ];
   
-  for (const pattern of datePatterns) {
-    const match = text.match(pattern);
+  // Use cleaned text for extraction
+  for (const datePattern of datePatterns) {
+    const match = cleanedText.match(datePattern.pattern);
     if (match) {
       try {
         Logger.log(`Found date pattern match: ${match[0]}`);
-        const date = new Date(match[0]);
-        if (!isNaN(date.getTime())) {
+        const date = datePattern.parser(match);
+        if (date && !isNaN(date.getTime())) {
           const formatted = Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
           Logger.log(`Parsed date: ${formatted}`);
           return formatted;
@@ -405,7 +647,7 @@ function extractDateFromText(text) {
     }
   }
   
-  Logger.log('No date pattern matched');
+  Logger.log('No date pattern matched in cleaned text');
   return null;
 }
 
@@ -543,6 +785,153 @@ function testCheckForReplies() {
 }
 
 /**
+ * Force reprocess an email reply for a task (bypasses "already processed" check)
+ * This is useful when you want to reprocess with improved classification code
+ * Usage: forceReprocessReply('TASK-20251222235746')
+ */
+function forceReprocessReply(taskId) {
+  try {
+    Logger.log(`=== Force Reprocessing Reply for Task: ${taskId} ===`);
+    
+    if (!taskId) {
+      Logger.log('ERROR: No task ID provided');
+      Logger.log('Usage: forceReprocessReply("TASK-20251222235746")');
+      return;
+    }
+    
+    const task = getTask(taskId);
+    if (!task) {
+      Logger.log(`ERROR: Task ${taskId} not found`);
+      return;
+    }
+    
+    Logger.log(`Task: ${task.Task_Name}`);
+    Logger.log(`Assignee: ${task.Assignee_Email}`);
+    Logger.log(`Current Status: ${task.Status}`);
+    
+    // Find email thread
+    const thread = findTaskEmailThread(taskId);
+    if (!thread) {
+      Logger.log('ERROR: No email thread found for this task');
+      Logger.log('Make sure an assignment email was sent first');
+      return;
+    }
+    
+    Logger.log(`Found email thread: ${thread.getFirstMessageSubject()}`);
+    
+    // Get replies
+    const replies = getTaskReplies(taskId);
+    Logger.log(`Found ${replies.length} reply(ies)`);
+    
+    if (replies.length === 0) {
+      Logger.log('No replies found. Send a test reply to the assignment email first.');
+      return;
+    }
+    
+    // Process most recent reply
+    const latestReply = replies[replies.length - 1];
+    const messageId = latestReply.getId();
+    Logger.log(`Processing latest reply from: ${latestReply.getFrom()}`);
+    Logger.log(`Message ID: ${messageId}`);
+    
+    // Get email content
+    const rawEmailContent = latestReply.getPlainBody();
+    const senderEmail = extractEmailFromString(latestReply.getFrom());
+    
+    Logger.log(`Raw email preview: ${rawEmailContent.substring(0, 300)}...`);
+    
+    // Clean email content - remove quoted replies and signatures
+    const emailContent = cleanEmailContent(rawEmailContent);
+    Logger.log(`Cleaned email content: ${emailContent.substring(0, 300)}...`);
+    
+    // Verify sender is the assignee
+    const assigneeEmail = extractEmailFromString(task.Assignee_Email);
+    if (senderEmail.toLowerCase() !== assigneeEmail.toLowerCase()) {
+      Logger.log(`WARNING: Reply from ${senderEmail} doesn't match assignee ${assigneeEmail}`);
+      Logger.log(`Proceeding anyway (force reprocess mode)`);
+    }
+    
+    // Remove the Message ID from Interaction_Log to allow reprocessing
+    const currentLog = task.Interaction_Log || '';
+    const logLines = currentLog.split('\n');
+    const filteredLog = logLines.filter(line => !line.includes(`Message ID: ${messageId}`)).join('\n');
+    
+    if (currentLog !== filteredLog) {
+      Logger.log(`Removed Message ID ${messageId} from Interaction_Log to allow reprocessing`);
+      updateTask(taskId, { Interaction_Log: filteredLog });
+    }
+    
+    // Classify reply type using AI (with improved classification, pass original due date for context)
+    Logger.log('Classifying reply type using AI (with improved classification)...');
+    const originalDueDate = task.Due_Date ? Utilities.formatDate(new Date(task.Due_Date), Session.getScriptTimeZone(), 'yyyy-MM-dd') : null;
+    Logger.log(`Original task due date: ${originalDueDate || 'Not set'}`);
+    const classification = classifyReplyType(emailContent, originalDueDate);
+    Logger.log(`Reply classified as: ${classification.type} (confidence: ${classification.confidence})`);
+    Logger.log(`Reasoning: ${classification.reasoning || 'N/A'}`);
+    Logger.log(`Extracted date: ${classification.extracted_date || 'None'}`);
+    
+    // Enhanced fallback: If classified as OTHER but contains date-related keywords, reclassify
+    if (classification.type === 'OTHER' && classification.confidence < 0.7) {
+      const dateKeywords = ['not feasible', 'deadline', 'by', 'before', 'need more time', 'can\'t make', 'feasible', 'propose', 'suggest', '10th', 'jan', 'january'];
+      const hasDateKeyword = dateKeywords.some(keyword => emailContent.toLowerCase().includes(keyword));
+      const hasDatePattern = /(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})/i.test(emailContent);
+      
+      if (hasDateKeyword && hasDatePattern) {
+        Logger.log('Reclassifying OTHER to DATE_CHANGE based on date keywords and patterns');
+        classification.type = 'DATE_CHANGE';
+        classification.confidence = 0.7;
+        classification.reasoning = 'Reclassified based on date keywords and patterns';
+        
+        // Try to extract date if not already extracted
+        if (!classification.extracted_date) {
+          const extractedDate = extractDateFromText(emailContent);
+          if (extractedDate) {
+            classification.extracted_date = extractedDate;
+            Logger.log(`Extracted date from text: ${extractedDate}`);
+          }
+        }
+      }
+    }
+    
+    // Additional fallback: Manual date extraction if still OTHER
+    if (classification.type === 'OTHER') {
+      const manuallyExtractedDate = extractDateFromText(emailContent);
+      if (manuallyExtractedDate) {
+        Logger.log(`Manual date extraction found: ${manuallyExtractedDate}`);
+        Logger.log('Reclassifying OTHER to DATE_CHANGE based on manual date detection');
+        classification.type = 'DATE_CHANGE';
+        classification.extracted_date = manuallyExtractedDate;
+        classification.confidence = 0.7;
+        classification.reasoning = 'Reclassified based on manual date extraction';
+      }
+    }
+    
+    // Process based on classification
+    if (classification.type === 'ACCEPTANCE') {
+      handleAcceptanceReply(taskId, emailContent, messageId);
+    } else if (classification.type === 'DATE_CHANGE') {
+      handleDateChangeReply(taskId, classification.extracted_date, emailContent, messageId);
+      Logger.log(`✓ Task status updated to REVIEW_DATE`);
+      Logger.log(`✓ Task should now appear in Lovable dashboard`);
+    } else if (classification.type === 'SCOPE_QUESTION') {
+      handleScopeQuestionReply(taskId, emailContent, messageId);
+    } else if (classification.type === 'ROLE_REJECTION') {
+      handleRoleRejectionReply(taskId, emailContent, messageId);
+    } else {
+      handleOtherReply(taskId, emailContent, messageId);
+    }
+    
+    Logger.log('✓ Reply reprocessed successfully!');
+    Logger.log('Check the task status in your spreadsheet and Lovable dashboard.');
+    
+  } catch (error) {
+    Logger.log(`ERROR: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+    logError(ERROR_TYPE.API_ERROR, 'forceReprocessReply', error.toString(), taskId, error.stack);
+  }
+}
+
+/**
  * Test function: Process a specific task's replies
  * Usage: testProcessTaskReplies('TASK-20251221031304')
  */
@@ -630,6 +1019,73 @@ function testListTasksWithEmails() {
   }
 }
 
+// ============================================
+// ⭐⭐ REPROCESS TASK REPLY - PUT TASK ID HERE ⭐⭐
+// ============================================
+// 
+// INSTRUCTIONS:
+// 
+// 1. Find your Task ID:
+//    - Open your Tasks_DB Google Sheet
+//    - Look in the "Task_ID" column
+//    - Or check the task card in Lovable dashboard
+//    - Example: TASK-20251222235746
+//
+// 2. Look at the line below that says:
+//    const taskId = 'PUT-TASK-ID-HERE';
+//
+// 3. Replace 'PUT-TASK-ID-HERE' with your actual task ID
+//    Example: const taskId = 'TASK-20251222235746';
+//
+// 4. Save the file (Ctrl+S or Cmd+S)
+//
+// 5. In Apps Script editor:
+//    - Click the function dropdown (top left, shows function names)
+//    - Select "reprocessMyTask"
+//    - Click the Run button (▶️)
+//
+// 6. Check the execution log (View → Execution log) for results
+//
+// ============================================
+
+function reprocessMyTask() {
+  
+  // ═══════════════════════════════════════════════════════════════
+  // ⬇️⬇️⬇️ CHANGE THIS LINE - PUT YOUR TASK ID HERE ⬇️⬇️⬇️
+  // ═══════════════════════════════════════════════════════════════
+  
+  const taskId = 'PUT-TASK-ID-HERE';
+  
+  // ═══════════════════════════════════════════════════════════════
+  // ⬆️⬆️⬆️ CHANGE THE LINE ABOVE - PUT YOUR TASK ID THERE ⬆️⬆️⬆️
+  // ═══════════════════════════════════════════════════════════════
+  
+  // Don't modify anything below this line
+  if (taskId === 'PUT-TASK-ID-HERE') {
+    Logger.log('');
+    Logger.log('═══════════════════════════════════════════════════════════════');
+    Logger.log('❌ ERROR: You need to replace PUT-TASK-ID-HERE with your task ID!');
+    Logger.log('═══════════════════════════════════════════════════════════════');
+    Logger.log('');
+    Logger.log('HOW TO FIX:');
+    Logger.log('1. Find this line in the code: const taskId = "PUT-TASK-ID-HERE";');
+    Logger.log('2. Replace "PUT-TASK-ID-HERE" with your actual task ID');
+    Logger.log('3. Example: const taskId = "TASK-20251222235746";');
+    Logger.log('4. Save the file (Ctrl+S or Cmd+S)');
+    Logger.log('5. Run the function again');
+    Logger.log('');
+    Logger.log('WHERE TO FIND YOUR TASK ID:');
+    Logger.log('- Open your Tasks_DB Google Sheet');
+    Logger.log('- Look in the "Task_ID" column');
+    Logger.log('- Or check the task card in Lovable dashboard');
+    Logger.log('');
+    return;
+  }
+  
+  Logger.log('✅ Processing task: ' + taskId);
+  forceReprocessReply(taskId);
+}
+
 /**
  * Test function: Simulate processing a reply with sample text
  * Usage: testClassifyReply('I accept this task and will complete it by the deadline.')
@@ -645,7 +1101,8 @@ function testClassifyReply(replyText) {
     
     Logger.log(`Classifying: "${replyText}"`);
     
-    const classification = classifyReplyType(replyText);
+    // Test function - no original due date available, pass null
+    const classification = classifyReplyType(replyText, null);
     
     Logger.log(`\nClassification Result:`);
     Logger.log(`  Type: ${classification.type}`);

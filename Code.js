@@ -561,11 +561,11 @@ function createAllSheets() {
   let tasksSheet = spreadsheet.getSheetByName('Tasks_DB');
   if (!tasksSheet) {
     tasksSheet = spreadsheet.insertSheet('Tasks_DB');
-    tasksSheet.getRange(1, 1, 1, 16).setValues([[
+    tasksSheet.getRange(1, 1, 1, 17).setValues([[
       'Task_ID', 'Task_Name', 'Status', 'Assignee_Email', 'Due_Date', 
       'Proposed_Date', 'Project_Tag', 'Meeting_Action', 'AI_Confidence', 
       'Tone_Detected', 'Context_Hidden', 'Interaction_Log', 'Boss_Reply_Draft',
-      'Created_Date', 'Last_Updated', 'Priority'
+      'Employee_Reply', 'Created_Date', 'Last_Updated', 'Priority'
     ]]);
     tasksSheet.getRange(1, 1, 1, 16).setFontWeight('bold');
     tasksSheet.setFrozenRows(1);

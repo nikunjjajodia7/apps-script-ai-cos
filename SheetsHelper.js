@@ -198,6 +198,54 @@ function updateStaff(email, updates) {
 }
 
 /**
+ * Create a new staff member in Staff_DB
+ * @param {string} name - Full name of staff member
+ * @param {string} email - Email address (required, must be unique)
+ * @param {object} additionalData - Optional additional fields (Role, Department, Manager_Email)
+ * @returns {boolean} - True if created successfully, false if email already exists
+ */
+function createStaff(name, email, additionalData = {}) {
+  if (!name || !email) {
+    Logger.log('Error: Name and email are required to create staff member');
+    return false;
+  }
+  
+  // Check if staff with this email already exists
+  const existingStaff = getStaff(email);
+  if (existingStaff) {
+    Logger.log(`Staff with email ${email} already exists: ${existingStaff.Name}`);
+    return false;
+  }
+  
+  // Check if staff with this name already exists (but different email)
+  const existingByName = findStaffEmailByName(name);
+  if (existingByName && existingByName !== email) {
+    Logger.log(`Staff with name "${name}" already exists with different email: ${existingByName}`);
+    // Still create, but log a warning
+  }
+  
+  try {
+    const staffData = {
+      Name: name.trim(),
+      Email: email.trim().toLowerCase(),
+      Role: additionalData.Role || 'Team Member',
+      Reliability_Score: '',
+      Active_Task_Count: 0,
+      Department: additionalData.Department || '',
+      Manager_Email: additionalData.Manager_Email || '',
+      Last_Updated: new Date()
+    };
+    
+    const rowNumber = addRow(SHEETS.STAFF_DB, staffData);
+    Logger.log(`Created new staff member: ${name} (${email}) at row ${rowNumber}`);
+    return true;
+  } catch (error) {
+    Logger.log(`Error creating staff member: ${error.toString()}`);
+    return false;
+  }
+}
+
+/**
  * Get project by tag
  */
 function getProject(projectTag) {
@@ -205,8 +253,95 @@ function getProject(projectTag) {
 }
 
 /**
- * Find staff email by name (fuzzy matching)
- * Tries multiple matching strategies for better accuracy
+ * Calculate Levenshtein distance between two strings
+ * Used for fuzzy string matching
+ */
+function levenshteinDistance(str1, str2) {
+  const len1 = str1.length;
+  const len2 = str2.length;
+  const matrix = [];
+  
+  // Initialize matrix
+  for (let i = 0; i <= len1; i++) {
+    matrix[i] = [i];
+  }
+  for (let j = 0; j <= len2; j++) {
+    matrix[0][j] = j;
+  }
+  
+  // Fill matrix
+  for (let i = 1; i <= len1; i++) {
+    for (let j = 1; j <= len2; j++) {
+      if (str1[i - 1] === str2[j - 1]) {
+        matrix[i][j] = matrix[i - 1][j - 1];
+      } else {
+        matrix[i][j] = Math.min(
+          matrix[i - 1][j] + 1,     // deletion
+          matrix[i][j - 1] + 1,     // insertion
+          matrix[i - 1][j - 1] + 1  // substitution
+        );
+      }
+    }
+  }
+  
+  return matrix[len1][len2];
+}
+
+/**
+ * Calculate similarity score between two strings (0-1)
+ * Higher score = more similar
+ */
+function stringSimilarity(str1, str2) {
+  const maxLen = Math.max(str1.length, str2.length);
+  if (maxLen === 0) return 1.0;
+  const distance = levenshteinDistance(str1.toLowerCase(), str2.toLowerCase());
+  return 1 - (distance / maxLen);
+}
+
+/**
+ * Simple phonetic matching - checks if names sound similar
+ * Handles common variations like: anaya/anaaya, john/jon, michael/mike
+ */
+function phoneticSimilarity(name1, name2) {
+  const n1 = name1.toLowerCase().replace(/[^a-z]/g, '');
+  const n2 = name2.toLowerCase().replace(/[^a-z]/g, '');
+  
+  // Exact match after normalization
+  if (n1 === n2) return 1.0;
+  
+  // Check if one contains the other (for nicknames)
+  if (n1.includes(n2) || n2.includes(n1)) {
+    const shorter = Math.min(n1.length, n2.length);
+    const longer = Math.max(n1.length, n2.length);
+    return shorter / longer; // Proportional similarity
+  }
+  
+  // Check for common phonetic variations
+  const variations = {
+    'aa': 'a', 'ee': 'e', 'ii': 'i', 'oo': 'o', 'uu': 'u',
+    'ph': 'f', 'ck': 'k', 'qu': 'kw'
+  };
+  
+  let n1Norm = n1;
+  let n2Norm = n2;
+  for (const [pattern, replacement] of Object.entries(variations)) {
+    n1Norm = n1Norm.replace(new RegExp(pattern, 'g'), replacement);
+    n2Norm = n2Norm.replace(new RegExp(pattern, 'g'), replacement);
+  }
+  
+  // Remove double letters
+  n1Norm = n1Norm.replace(/(.)\1+/g, '$1');
+  n2Norm = n2Norm.replace(/(.)\1+/g, '$1');
+  
+  if (n1Norm === n2Norm) return 0.9;
+  
+  // Use Levenshtein on normalized strings
+  return stringSimilarity(n1Norm, n2Norm);
+}
+
+/**
+ * Find staff email by name (enhanced fuzzy matching with phonetic support)
+ * Tries multiple matching strategies including sound-alike matching
  */
 function findStaffEmailByName(name) {
   if (!name) return null;
@@ -272,6 +407,50 @@ function findStaffEmailByName(name) {
           Logger.log(`Last name match found: "${name}" -> ${matched.Email}`);
           return matched.Email;
         }
+      }
+    }
+    
+    // Strategy 5: Phonetic/sound-alike matching
+    // Calculate similarity scores for all staff
+    const similarities = staff.map(s => {
+      if (!s.Name) return { staff: s, score: 0 };
+      const staffName = s.Name.toLowerCase();
+      const similarity = Math.max(
+        phoneticSimilarity(searchName, staffName),
+        phoneticSimilarity(firstName, staffName.split(' ')[0]),
+        stringSimilarity(searchName, staffName)
+      );
+      return { staff: s, score: similarity };
+    });
+    
+    // Sort by similarity score (highest first)
+    similarities.sort((a, b) => b.score - a.score);
+    
+    // If best match has similarity > 0.7, use it
+    if (similarities.length > 0 && similarities[0].score > 0.7) {
+      const bestMatch = similarities[0];
+      Logger.log(`Phonetic match found: "${name}" -> "${bestMatch.staff.Name}" (similarity: ${bestMatch.score.toFixed(2)})`);
+      return bestMatch.staff.Email;
+    }
+    
+    // Strategy 6: Partial phonetic match (for cases like "anaya" vs "anaaya")
+    // Check if removing one character from either name makes them match
+    for (let i = 0; i < searchName.length; i++) {
+      const searchVariation = searchName.slice(0, i) + searchName.slice(i + 1);
+      matched = staff.find(s => {
+        if (!s.Name) return false;
+        const staffName = s.Name.toLowerCase();
+        if (staffName === searchVariation || searchVariation === staffName) return true;
+        // Try removing character from staff name
+        for (let j = 0; j < staffName.length; j++) {
+          const staffVariation = staffName.slice(0, j) + staffName.slice(j + 1);
+          if (staffVariation === searchName || searchName === staffVariation) return true;
+        }
+        return false;
+      });
+      if (matched) {
+        Logger.log(`Partial phonetic match found: "${name}" -> "${matched.Name}"`);
+        return matched.Email;
       }
     }
     

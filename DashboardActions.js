@@ -53,6 +53,9 @@ function doPost(e) {
       case 'update_task':
         result = handleUpdateTask(postData);
         break;
+      case 'delete_task':
+        result = handleDeleteTask(taskId);
+        break;
       // Category B1: Review_AI_Assist actions
       case 'approve_interpretation':
         result = handleApproveInterpretation(taskId, data);
@@ -258,12 +261,20 @@ function handleApproveNewDate(taskId) {
     Due_Date: task.Proposed_Date,
     Proposed_Date: '',
     Status: TASK_STATUS.ACTIVE,
+    Employee_Reply: '', // Clear employee reply after review
   });
   
-  // Send confirmation email to assignee
+  // Send confirmation email to assignee with context
   const staff = getStaff(task.Assignee_Email);
   const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  const emailBody = `Hello ${assigneeName},\n\nYour request for a new due date has been approved. The new due date is ${task.Proposed_Date}.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+  let emailBody = `Hello ${assigneeName},\n\nYour request for a new due date has been approved. The new due date is ${task.Proposed_Date}.\n\n`;
+  
+  // Reference their original message if available
+  if (task.Employee_Reply) {
+    emailBody += `Thank you for your message regarding the deadline. `;
+  }
+  
+  emailBody += `\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
   GmailApp.sendEmail(
     task.Assignee_Email,
@@ -283,12 +294,20 @@ function handleRejectDateChange(taskId) {
   updateTask(taskId, {
     Proposed_Date: '',
     Status: TASK_STATUS.ACTIVE,
+    Employee_Reply: '', // Clear employee reply after review
   });
   
-  // Send email to assignee
+  // Send email to assignee with context
   const staff = getStaff(task.Assignee_Email);
   const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  const emailBody = `Hello ${assigneeName},\n\nThe original due date of ${task.Due_Date} stands. Please complete the task by this date.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+  let emailBody = `Hello ${assigneeName},\n\n`;
+  
+  // Acknowledge their request
+  if (task.Employee_Reply) {
+    emailBody += `Thank you for reaching out about the deadline. After reviewing your request, `;
+  }
+  
+  emailBody += `the original due date of ${task.Due_Date} stands. Please complete the task by this date.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
   GmailApp.sendEmail(
     task.Assignee_Email,
@@ -348,12 +367,20 @@ function handleProvideClarification(taskId, data) {
   updateTask(taskId, {
     Context_Hidden: newContext,
     Status: TASK_STATUS.ACTIVE,
+    Employee_Reply: '', // Clear employee reply after review
   });
   
-  // Send clarification email
+  // Send clarification email with context
   const staff = getStaff(task.Assignee_Email);
   const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  const emailBody = `Hello ${assigneeName},\n\nHere's additional clarification for the task:\n\n${data.clarification}\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+  let emailBody = `Hello ${assigneeName},\n\n`;
+  
+  // Acknowledge their question
+  if (task.Employee_Reply) {
+    emailBody += `Thank you for your question about the task scope. `;
+  }
+  
+  emailBody += `Here's additional clarification:\n\n${data.clarification}\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
   GmailApp.sendEmail(
     task.Assignee_Email,
@@ -426,10 +453,17 @@ function handleOverrideRole(taskId, data) {
     return { success: false, message: 'Task has no assignee' };
   }
   
-  // Send firm but respectful email
+  // Send firm but respectful email with context
   const staff = getStaff(task.Assignee_Email);
   const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  const emailBody = `Hello ${assigneeName},\n\nThis task is indeed your responsibility. We expect you to proceed with it as assigned. If you have specific concerns, please let us know.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+  let emailBody = `Hello ${assigneeName},\n\n`;
+  
+  // Acknowledge their concern
+  if (task.Employee_Reply) {
+    emailBody += `Thank you for sharing your concerns. After reviewing the task assignment, `;
+  }
+  
+  emailBody += `this task is indeed your responsibility. We expect you to proceed with it as assigned. If you have specific concerns, please let us know.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
   GmailApp.sendEmail(
     task.Assignee_Email,
@@ -437,7 +471,10 @@ function handleOverrideRole(taskId, data) {
     emailBody
   );
   
-  updateTask(taskId, { Status: TASK_STATUS.ACTIVE });
+  updateTask(taskId, { 
+    Status: TASK_STATUS.ACTIVE,
+    Employee_Reply: '', // Clear employee reply after review
+  });
   
   return { success: true, message: 'Override email sent' };
 }
@@ -537,20 +574,35 @@ function handleClarifyUpdate(taskId, data) {
 
 function handleConvertToMeeting(taskId, data) {
   updateTask(taskId, { Meeting_Action: MEETING_ACTION.ONE_ON_ONE });
-  scheduleOneOnOne(taskId);
-  return { success: true, message: 'Meeting scheduled' };
+  // Pass date, time, and duration if provided
+  const meetingId = scheduleOneOnOne(taskId, data?.date, data?.time, data?.duration);
+  if (meetingId) {
+    return { success: true, message: 'Meeting scheduled' };
+  } else {
+    return { success: false, message: 'Failed to schedule meeting - check for conflicts' };
+  }
 }
 
-function handleAddToWeekly(taskId) {
+function handleAddToWeekly(taskId, data) {
   updateTask(taskId, { Meeting_Action: MEETING_ACTION.WEEKLY });
-  addToWeeklyAgenda(taskId);
-  return { success: true, message: 'Added to weekly agenda' };
+  // Pass date if provided to find nearest weekly meeting
+  const meetingId = addToWeeklyAgenda(taskId, data?.date);
+  if (meetingId) {
+    return { success: true, message: 'Added to weekly agenda' };
+  } else {
+    return { success: false, message: 'Failed to add to weekly agenda' };
+  }
 }
 
-function handleScheduleFocusTime(taskId) {
+function handleScheduleFocusTime(taskId, data) {
   updateTask(taskId, { Meeting_Action: MEETING_ACTION.SELF });
-  scheduleFocusTime(taskId);
-  return { success: true, message: 'Focus time scheduled' };
+  // Pass date, time, and duration if provided
+  const meetingId = scheduleFocusTime(taskId, data?.date, data?.time, data?.duration);
+  if (meetingId) {
+    return { success: true, message: 'Focus time scheduled' };
+  } else {
+    return { success: false, message: 'Failed to schedule focus time - check for conflicts' };
+  }
 }
 
 function handleMarkHandled(taskId) {
@@ -573,6 +625,34 @@ function handleCreateTask(postData) {
       finalAssigneeEmail = findStaffEmailByName(assigneeName);
       if (finalAssigneeEmail) {
         Logger.log(`Matched name "${assigneeName}" to email: ${finalAssigneeEmail}`);
+      } else {
+        // Name doesn't exist - create new staff member if email is also provided
+        if (assigneeEmail) {
+          Logger.log(`Creating new staff member: "${assigneeName}" with email: ${assigneeEmail}`);
+          const created = createStaff(assigneeName, assigneeEmail);
+          if (created) {
+            finalAssigneeEmail = assigneeEmail;
+            Logger.log(`Successfully created staff member and assigned task`);
+          } else {
+            Logger.log(`Failed to create staff member, but will use email: ${assigneeEmail}`);
+            finalAssigneeEmail = assigneeEmail; // Use email anyway
+          }
+        } else {
+          Logger.log(`Could not match name "${assigneeName}" and no email provided`);
+        }
+      }
+    } else if (finalAssigneeEmail && assigneeName) {
+      // Both email and name provided - check if staff exists, create if not
+      const existingStaff = getStaff(finalAssigneeEmail);
+      if (!existingStaff) {
+        Logger.log(`Creating new staff member: "${assigneeName}" with email: ${finalAssigneeEmail}`);
+        createStaff(assigneeName, finalAssigneeEmail);
+      } else {
+        // Staff exists - update name if different
+        if (existingStaff.Name !== assigneeName) {
+          Logger.log(`Updating staff name from "${existingStaff.Name}" to "${assigneeName}"`);
+          updateStaff(finalAssigneeEmail, { Name: assigneeName });
+        }
       }
     }
     
@@ -660,13 +740,36 @@ function handleUpdateTask(postData) {
     // Handle assignee - support both email and name
     if (fieldsToUpdate.assigneeEmail !== undefined) {
       updates.Assignee_Email = fieldsToUpdate.assigneeEmail;
+      
+      // If name is also provided, ensure staff exists
+      if (fieldsToUpdate.assigneeName !== undefined && fieldsToUpdate.assigneeName) {
+        const existingStaff = getStaff(fieldsToUpdate.assigneeEmail);
+        if (!existingStaff) {
+          Logger.log(`Creating new staff member: "${fieldsToUpdate.assigneeName}" with email: ${fieldsToUpdate.assigneeEmail}`);
+          createStaff(fieldsToUpdate.assigneeName, fieldsToUpdate.assigneeEmail);
+        } else if (existingStaff.Name !== fieldsToUpdate.assigneeName) {
+          Logger.log(`Updating staff name from "${existingStaff.Name}" to "${fieldsToUpdate.assigneeName}"`);
+          updateStaff(fieldsToUpdate.assigneeEmail, { Name: fieldsToUpdate.assigneeName });
+        }
+      }
     } else if (fieldsToUpdate.assigneeName !== undefined && fieldsToUpdate.assigneeName) {
       const matchedEmail = findStaffEmailByName(fieldsToUpdate.assigneeName);
       if (matchedEmail) {
         updates.Assignee_Email = matchedEmail;
         Logger.log(`Matched name "${fieldsToUpdate.assigneeName}" to email: ${matchedEmail}`);
       } else {
-        Logger.log(`Could not match name "${fieldsToUpdate.assigneeName}" to any staff member`);
+        // Name doesn't exist - check if we have email from existing task
+        const currentEmail = existingTask.Assignee_Email;
+        if (currentEmail) {
+          // Use existing email and create staff member
+          Logger.log(`Creating new staff member: "${fieldsToUpdate.assigneeName}" with email: ${currentEmail}`);
+          const created = createStaff(fieldsToUpdate.assigneeName, currentEmail);
+          if (created) {
+            updates.Assignee_Email = currentEmail;
+          }
+        } else {
+          Logger.log(`Could not match name "${fieldsToUpdate.assigneeName}" and no email available to create staff member`);
+        }
       }
     }
     
@@ -833,9 +936,38 @@ function doGet(e) {
         })).setMimeType(ContentService.MimeType.JSON);
       }
       
+      // Generate review summary if this is a review task with employee reply
+      let reviewSummary = null;
+      if ((task.Status === TASK_STATUS.REVIEW_DATE || 
+           task.Status === TASK_STATUS.REVIEW_SCOPE || 
+           task.Status === TASK_STATUS.REVIEW_ROLE) && 
+          task.Employee_Reply) {
+        try {
+          const reviewType = task.Status === TASK_STATUS.REVIEW_DATE ? 'DATE_CHANGE' :
+                           task.Status === TASK_STATUS.REVIEW_SCOPE ? 'SCOPE_QUESTION' :
+                           task.Status === TASK_STATUS.REVIEW_ROLE ? 'ROLE_REJECTION' : 'OTHER';
+          reviewSummary = summarizeReviewRequest(
+            reviewType,
+            task.Employee_Reply,
+            task.Task_Name,
+            task.Due_Date,
+            task.Proposed_Date
+          );
+        } catch (error) {
+          Logger.log('Error generating review summary: ' + error.toString());
+          // Continue without summary
+        }
+      }
+      
+      // Add review summary to response
+      const taskResponse = { ...task };
+      if (reviewSummary) {
+        taskResponse.Review_Summary = reviewSummary;
+      }
+      
       return ContentService.createTextOutput(JSON.stringify({
         success: true,
-        data: task
+        data: taskResponse
       })).setMimeType(ContentService.MimeType.JSON);
     }
     

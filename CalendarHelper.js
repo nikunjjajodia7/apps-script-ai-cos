@@ -68,8 +68,12 @@ function findAvailableSlot(attendeeEmails, durationMinutes, startDate, endDate) 
 
 /**
  * Schedule a one-on-one meeting
+ * @param {string} taskId - Task ID
+ * @param {string} preferredDate - Optional: Preferred date in YYYY-MM-DD format
+ * @param {string} preferredTime - Optional: Preferred time in HH:MM format (24-hour)
+ * @param {number} durationMinutes - Optional: Duration in minutes (default from config)
  */
-function scheduleOneOnOne(taskId) {
+function scheduleOneOnOne(taskId, preferredDate, preferredTime, durationMinutes) {
   try {
     const task = getTask(taskId);
     if (!task || !task.Assignee_Email) {
@@ -78,13 +82,51 @@ function scheduleOneOnOne(taskId) {
     
     const bossEmail = CONFIG.BOSS_EMAIL();
     const assigneeEmail = task.Assignee_Email;
-    const duration = CONFIG.DEFAULT_MEETING_DURATION_MINUTES();
+    const duration = durationMinutes || CONFIG.DEFAULT_MEETING_DURATION_MINUTES();
     
-    // Find available slot in next 2 weeks
-    const startDate = new Date();
-    const endDate = new Date(startDate.getTime() + 14 * 24 * 60 * 60 * 1000);
+    let slot = null;
     
-    const slot = findAvailableSlot([bossEmail, assigneeEmail], duration, startDate, endDate);
+    // If date and time are provided, use them directly (check for conflicts)
+    if (preferredDate && preferredTime) {
+      try {
+        const [year, month, day] = preferredDate.split('-').map(Number);
+        const [hours, minutes] = preferredTime.split(':').map(Number);
+        const eventStart = new Date(year, month - 1, day, hours, minutes, 0, 0);
+        const eventEnd = new Date(eventStart.getTime() + duration * 60 * 1000);
+        
+        // Check if slot is available
+        const calendar = CalendarApp.getDefaultCalendar();
+        const existingEvents = calendar.getEvents(eventStart, eventEnd);
+        
+        // Check assignee calendar if accessible
+        let hasConflict = existingEvents.length > 0;
+        try {
+          const assigneeCalendar = CalendarApp.getCalendarById(assigneeEmail);
+          if (assigneeCalendar) {
+            const assigneeEvents = assigneeCalendar.getEvents(eventStart, eventEnd);
+            hasConflict = hasConflict || assigneeEvents.length > 0;
+          }
+        } catch (e) {
+          Logger.log(`Cannot check assignee calendar: ${e.toString()}`);
+        }
+        
+        if (!hasConflict) {
+          slot = { start: eventStart, end: eventEnd };
+        } else {
+          Logger.log(`Preferred time slot has conflicts, will find alternative`);
+        }
+      } catch (e) {
+        Logger.log(`Error parsing preferred date/time: ${e.toString()}`);
+      }
+    }
+    
+    // If no preferred slot or it had conflicts, find available slot
+    if (!slot) {
+      const startDate = preferredDate ? new Date(preferredDate + 'T00:00:00') : new Date();
+      const endDate = new Date(startDate.getTime() + 14 * 24 * 60 * 60 * 1000);
+      
+      slot = findAvailableSlot([bossEmail, assigneeEmail], duration, startDate, endDate);
+    }
     
     if (!slot) {
       // No slot found, set status to conflict
@@ -132,8 +174,10 @@ function scheduleOneOnOne(taskId) {
 
 /**
  * Add task to weekly agenda
+ * @param {string} taskId - Task ID
+ * @param {string} preferredDate - Optional: Preferred date in YYYY-MM-DD format (used to find nearest weekly meeting)
  */
-function addToWeeklyAgenda(taskId) {
+function addToWeeklyAgenda(taskId, preferredDate) {
   try {
     const task = getTask(taskId);
     if (!task) {
@@ -144,7 +188,7 @@ function addToWeeklyAgenda(taskId) {
     const calendar = CalendarApp.getDefaultCalendar();
     
     // Find next weekly meeting (next 30 days)
-    const startDate = new Date();
+    const startDate = preferredDate ? new Date(preferredDate + 'T00:00:00') : new Date();
     const endDate = new Date(startDate.getTime() + 30 * 24 * 60 * 60 * 1000);
     const events = calendar.getEvents(startDate, endDate);
     
@@ -200,22 +244,51 @@ function addToWeeklyAgenda(taskId) {
 
 /**
  * Schedule focus time for Boss
+ * @param {string} taskId - Task ID
+ * @param {string} preferredDate - Optional: Preferred date in YYYY-MM-DD format
+ * @param {string} preferredTime - Optional: Preferred time in HH:MM format (24-hour)
+ * @param {number} durationMinutes - Optional: Duration in minutes (default from config)
  */
-function scheduleFocusTime(taskId) {
+function scheduleFocusTime(taskId, preferredDate, preferredTime, durationMinutes) {
   try {
     const task = getTask(taskId);
     if (!task) {
       throw new Error(`Task ${taskId} not found`);
     }
     
-    const duration = CONFIG.FOCUS_TIME_DURATION_MINUTES();
+    const duration = durationMinutes || CONFIG.FOCUS_TIME_DURATION_MINUTES();
     const calendar = CalendarApp.getDefaultCalendar();
     
-    // Find available slot in next week
-    const startDate = new Date();
-    const endDate = new Date(startDate.getTime() + 7 * 24 * 60 * 60 * 1000);
+    let slot = null;
     
-    const slot = findAvailableSlot([CONFIG.BOSS_EMAIL()], duration, startDate, endDate);
+    // If date and time are provided, use them directly (check for conflicts)
+    if (preferredDate && preferredTime) {
+      try {
+        const [year, month, day] = preferredDate.split('-').map(Number);
+        const [hours, minutes] = preferredTime.split(':').map(Number);
+        const eventStart = new Date(year, month - 1, day, hours, minutes, 0, 0);
+        const eventEnd = new Date(eventStart.getTime() + duration * 60 * 1000);
+        
+        // Check if slot is available
+        const existingEvents = calendar.getEvents(eventStart, eventEnd);
+        
+        if (existingEvents.length === 0) {
+          slot = { start: eventStart, end: eventEnd };
+        } else {
+          Logger.log(`Preferred time slot has conflicts, will find alternative`);
+        }
+      } catch (e) {
+        Logger.log(`Error parsing preferred date/time: ${e.toString()}`);
+      }
+    }
+    
+    // If no preferred slot or it had conflicts, find available slot
+    if (!slot) {
+      const startDate = preferredDate ? new Date(preferredDate + 'T00:00:00') : new Date();
+      const endDate = new Date(startDate.getTime() + 7 * 24 * 60 * 60 * 1000);
+      
+      slot = findAvailableSlot([CONFIG.BOSS_EMAIL()], duration, startDate, endDate);
+    }
     
     if (!slot) {
       updateTask(taskId, {

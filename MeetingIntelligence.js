@@ -20,15 +20,29 @@ function onMeetingFileAdded(e) {
     
     const folders = file.getParents();
     let isInMeetingLake = false;
+    let isInMoMInput = false;
     
     folders.forEach(folder => {
       if (folder.getId() === meetingLakeFolderId) {
         isInMeetingLake = true;
       }
+      // Check if it's in MoM_Input subfolder
+      const parentFolders = folder.getParents();
+      parentFolders.forEach(parent => {
+        if (parent.getId() === meetingLakeFolderId) {
+          if (folder.getName() === 'MoM_Input') {
+            isInMoMInput = true;
+          }
+        }
+      });
     });
     
-    if (isInMeetingLake) {
-      // Process the meeting file
+    if (isInMoMInput) {
+      // Process manually created MoM document
+      Logger.log(`Processing manually created MoM document: ${fileId}`);
+      processManualMoM(fileId);
+    } else if (isInMeetingLake) {
+      // Process the meeting audio file
       processMeetingAudio(fileId);
     }
   } catch (error) {
@@ -109,6 +123,40 @@ function getOrCreateMoMFolder() {
     
   } catch (error) {
     logError(ERROR_TYPE.DATA_ERROR, 'getOrCreateMoMFolder', error.toString(), null, error.stack);
+    throw error;
+  }
+}
+
+/**
+ * Get or create the MoM_Input subfolder within Meeting_lake folder
+ * This folder accepts manually created MoM documents for processing
+ */
+function getOrCreateMoMInputFolder() {
+  try {
+    const meetingLakeFolderId = CONFIG.MEETING_LAKE_FOLDER_ID();
+    if (!meetingLakeFolderId) {
+      throw new Error('MEETING_LAKE_FOLDER_ID not configured');
+    }
+    
+    const meetingLakeFolder = DriveApp.getFolderById(meetingLakeFolderId);
+    const folders = meetingLakeFolder.getFolders();
+    
+    // Check if MoM_Input folder already exists
+    while (folders.hasNext()) {
+      const folder = folders.next();
+      if (folder.getName() === 'MoM_Input') {
+        Logger.log('MoM_Input folder found: ' + folder.getId());
+        return folder;
+      }
+    }
+    
+    // Create MoM_Input folder if it doesn't exist
+    const momInputFolder = meetingLakeFolder.createFolder('MoM_Input');
+    Logger.log('Created MoM_Input folder: ' + momInputFolder.getId());
+    return momInputFolder;
+    
+  } catch (error) {
+    logError(ERROR_TYPE.DATA_ERROR, 'getOrCreateMoMInputFolder', error.toString(), null, error.stack);
     throw error;
   }
 }
@@ -570,6 +618,191 @@ function testMeetingLakeAccess() {
   } catch (error) {
     Logger.log(`ERROR: ${error.toString()}`);
     Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+  }
+}
+
+// ============================================
+// MANUAL MoM PROCESSING
+// ============================================
+
+/**
+ * Process manually created MoM document
+ * Extracts text, analyzes with AI, creates action items, and stores project knowledge
+ */
+function processManualMoM(fileId) {
+  try {
+    Logger.log(`Processing manual MoM document: ${fileId}`);
+    
+    const file = DriveApp.getFileById(fileId);
+    const fileName = file.getName();
+    const mimeType = file.getMimeType();
+    
+    // Only process Google Docs
+    if (mimeType !== 'application/vnd.google-apps.document') {
+      Logger.log(`Skipping file ${fileName}: not a Google Doc (${mimeType})`);
+      return;
+    }
+    
+    // Extract text from Google Doc
+    const docText = extractTextFromGoogleDoc(fileId);
+    if (!docText || docText.trim().length === 0) {
+      Logger.log(`No text found in document: ${fileName}`);
+      return;
+    }
+    
+    Logger.log(`Extracted ${docText.length} characters from document`);
+    
+    // Analyze MoM document with AI
+    const analysisResult = analyzeMoMDocument(docText);
+    Logger.log(`MoM analysis complete: ${JSON.stringify(analysisResult)}`);
+    
+    // Create tasks from action items
+    if (analysisResult.action_items && analysisResult.action_items.length > 0) {
+      const meetingContext = {
+        meetingDate: new Date(),
+        meetingName: fileName,
+        meetingDocUrl: file.getUrl(),
+      };
+      createTasksFromActionItems(analysisResult.action_items, meetingContext);
+    }
+    
+    // Store project knowledge
+    if (analysisResult.projects && analysisResult.projects.length > 0) {
+      analysisResult.projects.forEach(project => {
+        storeProjectKnowledge(project, docText, fileName, file.getUrl());
+      });
+    }
+    
+    // Add to Knowledge_Lake
+    addToKnowledgeLake(file.getUrl(), analysisResult.executive_summary || analysisResult.summary || `MoM: ${fileName}`, fileName);
+    
+    Logger.log(`Manual MoM processed successfully: ${fileName}`);
+    
+  } catch (error) {
+    logError(ERROR_TYPE.UNKNOWN_ERROR, 'processManualMoM', error.toString(), null, error.stack);
+  }
+}
+
+/**
+ * Extract text from Google Doc
+ */
+function extractTextFromGoogleDoc(docId) {
+  try {
+    const doc = DocumentApp.openById(docId);
+    const body = doc.getBody();
+    const text = body.getText();
+    return text;
+  } catch (error) {
+    logError(ERROR_TYPE.API_ERROR, 'extractTextFromGoogleDoc', error.toString(), null, error.stack);
+    throw error;
+  }
+}
+
+/**
+ * Get or create project-specific knowledge folder
+ * @param {string} projectTag - Project tag from Projects_DB
+ * @returns {Folder} Google Drive folder for the project
+ */
+function getOrCreateProjectKnowledgeFolder(projectTag) {
+  try {
+    const meetingLakeFolderId = CONFIG.MEETING_LAKE_FOLDER_ID();
+    if (!meetingLakeFolderId) {
+      throw new Error('MEETING_LAKE_FOLDER_ID not configured');
+    }
+    
+    const meetingLakeFolder = DriveApp.getFolderById(meetingLakeFolderId);
+    const folders = meetingLakeFolder.getFolders();
+    
+    // Check if project folder already exists
+    const projectFolderName = `Project_${projectTag}`;
+    while (folders.hasNext()) {
+      const folder = folders.next();
+      if (folder.getName() === projectFolderName) {
+        Logger.log(`Project knowledge folder found: ${folder.getId()}`);
+        return folder;
+      }
+    }
+    
+    // Create project folder if it doesn't exist
+    const projectFolder = meetingLakeFolder.createFolder(projectFolderName);
+    Logger.log(`Created project knowledge folder: ${projectFolder.getId()}`);
+    return projectFolder;
+    
+  } catch (error) {
+    logError(ERROR_TYPE.DATA_ERROR, 'getOrCreateProjectKnowledgeFolder', error.toString(), null, error.stack);
+    throw error;
+  }
+}
+
+/**
+ * Store project knowledge in project-specific folder
+ */
+function storeProjectKnowledge(projectData, fullText, sourceName, sourceUrl) {
+  try {
+    const projectTag = projectData.project_tag;
+    if (!projectTag) {
+      Logger.log('No project tag found in project data, skipping knowledge storage');
+      return;
+    }
+    
+    // Get or create project folder
+    const projectFolder = getOrCreateProjectKnowledgeFolder(projectTag);
+    
+    // Create a knowledge document
+    const doc = DocumentApp.create(`Knowledge - ${projectTag} - ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')}`);
+    const body = doc.getBody();
+    
+    // Title
+    body.appendParagraph(`Project Knowledge: ${projectTag}`).setHeading(DocumentApp.ParagraphHeading.HEADING1);
+    body.appendParagraph(`Date: ${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMMM d, yyyy')}`);
+    body.appendParagraph(`Source: ${sourceName}`);
+    body.appendParagraph(`Source URL: ${sourceUrl}`);
+    body.appendParagraph('');
+    
+    // Project Summary
+    if (projectData.summary) {
+      body.appendParagraph('Summary').setHeading(DocumentApp.ParagraphHeading.HEADING2);
+      body.appendParagraph(projectData.summary);
+      body.appendParagraph('');
+    }
+    
+    // Key Points
+    if (projectData.key_points && projectData.key_points.length > 0) {
+      body.appendParagraph('Key Points').setHeading(DocumentApp.ParagraphHeading.HEADING2);
+      projectData.key_points.forEach(point => {
+        body.appendListItem(point);
+      });
+      body.appendParagraph('');
+    }
+    
+    // Decisions
+    if (projectData.decisions && projectData.decisions.length > 0) {
+      body.appendParagraph('Decisions').setHeading(DocumentApp.ParagraphHeading.HEADING2);
+      projectData.decisions.forEach(decision => {
+        body.appendListItem(decision);
+      });
+      body.appendParagraph('');
+    }
+    
+    // Full Context (if needed)
+    if (projectData.include_full_context) {
+      body.appendParagraph('Full Context').setHeading(DocumentApp.ParagraphHeading.HEADING2);
+      body.appendParagraph(fullText);
+    }
+    
+    doc.saveAndClose();
+    
+    // Move document to project folder
+    const docFile = DriveApp.getFileById(doc.getId());
+    docFile.moveTo(projectFolder);
+    
+    Logger.log(`Project knowledge stored in folder: ${projectFolder.getName()}`);
+    
+    return doc.getId();
+    
+  } catch (error) {
+    logError(ERROR_TYPE.DATA_ERROR, 'storeProjectKnowledge', error.toString(), null, error.stack);
+    throw error;
   }
 }
 
