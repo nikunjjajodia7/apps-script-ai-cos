@@ -95,7 +95,8 @@ function processVoiceNote(fileId) {
         context: `Original file: ${fileName}. Transcription failed: ${error.toString()}`,
         tone: 'normal',
         confidence: 0.2,
-        ambiguities: ['Transcription failed']
+        ambiguities: ['Transcription failed'],
+        raw_transcript: `[TRANSCRIPTION FAILED] Error: ${error.toString()}`
       });
       Logger.log('Created task with low confidence. Task ID: ' + taskId);
       
@@ -108,6 +109,9 @@ function processVoiceNote(fileId) {
     Logger.log('Parsing voice command...');
     const parsedData = parseVoiceCommand(transcript);
     Logger.log(`Parsed data: ${JSON.stringify(parsedData)}`);
+    
+    // Add the raw transcript to parsed data for storage
+    parsedData.raw_transcript = transcript;
     
     // Create task from parsed data
     Logger.log('Creating task from parsed data...');
@@ -181,16 +185,33 @@ function markFileAsUnclear(file, originalFileName) {
  */
 function createTaskFromVoice(parsedData) {
   try {
-    // Resolve assignee email if name was provided
-    let assigneeEmail = parsedData.assignee_email;
+    // Resolve assignee email and name if provided
+    let assigneeEmail = parsedData.assignee_email || '';
+    let assigneeName = parsedData.assignee_name || '';
     
-    if (!assigneeEmail && parsedData.assignee_name) {
-      // Try to find staff by name (improved matching)
-      assigneeEmail = findStaffEmailByName(parsedData.assignee_name);
+    Logger.log(`Voice input - name: "${assigneeName}", email: "${assigneeEmail}"`);
+    
+    // Case 1: We have a name but no email - find email from Staff_DB
+    if (!assigneeEmail && assigneeName) {
+      assigneeEmail = findStaffEmailByName(assigneeName);
       if (assigneeEmail) {
-        Logger.log(`Matched name "${parsedData.assignee_name}" to email: ${assigneeEmail}`);
+        Logger.log(`Matched name "${assigneeName}" to email: ${assigneeEmail}`);
       }
     }
+    
+    // Case 2: We have an email - always look up the official name from Staff_DB
+    if (assigneeEmail) {
+      const staff = getStaff(assigneeEmail);
+      if (staff && staff.Name) {
+        assigneeName = staff.Name;
+        Logger.log(`Using official name from Staff_DB: ${assigneeName}`);
+      } else {
+        Logger.log(`Staff not found for email: ${assigneeEmail}, keeping name: "${assigneeName}"`);
+      }
+    }
+    
+    Logger.log(`Final resolved - name: "${assigneeName}", email: "${assigneeEmail}"`);
+    
     
     // Resolve project tag if project name was provided
     let projectTag = parsedData.project_tag;
@@ -220,17 +241,26 @@ function createTaskFromVoice(parsedData) {
     }
     
     // Prepare task data
+    // Ensure due_date is in dd-MM-yyyy text format
+    let formattedDueDate = parsedData.due_date || '';
+    // Validate format - should be dd-MM-yyyy from Gemini
+    if (formattedDueDate && !/^\d{1,2}-\d{1,2}-\d{4}$/.test(formattedDueDate)) {
+      Logger.log(`Warning: Due date "${formattedDueDate}" is not in expected dd-MM-yyyy format`);
+    }
+    
     const taskData = {
       Task_Name: parsedData.task_name || 'Untitled Task',
       Status: status,
+      Assignee_Name: assigneeName || '',
       Assignee_Email: assigneeEmail || '',
-      Due_Date: parsedData.due_date || '',
+      Due_Date: formattedDueDate,
       Project_Tag: projectTag || '',
       AI_Confidence: parsedData.confidence || 0.5,
       Tone_Detected: parsedData.tone || 'normal',
       Context_Hidden: parsedData.context || '',
       Created_By: 'Voice',
       Priority: parsedData.priority || (parsedData.tone === 'urgent' ? 'High' : 'Medium'),
+      Voice_Transcript: parsedData.raw_transcript || '',
     };
     
     // Add due time to context if specified
@@ -243,6 +273,20 @@ function createTaskFromVoice(parsedData) {
     if (parsedData.ambiguities && parsedData.ambiguities.length > 0) {
       taskData.Context_Hidden = (taskData.Context_Hidden || '') + 
         '\n\nAmbiguities: ' + parsedData.ambiguities.join(', ');
+    }
+    
+    // Add name matching debug info if available
+    if (parsedData.name_heard_as) {
+      taskData.Context_Hidden = (taskData.Context_Hidden || '') + 
+        '\n\nVoice Recognition: Heard "' + parsedData.name_heard_as + '"' +
+        (parsedData.assignee_name ? ' → Matched to "' + parsedData.assignee_name + '"' : ' → No match found');
+    }
+    
+    // Add due date text for reference
+    if (parsedData.due_date_text) {
+      taskData.Context_Hidden = (taskData.Context_Hidden || '') + 
+        '\n\nDue Date Spoken: "' + parsedData.due_date_text + '"' +
+        (parsedData.due_date ? ' → Interpreted as ' + parsedData.due_date : '');
     }
     
     // Create task

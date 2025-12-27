@@ -42,8 +42,13 @@ function doPost(e) {
     const data = postData.data || {};
     
     Logger.log(`Dashboard action: ${action} for task ${taskId}`);
+    Logger.log(`Full postData: ${JSON.stringify(postData)}`);
+    Logger.log(`Action type: ${typeof action}, value: "${action}"`);
     
     let result = { success: false, message: 'Unknown action' };
+    
+    // Log all available actions for debugging
+    Logger.log(`Checking action "${action}" against switch cases...`);
     
     switch (action) {
       // Frontend API actions
@@ -55,6 +60,9 @@ function doPost(e) {
         break;
       case 'delete_task':
         result = handleDeleteTask(taskId);
+        break;
+      case 'add_staff':
+        result = handleAddStaff(postData);
         break;
       // Category B1: Review_AI_Assist actions
       case 'approve_interpretation':
@@ -167,7 +175,23 @@ function doPost(e) {
         result = handleMarkHandled(taskId);
         break;
       
+      // Admin actions
+      case 'save_prompt':
+        result = handleSavePrompt(postData);
+        break;
+      case 'save_workflow':
+        result = handleSaveWorkflow(postData);
+        break;
+      case 'delete_workflow':
+        result = handleDeleteWorkflow(postData);
+        break;
+      case 'test_workflow':
+        result = handleTestWorkflow(postData);
+        break;
+      
       default:
+        Logger.log(`Action "${action}" did not match any case in switch statement`);
+        Logger.log(`Available actions include: create_task, update_task, delete_task, modify_task, etc.`);
         result = { success: false, message: `Unknown action: ${action}` };
     }
     
@@ -202,16 +226,139 @@ function handleApproveInterpretation(taskId, data) {
 }
 
 function handleModifyTask(taskId, data) {
+  // #region agent log
+  Logger.log(JSON.stringify({
+    sessionId: 'debug-session',
+    runId: 'run1',
+    hypothesisId: 'B',
+    location: 'DashboardActions.gs:218',
+    message: 'handleModifyTask entry',
+    data: { taskId: taskId, incomingData: data, dataKeys: Object.keys(data || {}) },
+    timestamp: Date.now()
+  }));
+  // #endregion
+  
   const updates = {};
   if (data.taskName) updates.Task_Name = data.taskName;
-  if (data.assigneeEmail) updates.Assignee_Email = data.assigneeEmail;
-  if (data.dueDate) updates.Due_Date = data.dueDate;
+  if (data.dueDate) {
+    // Store date as text in dd-MM-yyyy format
+    if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(data.dueDate)) {
+      updates.Due_Date = data.dueDate; // Already in correct format
+    } else {
+      // Try to parse and convert to dd-MM-yyyy
+      try {
+        const parsed = new Date(data.dueDate);
+        if (!isNaN(parsed.getTime())) {
+          const day = String(parsed.getDate()).padStart(2, '0');
+          const month = String(parsed.getMonth() + 1).padStart(2, '0');
+          const year = parsed.getFullYear();
+          updates.Due_Date = day + '-' + month + '-' + year;
+        } else {
+          updates.Due_Date = data.dueDate; // Keep as-is if can't parse
+        }
+      } catch (e) {
+        updates.Due_Date = data.dueDate;
+      }
+    }
+  }
   if (data.context) updates.Context_Hidden = data.context;
+  if (data.description) updates.Context_Hidden = data.description;
+  if (data.priority) updates.Priority = data.priority;
   
-  updates.Status = updates.Assignee_Email ? TASK_STATUS.ASSIGNED : TASK_STATUS.NEW;
+  // Handle assignee - support both email and name
+  let finalAssigneeName = data.assigneeName;
+  let finalAssigneeEmail = data.assigneeEmail;
+  
+  // #region agent log
+  Logger.log(JSON.stringify({
+    sessionId: 'debug-session',
+    runId: 'run1',
+    hypothesisId: 'B',
+    location: 'DashboardActions.gs:232',
+    message: 'handleModifyTask - assignee values',
+    data: { finalAssigneeName: finalAssigneeName, finalAssigneeEmail: finalAssigneeEmail, assigneeNameType: typeof finalAssigneeName, assigneeEmailType: typeof finalAssigneeEmail },
+    timestamp: Date.now()
+  }));
+  // #endregion
+  
+  if (finalAssigneeEmail !== undefined) {
+    updates.Assignee_Email = finalAssigneeEmail;
+    
+    // If name is also provided, ensure staff exists and save name
+    if (finalAssigneeName !== undefined && finalAssigneeName) {
+      const existingStaff = getStaff(finalAssigneeEmail);
+      if (!existingStaff) {
+        Logger.log(`Creating new staff member: "${finalAssigneeName}" with email: ${finalAssigneeEmail}`);
+        createStaff(finalAssigneeName, finalAssigneeEmail);
+      } else if (existingStaff.Name !== finalAssigneeName) {
+        Logger.log(`Updating staff name from "${existingStaff.Name}" to "${finalAssigneeName}"`);
+        updateStaff(finalAssigneeEmail, { Name: finalAssigneeName });
+      }
+      updates.Assignee_Name = finalAssigneeName;
+    } else if (finalAssigneeEmail) {
+      // Email provided but no name - try to get name from staff
+      const staff = getStaff(finalAssigneeEmail);
+      if (staff) {
+        updates.Assignee_Name = staff.Name;
+      }
+    }
+  } else if (finalAssigneeName !== undefined && finalAssigneeName) {
+    // Only name provided - find matching email(s)
+    const existingTask = getTask(taskId);
+    const matchedEmail = findStaffEmailByName(finalAssigneeName);
+    if (matchedEmail) {
+      updates.Assignee_Email = matchedEmail;
+      updates.Assignee_Name = finalAssigneeName;
+      Logger.log(`Matched name "${finalAssigneeName}" to email: ${matchedEmail}`);
+    } else if (existingTask && existingTask.Assignee_Email) {
+      // Use existing email and create staff member
+      Logger.log(`Creating new staff member: "${finalAssigneeName}" with email: ${existingTask.Assignee_Email}`);
+      const created = createStaff(finalAssigneeName, existingTask.Assignee_Email);
+      if (created) {
+        updates.Assignee_Email = existingTask.Assignee_Email;
+        updates.Assignee_Name = finalAssigneeName;
+      }
+    }
+  }
+  
+  // Update status based on assignee
+  if (updates.Assignee_Email) {
+    updates.Status = TASK_STATUS.ASSIGNED;
+  } else if (data.assigneeEmail === null || data.assigneeEmail === '') {
+    // Explicitly unassigning
+    updates.Status = TASK_STATUS.NEW;
+    updates.Assignee_Name = '';
+    updates.Assignee_Email = '';
+  }
+  
+  // #region agent log
+  Logger.log(JSON.stringify({
+    sessionId: 'debug-session',
+    runId: 'run1',
+    hypothesisId: 'B',
+    location: 'DashboardActions.gs:280',
+    message: 'handleModifyTask - updates before updateTask',
+    data: { updates: updates, updatesKeys: Object.keys(updates) },
+    timestamp: Date.now()
+  }));
+  // #endregion
+  
   updateTask(taskId, updates);
   
-  if (updates.Status === TASK_STATUS.ASSIGNED) {
+  // #region agent log
+  const updatedTask = getTask(taskId);
+  Logger.log(JSON.stringify({
+    sessionId: 'debug-session',
+    runId: 'run1',
+    hypothesisId: 'B',
+    location: 'DashboardActions.gs:290',
+    message: 'handleModifyTask - task after update',
+    data: { taskId: taskId, assigneeName: updatedTask?.Assignee_Name, assigneeEmail: updatedTask?.Assignee_Email },
+    timestamp: Date.now()
+  }));
+  // #endregion
+  
+  if (updates.Status === TASK_STATUS.ASSIGNED && updates.Assignee_Email) {
     sendTaskAssignmentEmail(taskId);
   }
   
@@ -432,6 +579,100 @@ function handleCancelTask(taskId) {
   return { success: true, message: 'Task cancelled' };
 }
 
+// Task deletion handler
+function handleDeleteTask(taskId) {
+  // #region agent log
+  Logger.log(JSON.stringify({
+    sessionId: 'debug-session',
+    runId: 'run1',
+    hypothesisId: 'A',
+    location: 'DashboardActions.gs:502',
+    message: 'handleDeleteTask entry',
+    data: { taskId: taskId },
+    timestamp: Date.now()
+  }));
+  // #endregion
+  
+  if (!taskId) {
+    Logger.log('Error: taskId is required for deletion');
+    return { success: false, message: 'Task ID is required' };
+  }
+  
+  const task = getTask(taskId);
+  if (!task) {
+    // #region agent log
+    Logger.log(JSON.stringify({
+      sessionId: 'debug-session',
+      runId: 'run1',
+      hypothesisId: 'A',
+      location: 'DashboardActions.gs:515',
+      message: 'handleDeleteTask - task not found',
+      data: { taskId: taskId },
+      timestamp: Date.now()
+    }));
+    // #endregion
+    return { success: false, message: 'Task not found' };
+  }
+  
+  // #region agent log
+  Logger.log(JSON.stringify({
+    sessionId: 'debug-session',
+    runId: 'run1',
+    hypothesisId: 'A',
+    location: 'DashboardActions.gs:525',
+    message: 'handleDeleteTask - task found, deleting',
+    data: { taskId: taskId, taskName: task.Task_Name },
+    timestamp: Date.now()
+  }));
+  // #endregion
+  
+  try {
+    const deleted = deleteRowByValue(SHEETS.TASKS_DB, 'Task_ID', taskId);
+    if (deleted) {
+      // #region agent log
+      Logger.log(JSON.stringify({
+        sessionId: 'debug-session',
+        runId: 'run1',
+        hypothesisId: 'A',
+        location: 'DashboardActions.gs:533',
+        message: 'handleDeleteTask - deletion successful',
+        data: { taskId: taskId },
+        timestamp: Date.now()
+      }));
+      // #endregion
+      return { success: true, message: 'Task deleted successfully' };
+    } else {
+      // #region agent log
+      Logger.log(JSON.stringify({
+        sessionId: 'debug-session',
+        runId: 'run1',
+        hypothesisId: 'A',
+        location: 'DashboardActions.gs:541',
+        message: 'handleDeleteTask - deletion failed (row not found)',
+        data: { taskId: taskId },
+        timestamp: Date.now()
+      }));
+      // #endregion
+      return { success: false, message: 'Failed to delete task - row not found in sheet' };
+    }
+  } catch (error) {
+    // #region agent log
+    Logger.log(JSON.stringify({
+      sessionId: 'debug-session',
+      runId: 'run1',
+      hypothesisId: 'A',
+      location: 'DashboardActions.gs:550',
+      message: 'handleDeleteTask - exception',
+      data: { taskId: taskId, error: error.toString(), stack: error.stack },
+      timestamp: Date.now()
+    }));
+    // #endregion
+    Logger.log('Error deleting task: ' + error.toString());
+    Logger.log('Stack trace: ' + (error.stack || 'No stack trace'));
+    return { success: false, message: 'Error deleting task: ' + error.toString() };
+  }
+}
+
 // Category C3: Review_Role handlers
 function handleAcceptReassign(taskId, data) {
   if (!data.newAssigneeEmail) {
@@ -613,9 +854,17 @@ function handleMarkHandled(taskId) {
 // Frontend API handlers
 function handleCreateTask(postData) {
   try {
-    const { taskName, assigneeEmail, assigneeName, dueDate, priority, description, projectId, projectName } = postData;
+    // Debug logging
+    Logger.log('handleCreateTask received postData: ' + JSON.stringify(postData));
+    
+    // Extract from postData.data (frontend sends data nested under 'data' key)
+    const inputData = postData.data || postData;
+    const { taskName, assigneeEmail, assigneeName, dueDate, priority, description, projectId, projectName } = inputData;
+    
+    Logger.log('Extracted taskName: ' + taskName);
     
     if (!taskName) {
+      Logger.log('taskName is missing! postData keys: ' + Object.keys(postData).join(', '));
       return { success: false, error: 'taskName is required' };
     }
     
@@ -671,10 +920,27 @@ function handleCreateTask(postData) {
       projectTag = findProjectTagByName(searchText);
     }
     
+    // Get assignee name if email is available
+    let finalAssigneeName = assigneeName;
+    if (finalAssigneeEmail && !finalAssigneeName) {
+      const staff = getStaff(finalAssigneeEmail);
+      if (staff) {
+        finalAssigneeName = staff.Name;
+      }
+    } else if (finalAssigneeName && finalAssigneeEmail) {
+      // Both provided - ensure they match
+      const staff = getStaff(finalAssigneeEmail);
+      if (staff && staff.Name !== finalAssigneeName) {
+        // Update staff name if different
+        updateStaff(finalAssigneeEmail, { Name: finalAssigneeName });
+      }
+    }
+    
     // Create task data object
     const taskData = {
       Task_Name: taskName,
       Status: finalAssigneeEmail ? TASK_STATUS.ASSIGNED : TASK_STATUS.NEW,
+      Assignee_Name: finalAssigneeName || '',
       Assignee_Email: finalAssigneeEmail || '',
       Project_Tag: projectTag || '',
       Priority: priority || 'Medium',
@@ -682,12 +948,24 @@ function handleCreateTask(postData) {
       Created_By: 'Manual'
     };
     
-    // Parse due date if provided
+    // Store due date as text in dd-MM-yyyy format
     if (dueDate) {
-      try {
-        taskData.Due_Date = new Date(dueDate);
-      } catch (e) {
-        Logger.log('Invalid due date format: ' + dueDate);
+      // If it's already in dd-MM-yyyy format, use as-is
+      if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(dueDate)) {
+        taskData.Due_Date = dueDate;
+      } else {
+        // Try to parse and convert to dd-MM-yyyy
+        try {
+          const parsed = new Date(dueDate);
+          if (!isNaN(parsed.getTime())) {
+            const day = String(parsed.getDate()).padStart(2, '0');
+            const month = String(parsed.getMonth() + 1).padStart(2, '0');
+            const year = parsed.getFullYear();
+            taskData.Due_Date = day + '-' + month + '-' + year;
+          }
+        } catch (e) {
+          Logger.log('Invalid due date format: ' + dueDate);
+        }
       }
     }
     
@@ -721,7 +999,10 @@ function handleCreateTask(postData) {
 
 function handleUpdateTask(postData) {
   try {
-    const { taskId, ...fieldsToUpdate } = postData;
+    // Extract from postData.data (frontend sends data nested under 'data' key)
+    const inputData = postData.data || postData;
+    const taskId = postData.taskId || inputData.taskId;
+    const { taskId: _, ...fieldsToUpdate } = inputData;
     
     if (!taskId) {
       return { success: false, error: 'taskId is required' };
@@ -738,37 +1019,50 @@ function handleUpdateTask(postData) {
     if (fieldsToUpdate.taskName !== undefined) updates.Task_Name = fieldsToUpdate.taskName;
     
     // Handle assignee - support both email and name
-    if (fieldsToUpdate.assigneeEmail !== undefined) {
-      updates.Assignee_Email = fieldsToUpdate.assigneeEmail;
+    let finalAssigneeName = fieldsToUpdate.assigneeName;
+    let finalAssigneeEmail = fieldsToUpdate.assigneeEmail;
+    
+    if (finalAssigneeEmail !== undefined) {
+      updates.Assignee_Email = finalAssigneeEmail;
       
-      // If name is also provided, ensure staff exists
-      if (fieldsToUpdate.assigneeName !== undefined && fieldsToUpdate.assigneeName) {
-        const existingStaff = getStaff(fieldsToUpdate.assigneeEmail);
+      // If name is also provided, ensure staff exists and save name
+      if (finalAssigneeName !== undefined && finalAssigneeName) {
+        const existingStaff = getStaff(finalAssigneeEmail);
         if (!existingStaff) {
-          Logger.log(`Creating new staff member: "${fieldsToUpdate.assigneeName}" with email: ${fieldsToUpdate.assigneeEmail}`);
-          createStaff(fieldsToUpdate.assigneeName, fieldsToUpdate.assigneeEmail);
-        } else if (existingStaff.Name !== fieldsToUpdate.assigneeName) {
-          Logger.log(`Updating staff name from "${existingStaff.Name}" to "${fieldsToUpdate.assigneeName}"`);
-          updateStaff(fieldsToUpdate.assigneeEmail, { Name: fieldsToUpdate.assigneeName });
+          Logger.log(`Creating new staff member: "${finalAssigneeName}" with email: ${finalAssigneeEmail}`);
+          createStaff(finalAssigneeName, finalAssigneeEmail);
+        } else if (existingStaff.Name !== finalAssigneeName) {
+          Logger.log(`Updating staff name from "${existingStaff.Name}" to "${finalAssigneeName}"`);
+          updateStaff(finalAssigneeEmail, { Name: finalAssigneeName });
+        }
+        updates.Assignee_Name = finalAssigneeName;
+      } else if (finalAssigneeEmail) {
+        // Email provided but no name - try to get name from staff
+        const staff = getStaff(finalAssigneeEmail);
+        if (staff) {
+          updates.Assignee_Name = staff.Name;
         }
       }
-    } else if (fieldsToUpdate.assigneeName !== undefined && fieldsToUpdate.assigneeName) {
-      const matchedEmail = findStaffEmailByName(fieldsToUpdate.assigneeName);
+    } else if (finalAssigneeName !== undefined && finalAssigneeName) {
+      // Only name provided - find matching email(s)
+      const matchedEmail = findStaffEmailByName(finalAssigneeName);
       if (matchedEmail) {
         updates.Assignee_Email = matchedEmail;
-        Logger.log(`Matched name "${fieldsToUpdate.assigneeName}" to email: ${matchedEmail}`);
+        updates.Assignee_Name = finalAssigneeName;
+        Logger.log(`Matched name "${finalAssigneeName}" to email: ${matchedEmail}`);
       } else {
         // Name doesn't exist - check if we have email from existing task
         const currentEmail = existingTask.Assignee_Email;
         if (currentEmail) {
           // Use existing email and create staff member
-          Logger.log(`Creating new staff member: "${fieldsToUpdate.assigneeName}" with email: ${currentEmail}`);
-          const created = createStaff(fieldsToUpdate.assigneeName, currentEmail);
+          Logger.log(`Creating new staff member: "${finalAssigneeName}" with email: ${currentEmail}`);
+          const created = createStaff(finalAssigneeName, currentEmail);
           if (created) {
             updates.Assignee_Email = currentEmail;
+            updates.Assignee_Name = finalAssigneeName;
           }
         } else {
-          Logger.log(`Could not match name "${fieldsToUpdate.assigneeName}" and no email available to create staff member`);
+          Logger.log(`Could not match name "${finalAssigneeName}" and no email available to create staff member`);
         }
       }
     }
@@ -776,10 +1070,25 @@ function handleUpdateTask(postData) {
     if (fieldsToUpdate.status !== undefined) updates.Status = fieldsToUpdate.status;
     if (fieldsToUpdate.priority !== undefined) updates.Priority = fieldsToUpdate.priority;
     if (fieldsToUpdate.dueDate !== undefined) {
-      try {
-        updates.Due_Date = new Date(fieldsToUpdate.dueDate);
-      } catch (e) {
-        Logger.log('Invalid due date format: ' + fieldsToUpdate.dueDate);
+      const dueDate = fieldsToUpdate.dueDate;
+      // If it's already in dd-MM-yyyy format, use as-is
+      if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(dueDate)) {
+        updates.Due_Date = dueDate;
+      } else if (dueDate) {
+        // Try to parse and convert to dd-MM-yyyy
+        try {
+          const parsed = new Date(dueDate);
+          if (!isNaN(parsed.getTime())) {
+            const day = String(parsed.getDate()).padStart(2, '0');
+            const month = String(parsed.getMonth() + 1).padStart(2, '0');
+            const year = parsed.getFullYear();
+            updates.Due_Date = day + '-' + month + '-' + year;
+          }
+        } catch (e) {
+          Logger.log('Invalid due date format: ' + dueDate);
+        }
+      } else {
+        updates.Due_Date = ''; // Clear the date
       }
     }
     if (fieldsToUpdate.description !== undefined) updates.Context_Hidden = fieldsToUpdate.description;
@@ -871,6 +1180,7 @@ function doGet(e) {
       const formattedTasks = filteredTasks.map(task => ({
         taskId: task.Task_ID || '',
         taskName: task.Task_Name || '',
+        assigneeName: task.Assignee_Name || '',
         assigneeEmail: task.Assignee_Email || '',
         status: task.Status || '',
         priority: task.Priority || '',
@@ -898,6 +1208,26 @@ function doGet(e) {
         success: true,
         data: filteredTasks,
         count: filteredTasks.length
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    if (action === 'staff_by_name') {
+      const name = e.parameter.name;
+      if (!name) {
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: 'name parameter required'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      
+      const staffMembers = getStaffByName(name);
+      return ContentService.createTextOutput(JSON.stringify({
+        success: true,
+        data: staffMembers.map(s => ({
+          Email: s.Email,
+          Name: s.Name,
+          Role: s.Role || ''
+        }))
       })).setMimeType(ContentService.MimeType.JSON);
     }
     
@@ -971,9 +1301,37 @@ function doGet(e) {
       })).setMimeType(ContentService.MimeType.JSON);
     }
     
+    // Admin endpoints
+    if (action === 'admin_tasks') {
+      const tasks = getSheetData(SHEETS.TASKS_DB);
+      // Return all tasks with full details for table view
+      return ContentService.createTextOutput(JSON.stringify({
+        success: true,
+        data: tasks,
+        count: tasks.length
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    if (action === 'get_prompts') {
+      const category = e.parameter.category || 'voice';
+      const prompts = getAllPrompts(category);
+      return ContentService.createTextOutput(JSON.stringify({
+        success: true,
+        data: prompts
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    if (action === 'get_workflows') {
+      const workflows = getSheetData(SHEETS.WORKFLOWS);
+      return ContentService.createTextOutput(JSON.stringify({
+        success: true,
+        data: workflows
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
     return ContentService.createTextOutput(JSON.stringify({
       error: 'Unknown action',
-      availableActions: ['health', 'info', 'tasks', 'staff', 'projects', 'task']
+      availableActions: ['health', 'info', 'tasks', 'staff', 'projects', 'task', 'admin_tasks', 'get_prompts', 'get_workflows']
     })).setMimeType(ContentService.MimeType.JSON);
     
   } catch (error) {
@@ -1128,6 +1486,187 @@ function handleFileUpload(e) {
       success: false,
       error: error.toString()
     })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Handle save prompt request
+ */
+function handleSavePrompt(postData) {
+  try {
+    const { promptName, category, content, description } = postData;
+    
+    if (!promptName || !category || !content) {
+      return { success: false, error: 'promptName, category, and content are required' };
+    }
+    
+    savePrompt(promptName, category, content, description || '');
+    return { success: true, message: 'Prompt saved successfully' };
+  } catch (error) {
+    Logger.log('Error in handleSavePrompt: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle save workflow request
+ */
+function handleSaveWorkflow(postData) {
+  try {
+    const { workflowId, name, triggerEvent, conditions, actions, timing, active, description } = postData;
+    
+    if (!name || !triggerEvent) {
+      return { success: false, error: 'name and triggerEvent are required' };
+    }
+    
+    const spreadsheet = getSpreadsheet();
+    const sheet = spreadsheet.getSheetByName(SHEETS.WORKFLOWS);
+    if (!sheet) {
+      return { success: false, error: 'Workflows sheet not found' };
+    }
+    
+    const data = sheet.getDataRange().getValues();
+    let found = false;
+    let rowIndex = -1;
+    
+    // Check if workflow exists
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][0] === workflowId) {
+        found = true;
+        rowIndex = i + 1;
+        break;
+      }
+    }
+    
+    const now = new Date();
+    const conditionsJson = typeof conditions === 'string' ? conditions : JSON.stringify(conditions || {});
+    const actionsJson = typeof actions === 'string' ? actions : JSON.stringify(actions || []);
+    const timingJson = typeof timing === 'string' ? timing : JSON.stringify(timing || {});
+    
+    if (found) {
+      // Update existing workflow
+      sheet.getRange(rowIndex, 1, 1, 9).setValues([[
+        workflowId,
+        name,
+        triggerEvent,
+        conditionsJson,
+        actionsJson,
+        timingJson,
+        active !== false,
+        now,
+        description || ''
+      ]]);
+      Logger.log(`Updated workflow: ${workflowId}`);
+    } else {
+      // Create new workflow
+      const newWorkflowId = workflowId || `WF-${Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyyMMddHHmmss')}`;
+      sheet.appendRow([
+        newWorkflowId,
+        name,
+        triggerEvent,
+        conditionsJson,
+        actionsJson,
+        timingJson,
+        active !== false,
+        now,
+        description || ''
+      ]);
+      Logger.log(`Created new workflow: ${newWorkflowId}`);
+    }
+    
+    return { success: true, message: 'Workflow saved successfully' };
+  } catch (error) {
+    Logger.log('Error in handleSaveWorkflow: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle delete workflow request
+ */
+function handleDeleteWorkflow(postData) {
+  try {
+    const { workflowId } = postData;
+    
+    if (!workflowId) {
+      return { success: false, error: 'workflowId is required' };
+    }
+    
+    const spreadsheet = getSpreadsheet();
+    const sheet = spreadsheet.getSheetByName(SHEETS.WORKFLOWS);
+    if (!sheet) {
+      return { success: false, error: 'Workflows sheet not found' };
+    }
+    
+    const data = sheet.getDataRange().getValues();
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][0] === workflowId) {
+        sheet.deleteRow(i + 1);
+        Logger.log(`Deleted workflow: ${workflowId}`);
+        return { success: true, message: 'Workflow deleted successfully' };
+      }
+    }
+    
+    return { success: false, error: 'Workflow not found' };
+  } catch (error) {
+    Logger.log('Error in handleDeleteWorkflow: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle test workflow request (dry run)
+ */
+function handleTestWorkflow(postData) {
+  try {
+    const { workflow, sampleContext } = postData;
+    
+    if (!workflow) {
+      return { success: false, error: 'workflow is required' };
+    }
+    
+    const result = testWorkflow(workflow, sampleContext || {});
+    return { success: true, data: result };
+  } catch (error) {
+    Logger.log('Error in handleTestWorkflow: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle add staff request
+ */
+function handleAddStaff(postData) {
+  try {
+    const data = postData.data || {};
+    const { name, email, role } = data;
+    
+    if (!name || !email) {
+      return { success: false, error: 'name and email are required' };
+    }
+    
+    // Check if staff already exists
+    const existingStaff = getStaff(email);
+    if (existingStaff) {
+      return { success: false, error: 'Staff member with this email already exists' };
+    }
+    
+    // Create new staff member
+    const created = createStaff(name, email, { Role: role || 'Team Member' });
+    
+    if (created) {
+      const newStaff = getStaff(email);
+      return { 
+        success: true, 
+        data: newStaff,
+        message: 'Staff member created successfully' 
+      };
+    } else {
+      return { success: false, error: 'Failed to create staff member' };
+    }
+  } catch (error) {
+    Logger.log('Error in handleAddStaff: ' + error.toString());
+    return { success: false, error: error.toString() };
   }
 }
 

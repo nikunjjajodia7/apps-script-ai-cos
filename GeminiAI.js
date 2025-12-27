@@ -306,14 +306,30 @@ function transcribeAudio(audioFileId) {
         role: 'user',
         parts: [
           {
-            text: `Transcribe this audio file accurately. Follow these guidelines:
+            text: `Transcribe this audio file accurately. This is a TASK ASSIGNMENT voice note, so pay EXTRA attention to NAMES and DATES.
+
+CRITICAL FOR NAMES (MOST IMPORTANT):
+- Pay MAXIMUM attention to proper nouns (names of people)
+- When you hear a person's name, transcribe it CLEARLY even if pronunciation is unclear
+- Common Indian/South Asian names you might hear: Anaaya, Nikunj, Priya, Rahul, Vikram, Shreya, Aarav, Arjun, Amit, Ankit, Deepak, Gaurav, Harsh, Karan, Manish, Neha, Pooja, Rajesh, Sachin, Suresh, Vinay
+- For names with double vowels (Anaaya, Priya, etc.), preserve them: "aa", "ee", "oo"
+- If a name sounds like "anaya", write it as "Anaya" (could be Anaaya)
+- NEVER skip or omit names - they determine who gets assigned the task
+- If you hear "assign to [name]", "give to [name]", "[name] should do", "[name] ko do" - capture the name precisely
+
+CRITICAL FOR DATES AND TIMES:
+- Preserve dates in their spoken form: "tomorrow", "next Monday", "by Friday", "15th January", "end of week"
+- Preserve times: "by 3 PM", "before noon", "in the morning"
+- Hindi date words: "kal" (tomorrow), "parson" (day after tomorrow), "agle hafte" (next week)
+
+GENERAL RULES:
 - Preserve all spoken words exactly as spoken
 - Include proper punctuation (periods, commas, question marks)
-- Preserve numbers, dates, and times in their spoken form
-- Keep names, email addresses, and technical terms exactly as spoken
+- Keep email addresses and technical terms exactly as spoken
 - Do not add commentary, explanations, or corrections
 - If audio quality is poor, transcribe what you can hear and indicate unclear parts with [unclear]
-- Return only the transcribed text, nothing else`
+
+Return ONLY the transcribed text, nothing else.`
           },
           {
             inlineData: {
@@ -324,7 +340,7 @@ function transcribeAudio(audioFileId) {
         ]
       }],
       generationConfig: {
-        temperature: 0.3,
+        temperature: 0.2, // Lower temperature for more accurate transcription
         maxOutputTokens: 4096,
       }
     };
@@ -372,15 +388,26 @@ function transcribeAudio(audioFileId) {
 }
 
 /**
- * Get staff list for context in AI prompts
+ * Get staff list for context in AI prompts (enhanced with phonetic hints)
  */
 function getStaffListForContext() {
   try {
     const staff = getSheetData(SHEETS.STAFF_DB);
     if (!staff || staff.length === 0) return '';
     
-    const staffList = staff.map(s => `- ${s.Name || 'Unknown'} (${s.Email || 'No email'})`).join('\n');
-    return `\n\nAVAILABLE STAFF MEMBERS:\n${staffList}`;
+    const staffList = staff.map(s => {
+      const name = s.Name || 'Unknown';
+      const email = s.Email || 'No email';
+      // Generate phonetic hints for first name
+      const firstName = name.split(' ')[0];
+      const phoneticHint = generatePhoneticHints(firstName);
+      return `- ${name} (${email})${phoneticHint ? ` [sounds like: ${phoneticHint}]` : ''}`;
+    }).join('\n');
+    
+    return `\n\nAVAILABLE STAFF MEMBERS (use EXACT spelling from this list):
+${staffList}
+
+NOTE: Match transcribed names to this list even if spelling differs slightly. The name in the transcript may be a phonetic approximation.`;
   } catch (error) {
     Logger.log(`Error getting staff list: ${error.toString()}`);
     return '';
@@ -404,165 +431,416 @@ function getProjectsListForContext() {
 }
 
 /**
+ * Get current date context for AI prompts
+ * Provides today's date and calculated relative dates in dd-MM-yyyy format
+ */
+function getDateContextForPrompt() {
+  const tz = Session.getScriptTimeZone();
+  const today = new Date();
+  const dayOfWeek = Utilities.formatDate(today, tz, 'EEEE');
+  const dateFormat = 'dd-MM-yyyy'; // Indian date format
+  const todayStr = Utilities.formatDate(today, tz, dateFormat);
+  
+  // Calculate various relative dates
+  const tomorrow = new Date(today);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  
+  const dayAfterTomorrow = new Date(today);
+  dayAfterTomorrow.setDate(dayAfterTomorrow.getDate() + 2);
+  
+  // Current week Monday and Sunday
+  const currentDay = today.getDay();
+  const monday = new Date(today);
+  monday.setDate(today.getDate() - (currentDay === 0 ? 6 : currentDay - 1));
+  
+  const sunday = new Date(monday);
+  sunday.setDate(monday.getDate() + 6);
+  
+  const friday = new Date(monday);
+  friday.setDate(monday.getDate() + 4);
+  
+  // Next week
+  const nextMonday = new Date(monday);
+  nextMonday.setDate(monday.getDate() + 7);
+  
+  const nextSunday = new Date(nextMonday);
+  nextSunday.setDate(nextMonday.getDate() + 6);
+  
+  const nextFriday = new Date(nextMonday);
+  nextFriday.setDate(nextMonday.getDate() + 4);
+  
+  // This Friday (current or next depending on today)
+  const thisFriday = currentDay <= 5 ? friday : nextFriday;
+  
+  // One/two weeks from today
+  const oneWeek = new Date(today);
+  oneWeek.setDate(today.getDate() + 7);
+  
+  const twoWeeks = new Date(today);
+  twoWeeks.setDate(today.getDate() + 14);
+  
+  return {
+    TODAY_DATE: todayStr,
+    DAY_OF_WEEK: dayOfWeek,
+    TOMORROW_DATE: Utilities.formatDate(tomorrow, tz, dateFormat),
+    DAY_AFTER_TOMORROW_DATE: Utilities.formatDate(dayAfterTomorrow, tz, dateFormat),
+    MONDAY_DATE: Utilities.formatDate(monday, tz, dateFormat),
+    SUNDAY_DATE: Utilities.formatDate(sunday, tz, dateFormat),
+    FRIDAY_DATE: Utilities.formatDate(friday, tz, dateFormat),
+    NEXT_MONDAY_DATE: Utilities.formatDate(nextMonday, tz, dateFormat),
+    NEXT_SUNDAY_DATE: Utilities.formatDate(nextSunday, tz, dateFormat),
+    NEXT_FRIDAY_DATE: Utilities.formatDate(nextFriday, tz, dateFormat),
+    THIS_FRIDAY_DATE: Utilities.formatDate(thisFriday, tz, dateFormat),
+    ONE_WEEK_FROM_TODAY: Utilities.formatDate(oneWeek, tz, dateFormat),
+    TWO_WEEKS_FROM_TODAY: Utilities.formatDate(twoWeeks, tz, dateFormat),
+  };
+}
+
+/**
+ * Generate phonetic hints for common name variations
+ */
+function generatePhoneticHints(name) {
+  if (!name) return '';
+  const lower = name.toLowerCase();
+  
+  const hints = [];
+  
+  // Common variations for Indian names
+  if (lower.includes('aa')) hints.push(lower.replace(/aa/g, 'a'));
+  if (lower.includes('ee')) hints.push(lower.replace(/ee/g, 'i'));
+  if (lower.includes('oo')) hints.push(lower.replace(/oo/g, 'u'));
+  
+  // Specific name variations
+  const nameVariations = {
+    'anaaya': ['anaya', 'anaia', 'anayya', 'anaiah'],
+    'nikunj': ['nikanj', 'neekunj', 'nikunge', 'nikunje'],
+    'priya': ['pria', 'priyah', 'preya', 'priyaa'],
+    'shreya': ['shrey', 'sreya', 'shriya', 'shrea'],
+    'rahul': ['rahool', 'raul', 'rahull'],
+    'vikram': ['vikrum', 'vickram', 'vikrm'],
+    'aarav': ['arav', 'aaruv', 'aruv'],
+    'arjun': ['arjoon', 'arjn', 'arjuna'],
+    'amit': ['amith', 'ameet', 'ammit'],
+    'ankit': ['ankith', 'ankeet', 'ankit'],
+    'deepak': ['deepk', 'dipak', 'deepuk'],
+    'gaurav': ['gorav', 'gauruv', 'gaorav'],
+    'harsh': ['harash', 'harsch', 'harish'],
+    'karan': ['karn', 'karun', 'krn'],
+    'manish': ['maneesh', 'manesh', 'mansh'],
+    'neha': ['neeha', 'neha', 'nehaa'],
+    'pooja': ['puja', 'poojah', 'pujaa'],
+    'rajesh': ['rajsh', 'rajeesh', 'rajeshh'],
+    'sachin': ['sachinn', 'sachn', 'sacheen'],
+    'suresh': ['suresh', 'sureesh', 'sureshh'],
+    'vinay': ['vinaay', 'vinai', 'vinayy'],
+    'michael': ['mike', 'mikel', 'michel'],
+    'robert': ['bob', 'rob', 'bobby'],
+    'james': ['jim', 'jimmy', 'jamie'],
+    'william': ['will', 'bill', 'billy'],
+    'elizabeth': ['liz', 'beth', 'lizzy'],
+    'jennifer': ['jen', 'jenny', 'jenn'],
+    'sarah': ['sara', 'sahra', 'sarra'],
+    'jonathan': ['jon', 'john', 'jonny'],
+  };
+  
+  if (nameVariations[lower]) {
+    hints.push(...nameVariations[lower]);
+  }
+  
+  // Check if any variation matches
+  for (const [canonical, variations] of Object.entries(nameVariations)) {
+    if (variations.includes(lower)) {
+      hints.push(canonical);
+    }
+  }
+  
+  // Remove duplicates and the original name
+  const uniqueHints = [...new Set(hints)].filter(h => h !== lower);
+  
+  return uniqueHints.length > 0 ? uniqueHints.slice(0, 4).join(', ') : '';
+}
+
+/**
  * Parse voice command and extract structured data
  */
 function parseVoiceCommand(transcript) {
-  // Get context about available staff and projects
+  // Get context about available staff, projects, and dates
   const staffContext = getStaffListForContext();
   const projectsContext = getProjectsListForContext();
+  const dateContext = getDateContextForPrompt();
   
-  const prompt = `You are an expert task management assistant with advanced name recognition and context understanding. Parse the following voice command transcript and extract all relevant information with high accuracy.
+  // Try to load prompt from sheet, fallback to hardcoded
+  let promptTemplate = null;
+  try {
+    const promptData = getPrompt('parseVoiceCommand', 'voice');
+    if (promptData && promptData.Content) {
+      promptTemplate = promptData.Content;
+    }
+  } catch (e) {
+    Logger.log('Could not load prompt from sheet, using fallback: ' + e.toString());
+  }
+  
+  // Fallback to hardcoded prompt if not found in sheet
+  if (!promptTemplate) {
+    promptTemplate = `You are an expert task management assistant with advanced name recognition and date parsing capabilities. Parse the following voice command transcript and extract all relevant information with high accuracy.
 
-Voice command transcript: "${transcript}"${staffContext}${projectsContext}
+Voice command transcript: "{{TRANSCRIPT}}"
 
-CRITICAL INSTRUCTIONS FOR NAME MATCHING:
-1. When extracting assignee_name, consider PHONETIC VARIATIONS and SOUND-ALIKE names
-2. Examples of sound-alike matches:
-   - "anaya" heard → match to "anaaya" in staff list
-   - "john" heard → match to "Jon" or "Jonathan" in staff list
-   - "mike" heard → match to "Michael" in staff list
-   - "sarah" heard → match to "Sara" in staff list
-3. Use the AVAILABLE STAFF MEMBERS list above to find the BEST MATCH, even if spelling differs slightly
-4. If you hear a name that sounds similar to a staff member, use the EXACT name from the staff list
-5. Consider common nicknames and variations (e.g., "bob" → "Robert", "jim" → "James")
-6. If unsure between multiple matches, prefer the one that sounds most similar phonetically
+===========================================
+CURRENT DATE AND TIME CONTEXT
+===========================================
+- Today's date: {{TODAY_DATE}}
+- Today is: {{DAY_OF_WEEK}}
+- Current week: Monday={{MONDAY_DATE}} through Sunday={{SUNDAY_DATE}}
+- This Friday: {{THIS_FRIDAY_DATE}}
+- Next week: {{NEXT_MONDAY_DATE}} through {{NEXT_SUNDAY_DATE}}
+- Next Friday: {{NEXT_FRIDAY_DATE}}
+- Timezone: Asia/Kolkata (IST)
 
-CRITICAL INSTRUCTIONS FOR PROJECT RECOGNITION:
+{{STAFF_CONTEXT}}{{PROJECTS_CONTEXT}}
+
+===========================================
+CRITICAL INSTRUCTIONS FOR NAME/ASSIGNEE MATCHING
+===========================================
+
+1. ALWAYS scan the AVAILABLE STAFF MEMBERS list above FIRST before processing
+2. When you hear ANY name in the transcript, immediately check for matches in the staff list
+3. Use PHONETIC MATCHING - names that SOUND similar should match:
+   - "anaya" heard → match to "Anaaya" in staff list
+   - "neekunj" or "nikanj" heard → match to "Nikunj"
+   - "shray" or "shreya" heard → match to "Shreya"
+   - "priyah" or "pria" heard → match to "Priya"
+   - "john" heard → match to "Jon" or "Jonathan"
+   - "mike" heard → match to "Michael"
+
+4. Common voice transcription errors to watch for:
+   - Double vowels getting reduced: "Anaaya" transcribed as "Anaya" or "Anaia"
+   - 'j' and 'g' sounds confused: "Nikunj" → "Nikung"
+   - 'sh' and 's' confused: "Shreya" → "Sreya"
+   - 'th' sounds: "Prathik" → "Pratik"
+   - Silent letters dropped or added
+
+5. PRIORITY: If you identify a name in the transcript, you MUST:
+   a. Find the closest match in AVAILABLE STAFF MEMBERS
+   b. Use the EXACT spelling from the staff list
+   c. Only return null for assignee_name if NO name is mentioned at all
+
+6. Look for these assignee indicators:
+   - "assign to [name]", "give to [name]", "[name] should", "[name] will"
+   - "send to [name]", "[name] can", "[name] needs to", "for [name]"
+   - "[name] ko do" (Hindi), "[name] se karwa do", "[name] handle karega"
+
+===========================================
+CRITICAL INSTRUCTIONS FOR DUE DATE EXTRACTION
+===========================================
+
+TODAY IS: {{TODAY_DATE}} ({{DAY_OF_WEEK}})
+DATE FORMAT: Always output dates as DD-MM-YYYY (e.g., 27-01-2025)
+
+1. RELATIVE DATE CONVERSIONS (calculate from today's date above):
+   - "today" = {{TODAY_DATE}}
+   - "tomorrow" = {{TOMORROW_DATE}}
+   - "day after tomorrow" = {{DAY_AFTER_TOMORROW_DATE}}
+   - "this week" = by {{SUNDAY_DATE}}
+   - "end of week" = {{FRIDAY_DATE}} or {{SUNDAY_DATE}}
+   - "next week" = {{NEXT_MONDAY_DATE}} through {{NEXT_SUNDAY_DATE}}
+   - "next Monday" = {{NEXT_MONDAY_DATE}}
+   - "next Friday" = {{NEXT_FRIDAY_DATE}}
+   
+2. DAY NAME CONVERSIONS (relative to today being {{DAY_OF_WEEK}}):
+   - If today is Monday-Thursday and someone says "Friday" = this Friday ({{THIS_FRIDAY_DATE}})
+   - If today is Friday-Sunday and someone says "Friday" = next Friday ({{NEXT_FRIDAY_DATE}})
+   - "this [day]" = upcoming occurrence in current week
+   - "next [day]" = occurrence in the following week
+
+3. TIME EXPRESSIONS:
+   - "in X days" = add X days to {{TODAY_DATE}}
+   - "in a week" = {{ONE_WEEK_FROM_TODAY}}
+   - "in two weeks" = {{TWO_WEEKS_FROM_TODAY}}
+   - "by month end" = last day of current month
+   - "end of month" = last day of current month
+
+4. ABSOLUTE DATES - Convert to DD-MM-YYYY:
+   - "15th" or "the 15th" = 15-01-2025 (15th of current month, or next if passed)
+   - "January 15" or "15th January" or "15 Jan" = 15-01-2025
+   - "15/01" or "15-01" = assume DD/MM format = 15-01-2025
+   - "2025-01-15" = convert to 15-01-2025
+
+5. HINDI/HINGLISH DATE EXPRESSIONS:
+   - "kal" = tomorrow = {{TOMORROW_DATE}}
+   - "parson" = day after tomorrow = {{DAY_AFTER_TOMORROW_DATE}}
+   - "agle hafte" = next week = {{NEXT_MONDAY_DATE}}
+   - "is hafte" = this week = by {{SUNDAY_DATE}}
+   - "mahine ke end tak" = end of month
+
+6. PRESERVE ORIGINAL TEXT:
+   - Always capture the exact spoken words in due_date_text field
+   - Convert to DD-MM-YYYY format in due_date field
+
+7. AMBIGUOUS DATES:
+   - If unclear, prefer the NEARER date
+   - Add ambiguity note if date interpretation is uncertain
+
+===========================================
+CRITICAL INSTRUCTIONS FOR PROJECT RECOGNITION
+===========================================
+
 1. Look for project mentions in the task name, context, or assignee context
 2. Use the AVAILABLE PROJECTS list above to match project names
 3. Consider partial matches and variations (e.g., "Q4 Report" → "Q4 Financial Report")
 4. Project tags can be abbreviations or codes - match both name and tag
 5. If project is mentioned indirectly (e.g., "for the website project"), extract it
 
+===========================================
+OUTPUT FORMAT
+===========================================
+
 Extract the following information and return ONLY a valid JSON object (no markdown, no code blocks, no explanations):
 
 {
   "task_name": "concise, clear task title (3-8 words, action-oriented)",
   "assignee_email": "full email address if mentioned explicitly, or null",
-  "assignee_name": "full name if mentioned (first and last name if available), or null",
-  "due_date": "date in YYYY-MM-DD format if mentioned, or null",
-  "due_date_text": "exact original text about due date/timing (e.g., 'next Monday', 'by Friday', 'in 2 days'), or null",
+  "assignee_name": "EXACT name from AVAILABLE STAFF MEMBERS list if matched, or the heard name if no match, or null",
+  "due_date": "date in DD-MM-YYYY format (MUST be calculated from today={{TODAY_DATE}}), or null",
+  "due_date_text": "exact original text about due date/timing as spoken, or null",
   "due_time": "time if mentioned (HH:MM format in 24-hour), or null",
-  "priority": "High, Medium, or Low based on urgency indicators (urgent, ASAP, important = High; normal = Medium; low priority, whenever = Low), or null if not mentioned",
+  "priority": "High, Medium, or Low based on urgency indicators",
   "project_tag": "project name or tag if mentioned, or null",
-  "context": "all additional details, background, requirements, constraints, or important notes mentioned",
-  "tone": "urgent, normal, or calm based on speaker's tone and urgency words",
-  "confidence": 0.0-1.0 confidence score (be accurate: 0.9+ if very clear, 0.7-0.9 if mostly clear, 0.5-0.7 if some ambiguity, <0.5 if unclear)",
-  "ambiguities": ["specific list of what is unclear or ambiguous (e.g., 'assignee name unclear', 'due date format ambiguous')"]
+  "context": "all additional details, background, requirements, constraints mentioned",
+  "tone": "urgent, normal, or calm",
+  "confidence": 0.0-1.0 confidence score,
+  "ambiguities": ["list of unclear elements"],
+  "name_heard_as": "the raw name as it was transcribed before matching (for debugging)"
 }
 
-EXTRACTION GUIDELINES:
+===========================================
+EXTRACTION GUIDELINES
+===========================================
 
 1. Task Name:
    - Extract the core action/objective (e.g., "Review Q4 report" not "I need to review the Q4 report")
    - Remove filler words like "please", "I want", "can you", "I need", "we should"
    - Keep it concise but descriptive (3-8 words ideal)
    - Use action verbs: "Review", "Update", "Create", "Send", "Schedule", etc.
-   - Include key nouns that identify what the task is about
 
-2. Assignee:
-   - Look for: "assign to [name]", "give to [name]", "[name] should", "[name] will", "send to [name]", "[name] can", "[name] needs to"
-   - IMPORTANT: Match the HEARD name to the EXACT name in AVAILABLE STAFF MEMBERS list using phonetic/sound-alike matching
-   - If you hear "anaya" but staff list has "anaaya", use "anaaya" (the exact spelling from staff list)
-   - Extract full name if possible (first + last), but prioritize matching to staff list
-   - If only first name mentioned, try to match to full name in staff list
-   - Consider common name variations: "mike"→"Michael", "bob"→"Robert", "jim"→"James", "sarah"→"Sara"
-   - Email: only if explicitly stated (e.g., "john@company.com"), otherwise use null
-
-3. Due Date:
-   - Relative dates: "today" = today's date, "tomorrow" = tomorrow, "next Monday" = next Monday, "Friday" = this or next Friday
-   - Absolute dates: "January 15th", "15th of January", "01/15/2024" → convert to YYYY-MM-DD
-   - Preserve original text in due_date_text for reference
-   - If time mentioned (e.g., "by 3 PM", "before noon"), extract in due_time field
-
-4. Priority:
-   - High: urgent, ASAP, immediately, critical, important, high priority, rush
+2. Priority:
+   - High: urgent, ASAP, immediately, critical, important, high priority, rush, jaldi
    - Medium: normal, standard, regular (default if not mentioned)
    - Low: low priority, whenever, no rush, eventually
 
-5. Project/Tag:
-   - Look for: "for [project]", "related to [project]", "under [project]", "in [project]", "for the [project]", project names mentioned
-   - IMPORTANT: Match to EXACT project name or tag from AVAILABLE PROJECTS list
-   - Consider context: if task mentions "website", "Q4 report", "marketing campaign", match to relevant project
-   - Use partial matching: "Q4 Report" can match "Q4 Financial Report" project
-   - If project is mentioned indirectly, infer from context (e.g., "update the homepage" → "Website" project)
-   - Return the Project_Tag value from the projects list if found, otherwise return project name
-
-6. Context:
+3. Context:
    - Include: why the task exists, background info, specific requirements, constraints, dependencies
-   - Include: location, tools needed, people involved, budget constraints, etc.
    - Be comprehensive but concise
 
-7. Tone:
-   - Urgent: rushed speech, urgent words, time pressure mentioned
-   - Normal: standard conversational tone
-   - Calm: relaxed, no rush indicated
-
-8. Confidence:
+4. Confidence:
    - 0.9-1.0: All key info clear (task, assignee, date all clear)
    - 0.7-0.9: Most info clear, minor ambiguities
    - 0.5-0.7: Some key info missing or unclear
    - <0.5: Major ambiguities or unclear command
 
-9. Ambiguities:
+5. Ambiguities:
    - List specific unclear elements: "assignee name unclear", "due date ambiguous", "task scope vague"
 
-EXAMPLES WITH NAME AND PROJECT MATCHING:
+===========================================
+EXAMPLES WITH NAME AND DATE MATCHING
+===========================================
 
-Input: "Assign anaya to review the Q4 financial report by next Friday, it's urgent"
-Available Staff: - Anaaya Udhas (anaayaudhas92@gmail.com)
-Available Projects: - Q4 Financial Report (Tag: Q4_Report)
+EXAMPLE 1 - Name with phonetic variation:
+Transcript: "Assign anaya to review the Q4 financial report by next Friday, it's urgent"
+Today: 27-01-2025 (Monday)
+Staff List: Anaaya Udhas (anaayaudhas92@gmail.com)
+
 Output: {
   "task_name": "Review Q4 financial report",
   "assignee_email": null,
   "assignee_name": "Anaaya Udhas",
-  "due_date": "2024-01-19",
+  "due_date": "31-01-2025",
   "due_date_text": "next Friday",
   "due_time": null,
   "priority": "High",
-  "project_tag": "Q4_Report",
-  "context": "Q4 financial report needs review, urgent",
+  "project_tag": null,
+  "context": "Q4 financial report needs review, marked urgent",
   "tone": "urgent",
   "confidence": 0.95,
-  "ambiguities": []
+  "ambiguities": [],
+  "name_heard_as": "anaya"
 }
 
-Input: "I need someone to update the website homepage, maybe by end of week"
-Available Projects: - Website Redesign (Tag: Website)
+EXAMPLE 2 - Relative date with Hindi:
+Transcript: "Nikunj ko kal tak website update karna hai"
+Today: 27-01-2025 (Monday)
+Staff List: Nikunj Jajodia (nikunj@example.com)
+
 Output: {
-  "task_name": "Update website homepage",
+  "task_name": "Update website",
+  "assignee_email": null,
+  "assignee_name": "Nikunj Jajodia",
+  "due_date": "28-01-2025",
+  "due_date_text": "kal tak",
+  "due_time": null,
+  "priority": "Medium",
+  "project_tag": null,
+  "context": "Website update needed",
+  "tone": "normal",
+  "confidence": 0.9,
+  "ambiguities": [],
+  "name_heard_as": "Nikunj"
+}
+
+EXAMPLE 3 - End of week:
+Transcript: "I need someone to finish the presentation by end of week"
+Today: 27-01-2025 (Monday)
+
+Output: {
+  "task_name": "Finish presentation",
   "assignee_email": null,
   "assignee_name": null,
-  "due_date": "2024-01-19",
+  "due_date": "31-01-2025",
   "due_date_text": "end of week",
   "due_time": null,
   "priority": "Medium",
-  "project_tag": "Website",
-  "context": "Website homepage needs updating",
+  "project_tag": null,
+  "context": "Presentation needs to be completed",
   "tone": "normal",
-  "confidence": 0.75,
-  "ambiguities": ["assignee not specified"]
+  "confidence": 0.7,
+  "ambiguities": ["assignee not specified"],
+  "name_heard_as": null
 }
 
-Input: "Give this to mike, he should handle the marketing campaign launch"
-Available Staff: - Michael Johnson (michael.j@company.com)
-Available Projects: - Marketing Campaign (Tag: Marketing)
+EXAMPLE 4 - Day after tomorrow in Hindi:
+Transcript: "Priya ko parson tak report submit karni hai"
+Today: 27-01-2025 (Monday)
+Staff List: Priya Sharma (priya@example.com)
+
 Output: {
-  "task_name": "Handle marketing campaign launch",
+  "task_name": "Submit report",
   "assignee_email": null,
-  "assignee_name": "Michael Johnson",
-  "due_date": null,
-  "due_date_text": null,
+  "assignee_name": "Priya Sharma",
+  "due_date": "29-01-2025",
+  "due_date_text": "parson tak",
   "due_time": null,
   "priority": "Medium",
-  "project_tag": "Marketing",
-  "context": "Marketing campaign launch needs to be handled",
+  "project_tag": null,
+  "context": "Report needs to be submitted",
   "tone": "normal",
   "confidence": 0.9,
-  "ambiguities": []
+  "ambiguities": [],
+  "name_heard_as": "Priya"
 }
 
-Now parse this voice command: "${transcript}"`;
+Now parse this voice command: "{{TRANSCRIPT}}"`;
+  }
+  
+  // Replace template variables
+  let prompt = promptTemplate
+    .replace(/\{\{TRANSCRIPT\}\}/g, transcript)
+    .replace(/\{\{STAFF_CONTEXT\}\}/g, staffContext)
+    .replace(/\{\{PROJECTS_CONTEXT\}\}/g, projectsContext);
+  
+  // Replace all date context placeholders
+  for (const [key, value] of Object.entries(dateContext)) {
+    prompt = prompt.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
+  }
 
   try {
     const response = callGeminiFlash(prompt);
@@ -578,9 +856,14 @@ Now parse this voice command: "${transcript}"`;
     
     const parsed = JSON.parse(jsonText);
     
-    // Process due date if it's text
+    // Process due date if it's text but due_date is missing
     if (parsed.due_date_text && !parsed.due_date) {
       parsed.due_date = parseRelativeDate(parsed.due_date_text);
+    }
+    
+    // Log the name matching for debugging
+    if (parsed.name_heard_as && parsed.assignee_name) {
+      Logger.log(`Voice name matching: heard "${parsed.name_heard_as}" → matched to "${parsed.assignee_name}"`);
     }
     
     return parsed;
@@ -600,33 +883,147 @@ Now parse this voice command: "${transcript}"`;
 }
 
 /**
- * Parse relative date text to actual date
+ * Parse relative date text to actual date in dd-MM-yyyy format
  */
 function parseRelativeDate(dateText) {
   const today = new Date();
+  const tz = Session.getScriptTimeZone();
+  const dateFormat = 'dd-MM-yyyy';
   const lowerText = dateText.toLowerCase();
   
-  // Simple relative date parsing
-  if (lowerText.includes('today')) {
-    return Utilities.formatDate(today, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  // Today
+  if (lowerText.includes('today') || lowerText.includes('aaj')) {
+    return Utilities.formatDate(today, tz, dateFormat);
   }
-  if (lowerText.includes('tomorrow')) {
+  
+  // Tomorrow (English and Hindi)
+  if (lowerText.includes('tomorrow') || lowerText.includes('kal')) {
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
-    return Utilities.formatDate(tomorrow, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    return Utilities.formatDate(tomorrow, tz, dateFormat);
   }
-  if (lowerText.includes('next monday') || lowerText.includes('next week')) {
+  
+  // Day after tomorrow (English and Hindi)
+  if (lowerText.includes('day after tomorrow') || lowerText.includes('parson') || lowerText.includes('parso')) {
+    const dayAfter = new Date(today);
+    dayAfter.setDate(dayAfter.getDate() + 2);
+    return Utilities.formatDate(dayAfter, tz, dateFormat);
+  }
+  
+  // Next week / Next Monday (English and Hindi)
+  if (lowerText.includes('next monday') || lowerText.includes('next week') || lowerText.includes('agle hafte') || lowerText.includes('agle week')) {
     const daysUntilMonday = (8 - today.getDay()) % 7 || 7;
     const nextMonday = new Date(today);
     nextMonday.setDate(today.getDate() + daysUntilMonday);
-    return Utilities.formatDate(nextMonday, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+    return Utilities.formatDate(nextMonday, tz, dateFormat);
   }
   
-  // Try to parse as date
+  // End of week / This week (English and Hindi)
+  if (lowerText.includes('end of week') || lowerText.includes('is hafte') || lowerText.includes('this week') || lowerText.includes('week end')) {
+    const currentDay = today.getDay();
+    const daysUntilFriday = (5 - currentDay + 7) % 7;
+    const friday = new Date(today);
+    friday.setDate(today.getDate() + (daysUntilFriday === 0 ? 0 : daysUntilFriday));
+    return Utilities.formatDate(friday, tz, dateFormat);
+  }
+  
+  // Next Friday
+  if (lowerText.includes('next friday')) {
+    const currentDay = today.getDay();
+    // Calculate days until next Friday (at least 7 days from now)
+    const daysUntilNextFriday = ((5 - currentDay + 7) % 7) + 7;
+    const nextFriday = new Date(today);
+    nextFriday.setDate(today.getDate() + daysUntilNextFriday);
+    return Utilities.formatDate(nextFriday, tz, dateFormat);
+  }
+  
+  // This Friday / Friday
+  if (lowerText.includes('friday') && !lowerText.includes('next')) {
+    const currentDay = today.getDay();
+    let daysUntilFriday = (5 - currentDay + 7) % 7;
+    // If today is Friday or later, go to next week's Friday
+    if (daysUntilFriday === 0 && currentDay >= 5) {
+      daysUntilFriday = 7;
+    }
+    const friday = new Date(today);
+    friday.setDate(today.getDate() + daysUntilFriday);
+    return Utilities.formatDate(friday, tz, dateFormat);
+  }
+  
+  // In X days
+  const inDaysMatch = lowerText.match(/in\s+(\d+)\s+days?/);
+  if (inDaysMatch) {
+    const days = parseInt(inDaysMatch[1], 10);
+    const futureDate = new Date(today);
+    futureDate.setDate(today.getDate() + days);
+    return Utilities.formatDate(futureDate, tz, dateFormat);
+  }
+  
+  // In a week / one week
+  if (lowerText.includes('in a week') || lowerText.includes('in one week') || lowerText.includes('ek hafte mein')) {
+    const oneWeek = new Date(today);
+    oneWeek.setDate(today.getDate() + 7);
+    return Utilities.formatDate(oneWeek, tz, dateFormat);
+  }
+  
+  // In two weeks
+  if (lowerText.includes('in two weeks') || lowerText.includes('in 2 weeks') || lowerText.includes('do hafte mein')) {
+    const twoWeeks = new Date(today);
+    twoWeeks.setDate(today.getDate() + 14);
+    return Utilities.formatDate(twoWeeks, tz, dateFormat);
+  }
+  
+  // End of month / Month end
+  if (lowerText.includes('end of month') || lowerText.includes('month end') || lowerText.includes('mahine ke end')) {
+    const endOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    return Utilities.formatDate(endOfMonth, tz, dateFormat);
+  }
+  
+  // Try to parse DD-MM-YYYY format first
+  const ddmmyyyyMatch = dateText.match(/(\d{1,2})-(\d{1,2})-(\d{4})/);
+  if (ddmmyyyyMatch) {
+    const [_, day, month, year] = ddmmyyyyMatch;
+    const parsed = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+    if (!isNaN(parsed.getTime())) {
+      return Utilities.formatDate(parsed, tz, dateFormat);
+    }
+  }
+  
+  // Try to parse DD/MM/YYYY format
+  const ddmmyyyySlashMatch = dateText.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (ddmmyyyySlashMatch) {
+    const [_, day, month, year] = ddmmyyyySlashMatch;
+    const parsed = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+    if (!isNaN(parsed.getTime())) {
+      return Utilities.formatDate(parsed, tz, dateFormat);
+    }
+  }
+  
+  // Try to parse "15th January", "January 15", etc.
+  const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+  const monthAbbr = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+  
+  for (let i = 0; i < monthNames.length; i++) {
+    const monthPattern = new RegExp(`(\\d{1,2})(?:st|nd|rd|th)?\\s*(?:of\\s*)?${monthNames[i]}|${monthNames[i]}\\s*(\\d{1,2})(?:st|nd|rd|th)?|` +
+                                    `(\\d{1,2})(?:st|nd|rd|th)?\\s*${monthAbbr[i]}|${monthAbbr[i]}\\s*(\\d{1,2})(?:st|nd|rd|th)?`, 'i');
+    const match = lowerText.match(monthPattern);
+    if (match) {
+      const day = parseInt(match[1] || match[2] || match[3] || match[4], 10);
+      const year = today.getFullYear();
+      const parsed = new Date(year, i, day);
+      // If the date has passed, assume next year
+      if (parsed < today) {
+        parsed.setFullYear(year + 1);
+      }
+      return Utilities.formatDate(parsed, tz, dateFormat);
+    }
+  }
+  
+  // Try to parse as generic date
   try {
     const parsed = new Date(dateText);
     if (!isNaN(parsed.getTime())) {
-      return Utilities.formatDate(parsed, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+      return Utilities.formatDate(parsed, tz, dateFormat);
     }
   } catch (e) {
     // Ignore
@@ -675,7 +1072,20 @@ function classifyReplyType(replyContent, originalDueDate) {
   // Build context about the original deadline if available
   const dateContext = originalDueDate ? `\n\nOriginal task due date: ${originalDueDate}` : '';
   
-  const prompt = `You are an expert at analyzing email replies about task assignments. Classify this email reply into one of these categories:
+  // Try to load prompt from sheet, fallback to hardcoded
+  let promptTemplate = null;
+  try {
+    const promptData = getPrompt('classifyReplyType', 'email');
+    if (promptData && promptData.Content) {
+      promptTemplate = promptData.Content;
+    }
+  } catch (e) {
+    Logger.log('Could not load prompt from sheet, using fallback: ' + e.toString());
+  }
+  
+  // Fallback to hardcoded prompt if not found in sheet
+  if (!promptTemplate) {
+    promptTemplate = `You are an expert at analyzing email replies about task assignments. Classify this email reply into one of these categories:
 
 1. ACCEPTANCE - The assignee accepts the task and agrees to the deadline. Examples: "I accept", "I'll do it", "Got it", "Will complete by deadline", "Acknowledged" (if accepting)
 2. DATE_CHANGE - The assignee requests a different due date or mentions a date that's not feasible. Look for: "not feasible", "can't make that date", "need more time", "deadline is", "by [date]", "feasible as deadline", "propose [date]", "suggest [date]", "prefer [date]", "10th Jan", "January 10th", "10/01/2025", etc.
@@ -700,7 +1110,7 @@ IMPORTANT DATE EXTRACTION RULES:
 - If the email says "not feasible" or "can't make that date" and mentions another date, that other date is the proposed date
 - PRIORITIZE dates that appear in sentences with words like "by", "deadline", "feasible", "can do", "I can"
 
-Email reply (already cleaned - quoted text removed): "${replyContent}"${dateContext}
+Email reply (already cleaned - quoted text removed): "{{REPLY_CONTENT}}"{{DATE_CONTEXT}}
 
 Return ONLY a valid JSON object (no markdown, no code blocks):
 {
@@ -709,6 +1119,12 @@ Return ONLY a valid JSON object (no markdown, no code blocks):
   "extracted_date": "proposed date in YYYY-MM-DD format if DATE_CHANGE (MUST be the NEW date being requested, not the original. Convert all formats: '10th Jan' → '2025-01-10', 'Jan 10' → '2025-01-10', '10/01/2025' → '2025-01-10', 'next Monday' → calculate actual date). If no clear date, return null",
   "reasoning": "brief explanation of why this classification was chosen and what date was extracted (if any)"
 }`;
+  }
+  
+  // Replace template variables
+  const prompt = promptTemplate
+    .replace(/\{\{REPLY_CONTENT\}\}/g, replyContent)
+    .replace(/\{\{DATE_CONTEXT\}\}/g, dateContext);
 
   let response = null;
   try {
@@ -908,90 +1324,20 @@ Extract and return ONLY a valid JSON object:
  * Extracts action items and project knowledge
  */
 function analyzeMoMDocument(momText) {
-  const prompt = `You are analyzing a manually created Minutes of Meeting (MoM) document. Extract the following information:
-
-1. Action Items: List all action items mentioned in the document. For each action item, extract:
-   - description: What needs to be done
-   - owner: Who is responsible (name or email if mentioned)
-   - deadline: When it's due (extract date if mentioned, format as YYYY-MM-DD or null)
-   - priority: High, Medium, or Low (based on urgency indicators)
-
-2. Projects: Identify all projects mentioned in the document. For each project, extract:
-   - project_tag: The project identifier/tag (if mentioned, or infer from project name)
-   - project_name: The full project name
-   - summary: Brief summary of what was discussed about this project
-   - key_points: Array of key points discussed (max 10 points)
-   - decisions: Array of decisions made about the project (max 10 decisions)
-   - include_full_context: Boolean - true if full document text should be stored
-
-3. Executive Summary: A brief summary of the entire meeting (2-3 sentences)
-
-Return your response as a JSON object with this structure:
-{
-  "action_items": [
-    {
-      "description": "string",
-      "owner": "string or null",
-      "deadline": "YYYY-MM-DD or null",
-      "priority": "High|Medium|Low"
-    }
-  ],
-  "projects": [
-    {
-      "project_tag": "string or null",
-      "project_name": "string",
-      "summary": "string",
-      "key_points": ["string"],
-      "decisions": ["string"],
-      "include_full_context": boolean
-    }
-  ],
-  "executive_summary": "string"
-}
-
-MoM Document:
-${momText}
-
-Return ONLY valid JSON, no markdown, no explanations.`;
-
+  // Try to load prompt from sheet, fallback to hardcoded
+  let promptTemplate = null;
   try {
-    const response = callGeminiPro(prompt, { temperature: 0.3 });
-    
-    // Extract JSON from response
-    let jsonText = response.trim();
-    if (jsonText.startsWith('```')) {
-      jsonText = jsonText.replace(/^```json\n?/, '').replace(/```$/, '');
+    const promptData = getPrompt('analyzeMoMDocument', 'mom');
+    if (promptData && promptData.Content) {
+      promptTemplate = promptData.Content;
     }
-    if (jsonText.startsWith('```')) {
-      jsonText = jsonText.replace(/^```\n?/, '').replace(/```$/, '');
-    }
-    
-    const parsed = JSON.parse(jsonText);
-    
-    // Ensure arrays exist
-    if (!parsed.action_items) parsed.action_items = [];
-    if (!parsed.projects) parsed.projects = [];
-    if (!parsed.executive_summary) parsed.executive_summary = '';
-    
-    return parsed;
-    
-  } catch (error) {
-    logError(ERROR_TYPE.API_ERROR, 'analyzeMoMDocument', error.toString());
-    // Return empty structure on error
-    return {
-      action_items: [],
-      projects: [],
-      executive_summary: 'Failed to analyze MoM document'
-    };
+  } catch (e) {
+    Logger.log('Could not load prompt from sheet, using fallback: ' + e.toString());
   }
-}
-
-/**
- * Analyze manually created MoM document
- * Extracts action items and project knowledge
- */
-function analyzeMoMDocument(momText) {
-  const prompt = `You are analyzing a manually created Minutes of Meeting (MoM) document. Extract the following information:
+  
+  // Fallback to hardcoded prompt if not found in sheet
+  if (!promptTemplate) {
+    promptTemplate = `You are analyzing a manually created Minutes of Meeting (MoM) document. Extract the following information:
 
 1. Action Items: List all action items mentioned in the document. For each action item, extract:
    - description: What needs to be done
@@ -1032,10 +1378,14 @@ Return your response as a JSON object with this structure:
   "executive_summary": "string"
 }
 
-MoM Document:
-${momText}
+MoM document text:
+"{{MOM_TEXT}}"
 
-Return ONLY valid JSON, no markdown, no explanations.`;
+Return your response as a JSON object with this structure.`;
+  }
+  
+  // Replace template variables
+  const prompt = promptTemplate.replace(/\{\{MOM_TEXT\}\}/g, momText);
 
   try {
     const response = callGeminiPro(prompt, { temperature: 0.3 });

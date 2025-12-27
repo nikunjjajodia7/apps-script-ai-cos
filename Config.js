@@ -193,6 +193,10 @@ const SHEETS = {
   KNOWLEDGE_LAKE: 'Knowledge_Lake',
   CONFIG: 'Config',
   ERROR_LOG: 'Error_Log',
+  VOICE_PROMPTS: 'VoicePrompts',
+  EMAIL_PROMPTS: 'EmailPrompts',
+  MOM_PROMPTS: 'MoMPrompts',
+  WORKFLOWS: 'Workflows',
 };
 
 // Task statuses

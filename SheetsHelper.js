@@ -135,6 +135,44 @@ function updateRowByValue(sheetName, matchColumn, matchValue, updates) {
 }
 
 /**
+ * Delete a row by matching a column value
+ */
+function deleteRowByValue(sheetName, matchColumn, matchValue) {
+  try {
+    const sheet = getSheet(sheetName);
+    const data = sheet.getDataRange().getValues();
+    
+    if (data.length <= 1) {
+      // Only headers or empty sheet
+      return false;
+    }
+    
+    const headers = data[0];
+    const matchColumnIndex = headers.indexOf(matchColumn);
+    
+    if (matchColumnIndex === -1) {
+      Logger.log(`Column "${matchColumn}" not found in sheet "${sheetName}"`);
+      return false;
+    }
+    
+    // Search from bottom to top to avoid index shifting issues
+    for (let i = data.length - 1; i >= 1; i--) {
+      if (data[i][matchColumnIndex] === matchValue) {
+        sheet.deleteRow(i + 1); // Delete the row (1-indexed)
+        Logger.log(`Deleted row ${i + 1} with ${matchColumn}="${matchValue}"`);
+        return true;
+      }
+    }
+    
+    Logger.log(`Row with ${matchColumn}="${matchValue}" not found`);
+    return false; // Row not found
+  } catch (error) {
+    Logger.log(`Error in deleteRowByValue: ${error.toString()}`);
+    throw error;
+  }
+}
+
+/**
  * Get task by Task_ID
  */
 function getTask(taskId) {
@@ -164,6 +202,29 @@ function createTask(taskData) {
   
   const rowNum = addRow(SHEETS.TASKS_DB, taskData);
   logInteraction(taskData.Task_ID, `Task created: ${taskData.Task_Name}`);
+  
+  // Auto-link staff to project if both are present
+  if (taskData.Assignee_Email && taskData.Project_Tag) {
+    try {
+      addStaffToProject(taskData.Assignee_Email, taskData.Project_Tag);
+    } catch (error) {
+      Logger.log(`Error linking staff to project: ${error.toString()}`);
+      // Don't fail task creation if linking fails
+    }
+  }
+  
+  // Execute workflows for task_created trigger
+  try {
+    executeWorkflow('task_created', {
+      taskId: taskData.Task_ID,
+      task: taskData,
+      status: taskData.Status
+    });
+  } catch (error) {
+    Logger.log(`Error executing workflow for task_created: ${error.toString()}`);
+    // Don't fail task creation if workflow fails
+  }
+  
   return taskData.Task_ID;
 }
 
@@ -177,6 +238,22 @@ function updateTask(taskId, updates) {
     // Only log if we're not updating Interaction_Log itself (to avoid recursive loop)
     if (!updates.hasOwnProperty('Interaction_Log')) {
       logInteraction(taskId, `Task updated: ${JSON.stringify(updates)}`);
+    }
+    
+    // Auto-link staff to project if both are being updated or one is new
+    const task = getTask(taskId);
+    if (task) {
+      const assigneeEmail = updates.Assignee_Email !== undefined ? updates.Assignee_Email : task.Assignee_Email;
+      const projectTag = updates.Project_Tag !== undefined ? updates.Project_Tag : task.Project_Tag;
+      
+      if (assigneeEmail && projectTag) {
+        try {
+          addStaffToProject(assigneeEmail, projectTag);
+        } catch (error) {
+          Logger.log(`Error linking staff to project during task update: ${error.toString()}`);
+          // Don't fail task update if linking fails
+        }
+      }
     }
   }
   return rowNum !== null;
@@ -250,6 +327,140 @@ function createStaff(name, email, additionalData = {}) {
  */
 function getProject(projectTag) {
   return findRowByValue(SHEETS.PROJECTS_DB, 'Project_Tag', projectTag);
+}
+
+/**
+ * Add a staff member to a project (bidirectional linking)
+ * @param {string} staffEmail - Email of the staff member
+ * @param {string} projectTag - Project tag to add
+ * @returns {boolean} - True if successful
+ */
+function addStaffToProject(staffEmail, projectTag) {
+  if (!staffEmail || !projectTag) {
+    Logger.log('Error: Staff email and project tag are required');
+    return false;
+  }
+  
+  const staff = getStaff(staffEmail);
+  const project = getProject(projectTag);
+  
+  if (!staff) {
+    Logger.log(`Error: Staff member with email ${staffEmail} not found`);
+    return false;
+  }
+  
+  if (!project) {
+    Logger.log(`Error: Project with tag ${projectTag} not found`);
+    return false;
+  }
+  
+  // Add project to staff's Project_Tags
+  const staffProjects = (staff.Project_Tags || '').split(',').map(tag => tag.trim()).filter(tag => tag);
+  if (!staffProjects.includes(projectTag)) {
+    staffProjects.push(projectTag);
+    updateStaff(staffEmail, { Project_Tags: staffProjects.join(', ') });
+    Logger.log(`Added project ${projectTag} to staff ${staffEmail}`);
+  }
+  
+  // Add staff to project's Team_Members
+  const projectMembers = (project.Team_Members || '').split(',').map(email => email.trim().toLowerCase()).filter(email => email);
+  const staffEmailLower = staffEmail.toLowerCase();
+  if (!projectMembers.includes(staffEmailLower)) {
+    projectMembers.push(staffEmailLower);
+    updateRowByValue(SHEETS.PROJECTS_DB, 'Project_Tag', projectTag, { Team_Members: projectMembers.join(', ') });
+    Logger.log(`Added staff ${staffEmail} to project ${projectTag}`);
+  }
+  
+  return true;
+}
+
+/**
+ * Remove a staff member from a project (bidirectional unlinking)
+ * @param {string} staffEmail - Email of the staff member
+ * @param {string} projectTag - Project tag to remove
+ * @returns {boolean} - True if successful
+ */
+function removeStaffFromProject(staffEmail, projectTag) {
+  if (!staffEmail || !projectTag) {
+    Logger.log('Error: Staff email and project tag are required');
+    return false;
+  }
+  
+  const staff = getStaff(staffEmail);
+  const project = getProject(projectTag);
+  
+  if (!staff || !project) {
+    return false;
+  }
+  
+  // Remove project from staff's Project_Tags
+  const staffProjects = (staff.Project_Tags || '').split(',').map(tag => tag.trim()).filter(tag => tag && tag !== projectTag);
+  updateStaff(staffEmail, { Project_Tags: staffProjects.join(', ') });
+  
+  // Remove staff from project's Team_Members
+  const projectMembers = (project.Team_Members || '').split(',').map(email => email.trim().toLowerCase()).filter(email => email && email !== staffEmail.toLowerCase());
+  updateRowByValue(SHEETS.PROJECTS_DB, 'Project_Tag', projectTag, { Team_Members: projectMembers.join(', ') });
+  
+  Logger.log(`Removed staff ${staffEmail} from project ${projectTag}`);
+  return true;
+}
+
+/**
+ * Get all projects a staff member is working on
+ * @param {string} staffEmail - Email of the staff member
+ * @returns {Array<string>} - Array of project tags
+ */
+function getStaffProjects(staffEmail) {
+  const staff = getStaff(staffEmail);
+  if (!staff || !staff.Project_Tags) {
+    return [];
+  }
+  return staff.Project_Tags.split(',').map(tag => tag.trim()).filter(tag => tag);
+}
+
+/**
+ * Get all staff members working on a project
+ * @param {string} projectTag - Project tag
+ * @returns {Array<object>} - Array of staff objects
+ */
+function getProjectStaff(projectTag) {
+  const project = getProject(projectTag);
+  if (!project || !project.Team_Members) {
+    return [];
+  }
+  
+  const memberEmails = project.Team_Members.split(',').map(email => email.trim().toLowerCase()).filter(email => email);
+  return memberEmails.map(email => getStaff(email)).filter(staff => staff !== null && staff !== undefined);
+}
+
+/**
+ * Sync staff-project relationships from tasks
+ * This function analyzes all tasks and updates staff-project links based on task assignments
+ * @returns {number} - Number of relationships updated
+ */
+function syncStaffProjectRelationships() {
+  const tasks = getSheetData(SHEETS.TASKS_DB);
+  let updatedCount = 0;
+  
+  tasks.forEach(task => {
+    if (task.Assignee_Email && task.Project_Tag) {
+      const staff = getStaff(task.Assignee_Email);
+      const project = getProject(task.Project_Tag);
+      
+      if (staff && project) {
+        // Check if relationship already exists
+        const staffProjects = getStaffProjects(task.Assignee_Email);
+        if (!staffProjects.includes(task.Project_Tag)) {
+          if (addStaffToProject(task.Assignee_Email, task.Project_Tag)) {
+            updatedCount++;
+          }
+        }
+      }
+    }
+  });
+  
+  Logger.log(`Synced ${updatedCount} staff-project relationships from tasks`);
+  return updatedCount;
 }
 
 /**
@@ -463,6 +674,57 @@ function findStaffEmailByName(name) {
 }
 
 /**
+ * Get all staff members with the same name (for email selection)
+ * Returns array of staff objects with same name but different emails
+ */
+function getStaffByName(name) {
+  if (!name) return [];
+  
+  try {
+    const staff = getSheetData(SHEETS.STAFF_DB);
+    if (!staff || staff.length === 0) {
+      return [];
+    }
+    
+    const searchName = name.trim().toLowerCase();
+    
+    // Find all staff with matching name (exact or fuzzy)
+    const matches = [];
+    
+    staff.forEach(s => {
+      if (!s.Name) return;
+      
+      const staffName = s.Name.toLowerCase();
+      
+      // Exact match
+      if (staffName === searchName) {
+        matches.push(s);
+      }
+      // First name match
+      else if (staffName.split(' ')[0] === searchName.split(' ')[0] && 
+               searchName.split(' ')[0].length >= 3) {
+        matches.push(s);
+      }
+      // Phonetic match
+      else {
+        const similarity = Math.max(
+          phoneticSimilarity(searchName, staffName),
+          phoneticSimilarity(searchName.split(' ')[0], staffName.split(' ')[0])
+        );
+        if (similarity > 0.7) {
+          matches.push(s);
+        }
+      }
+    });
+    
+    return matches;
+  } catch (error) {
+    Logger.log(`Error finding staff by name: ${error.toString()}`);
+    return [];
+  }
+}
+
+/**
  * Find project tag by name (fuzzy matching)
  * Searches in Project_Name and Project_Tag fields
  */
@@ -614,5 +876,59 @@ function updateAllActiveTaskCounts() {
       updateStaff(member.Email, { Active_Task_Count: count });
     }
   });
+}
+
+/**
+ * Format the Due_Date column as plain text to prevent Google Sheets from auto-formatting dates
+ * Run this once to set up the column format
+ */
+function formatDueDateColumnAsText() {
+  try {
+    const sheet = getSheet(SHEETS.TASKS_DB);
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const dueDateColIndex = headers.indexOf('Due_Date');
+    
+    if (dueDateColIndex === -1) {
+      Logger.log('Due_Date column not found');
+      return false;
+    }
+    
+    // Get the entire Due_Date column (starting from row 2 to skip header)
+    const lastRow = Math.max(sheet.getLastRow(), 2);
+    const dueDateRange = sheet.getRange(2, dueDateColIndex + 1, lastRow - 1, 1);
+    
+    // Set the number format to plain text (@)
+    dueDateRange.setNumberFormat('@');
+    
+    Logger.log('Due_Date column formatted as plain text');
+    return true;
+  } catch (error) {
+    Logger.log('Error formatting Due_Date column: ' + error.toString());
+    return false;
+  }
+}
+
+/**
+ * Add Team_Members column to Projects_DB if it doesn't exist
+ */
+function addTeamMembersColumn() {
+  try {
+    const sheet = getSheet(SHEETS.PROJECTS_DB);
+    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    
+    if (headers.includes('Team_Members')) {
+      Logger.log('Team_Members column already exists');
+      return true;
+    }
+    
+    // Add Team_Members column at the end
+    const newColIndex = sheet.getLastColumn() + 1;
+    sheet.getRange(1, newColIndex).setValue('Team_Members');
+    Logger.log('Team_Members column added at position ' + newColIndex);
+    return true;
+  } catch (error) {
+    Logger.log('Error adding Team_Members column: ' + error.toString());
+    return false;
+  }
 }
 

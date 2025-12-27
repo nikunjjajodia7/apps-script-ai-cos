@@ -559,43 +559,142 @@ function createAllSheets() {
   
   // Create or get Tasks_DB sheet
   let tasksSheet = spreadsheet.getSheetByName('Tasks_DB');
+  const expectedColumns = [
+    'Task_ID', 'Task_Name', 'Status', 'Assignee_Name', 'Assignee_Email', 'Due_Date', 
+    'Proposed_Date', 'Project_Tag', 'Meeting_Action', 'AI_Confidence', 
+    'Tone_Detected', 'Context_Hidden', 'Interaction_Log', 'Boss_Reply_Draft',
+    'Employee_Reply', 'Created_Date', 'Last_Updated', 'Priority'
+  ];
+  
   if (!tasksSheet) {
     tasksSheet = spreadsheet.insertSheet('Tasks_DB');
-    tasksSheet.getRange(1, 1, 1, 17).setValues([[
-      'Task_ID', 'Task_Name', 'Status', 'Assignee_Email', 'Due_Date', 
-      'Proposed_Date', 'Project_Tag', 'Meeting_Action', 'AI_Confidence', 
-      'Tone_Detected', 'Context_Hidden', 'Interaction_Log', 'Boss_Reply_Draft',
-      'Employee_Reply', 'Created_Date', 'Last_Updated', 'Priority'
-    ]]);
-    tasksSheet.getRange(1, 1, 1, 16).setFontWeight('bold');
+    tasksSheet.getRange(1, 1, 1, expectedColumns.length).setValues([expectedColumns]);
+    tasksSheet.getRange(1, 1, 1, expectedColumns.length).setFontWeight('bold');
     tasksSheet.setFrozenRows(1);
     Logger.log('Created Tasks_DB sheet');
+  } else {
+    // Check for missing columns and add them if needed
+    const existingHeaders = tasksSheet.getRange(1, 1, 1, tasksSheet.getLastColumn()).getValues()[0];
+    let needsUpdate = false;
+    
+    expectedColumns.forEach((columnName, index) => {
+      const columnIndex = existingHeaders.indexOf(columnName);
+      if (columnIndex === -1) {
+        // Column is missing - insert it at the correct position
+        const insertPosition = index + 1;
+        tasksSheet.insertColumnBefore(insertPosition);
+        tasksSheet.getRange(1, insertPosition).setValue(columnName);
+        tasksSheet.getRange(1, insertPosition).setFontWeight('bold');
+        
+        // Fill empty values for existing rows
+        const lastRow = tasksSheet.getLastRow();
+        if (lastRow > 1) {
+          tasksSheet.getRange(2, insertPosition, lastRow - 1, 1).setValue('');
+        }
+        
+        Logger.log(`Added missing column "${columnName}" to Tasks_DB at position ${insertPosition}`);
+        needsUpdate = true;
+      } else if (columnIndex !== index) {
+        // Column exists but in wrong position - log warning but don't move (risky)
+        Logger.log(`Warning: Column "${columnName}" exists at position ${columnIndex + 1} but expected at ${index + 1}`);
+      }
+    });
+    
+    if (needsUpdate) {
+      Logger.log('Updated Tasks_DB sheet with missing columns');
+    } else {
+      Logger.log('Tasks_DB sheet structure is up to date');
+    }
   }
   
   // Create or get Staff_DB sheet
   let staffSheet = spreadsheet.getSheetByName('Staff_DB');
+  const expectedStaffColumns = [
+    'Name', 'Email', 'Role', 'Reliability_Score', 'Active_Task_Count',
+    'Department', 'Manager_Email', 'Project_Tags', 'Last_Updated'
+  ];
+  
   if (!staffSheet) {
     staffSheet = spreadsheet.insertSheet('Staff_DB');
-    staffSheet.getRange(1, 1, 1, 8).setValues([[
-      'Name', 'Email', 'Role', 'Reliability_Score', 'Active_Task_Count',
-      'Department', 'Manager_Email', 'Last_Updated'
-    ]]);
-    staffSheet.getRange(1, 1, 1, 8).setFontWeight('bold');
+    staffSheet.getRange(1, 1, 1, expectedStaffColumns.length).setValues([expectedStaffColumns]);
+    staffSheet.getRange(1, 1, 1, expectedStaffColumns.length).setFontWeight('bold');
     staffSheet.setFrozenRows(1);
     Logger.log('Created Staff_DB sheet');
+  } else {
+    // Check for missing columns and add them if needed
+    const existingHeaders = staffSheet.getRange(1, 1, 1, staffSheet.getLastColumn()).getValues()[0];
+    let needsUpdate = false;
+    
+    expectedStaffColumns.forEach((columnName, index) => {
+      const columnIndex = existingHeaders.indexOf(columnName);
+      if (columnIndex === -1) {
+        // Column is missing - insert it at the correct position
+        const insertPosition = index + 1;
+        staffSheet.insertColumnBefore(insertPosition);
+        staffSheet.getRange(1, insertPosition).setValue(columnName);
+        staffSheet.getRange(1, insertPosition).setFontWeight('bold');
+        
+        // Fill empty values for existing rows
+        const lastRow = staffSheet.getLastRow();
+        if (lastRow > 1) {
+          staffSheet.getRange(2, insertPosition, lastRow - 1, 1).setValue('');
+        }
+        
+        Logger.log(`Added missing column "${columnName}" to Staff_DB at position ${insertPosition}`);
+        needsUpdate = true;
+      }
+    });
+    
+    if (needsUpdate) {
+      Logger.log('Updated Staff_DB sheet with missing columns');
+    } else {
+      Logger.log('Staff_DB sheet structure is up to date');
+    }
   }
   
   // Create or get Projects_DB sheet
   let projectsSheet = spreadsheet.getSheetByName('Projects_DB');
+  const expectedProjectColumns = [
+    'Project_Tag', 'Project_Name', 'Team_Lead_Email', 'Team_Members', 'Status', 'Priority',
+    'Start_Date', 'End_Date', 'Description'
+  ];
+  
   if (!projectsSheet) {
     projectsSheet = spreadsheet.insertSheet('Projects_DB');
-    projectsSheet.getRange(1, 1, 1, 8).setValues([[
-      'Project_Tag', 'Project_Name', 'Team_Lead_Email', 'Status', 'Priority',
-      'Start_Date', 'End_Date', 'Description'
-    ]]);
-    projectsSheet.getRange(1, 1, 1, 8).setFontWeight('bold');
+    projectsSheet.getRange(1, 1, 1, expectedProjectColumns.length).setValues([expectedProjectColumns]);
+    projectsSheet.getRange(1, 1, 1, expectedProjectColumns.length).setFontWeight('bold');
     projectsSheet.setFrozenRows(1);
     Logger.log('Created Projects_DB sheet');
+  } else {
+    // Check for missing columns and add them if needed
+    const existingHeaders = projectsSheet.getRange(1, 1, 1, projectsSheet.getLastColumn()).getValues()[0];
+    let needsUpdate = false;
+    
+    expectedProjectColumns.forEach((columnName, index) => {
+      const columnIndex = existingHeaders.indexOf(columnName);
+      if (columnIndex === -1) {
+        // Column is missing - insert it at the correct position
+        const insertPosition = index + 1;
+        projectsSheet.insertColumnBefore(insertPosition);
+        projectsSheet.getRange(1, insertPosition).setValue(columnName);
+        projectsSheet.getRange(1, insertPosition).setFontWeight('bold');
+        
+        // Fill empty values for existing rows
+        const lastRow = projectsSheet.getLastRow();
+        if (lastRow > 1) {
+          projectsSheet.getRange(2, insertPosition, lastRow - 1, 1).setValue('');
+        }
+        
+        Logger.log(`Added missing column "${columnName}" to Projects_DB at position ${insertPosition}`);
+        needsUpdate = true;
+      }
+    });
+    
+    if (needsUpdate) {
+      Logger.log('Updated Projects_DB sheet with missing columns');
+    } else {
+      Logger.log('Projects_DB sheet structure is up to date');
+    }
   }
   
   // Create or get Knowledge_Lake sheet
@@ -650,6 +749,54 @@ function createAllSheets() {
     errorSheet.getRange(1, 1, 1, 8).setFontWeight('bold');
     errorSheet.setFrozenRows(1);
     Logger.log('Created Error_Log sheet');
+  }
+  
+  // Create or get VoicePrompts sheet
+  let voicePromptsSheet = spreadsheet.getSheetByName('VoicePrompts');
+  if (!voicePromptsSheet) {
+    voicePromptsSheet = spreadsheet.insertSheet('VoicePrompts');
+    voicePromptsSheet.getRange(1, 1, 1, 6).setValues([[
+      'Prompt_Name', 'Category', 'Content', 'Version', 'Last_Updated', 'Description'
+    ]]);
+    voicePromptsSheet.getRange(1, 1, 1, 6).setFontWeight('bold');
+    voicePromptsSheet.setFrozenRows(1);
+    Logger.log('Created VoicePrompts sheet');
+  }
+  
+  // Create or get EmailPrompts sheet
+  let emailPromptsSheet = spreadsheet.getSheetByName('EmailPrompts');
+  if (!emailPromptsSheet) {
+    emailPromptsSheet = spreadsheet.insertSheet('EmailPrompts');
+    emailPromptsSheet.getRange(1, 1, 1, 6).setValues([[
+      'Prompt_Name', 'Category', 'Content', 'Version', 'Last_Updated', 'Description'
+    ]]);
+    emailPromptsSheet.getRange(1, 1, 1, 6).setFontWeight('bold');
+    emailPromptsSheet.setFrozenRows(1);
+    Logger.log('Created EmailPrompts sheet');
+  }
+  
+  // Create or get MoMPrompts sheet
+  let momPromptsSheet = spreadsheet.getSheetByName('MoMPrompts');
+  if (!momPromptsSheet) {
+    momPromptsSheet = spreadsheet.insertSheet('MoMPrompts');
+    momPromptsSheet.getRange(1, 1, 1, 6).setValues([[
+      'Prompt_Name', 'Category', 'Content', 'Version', 'Last_Updated', 'Description'
+    ]]);
+    momPromptsSheet.getRange(1, 1, 1, 6).setFontWeight('bold');
+    momPromptsSheet.setFrozenRows(1);
+    Logger.log('Created MoMPrompts sheet');
+  }
+  
+  // Create or get Workflows sheet
+  let workflowsSheet = spreadsheet.getSheetByName('Workflows');
+  if (!workflowsSheet) {
+    workflowsSheet = spreadsheet.insertSheet('Workflows');
+    workflowsSheet.getRange(1, 1, 1, 9).setValues([[
+      'Workflow_ID', 'Name', 'Trigger_Event', 'Conditions', 'Actions', 'Timing', 'Active', 'Last_Updated', 'Description'
+    ]]);
+    workflowsSheet.getRange(1, 1, 1, 9).setFontWeight('bold');
+    workflowsSheet.setFrozenRows(1);
+    Logger.log('Created Workflows sheet');
   }
   
   Logger.log('All sheets created/verified successfully!');

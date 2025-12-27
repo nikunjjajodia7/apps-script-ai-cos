@@ -203,6 +203,21 @@ function processReplyEmail(taskId, message) {
     // Log the interaction with message ID
     logInteraction(taskId, `Reply received from ${senderEmail}: ${classification.type} (Message ID: ${messageId})`);
     
+    // Execute workflows for email_reply trigger
+    try {
+      const updatedTask = getTask(taskId);
+      executeWorkflow('email_reply', {
+        taskId: taskId,
+        task: updatedTask,
+        replyType: classification.type,
+        senderEmail: senderEmail,
+        messageId: messageId
+      });
+    } catch (error) {
+      Logger.log(`Error executing workflow for email_reply: ${error.toString()}`);
+      // Don't fail reply processing if workflow fails
+    }
+    
     Logger.log(`✓ Reply processed successfully`);
     
   } catch (error) {
