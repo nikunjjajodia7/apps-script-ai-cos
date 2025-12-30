@@ -189,9 +189,9 @@ function createTask(taskData) {
     taskData.Task_ID = `TASK-${timestamp}`;
   }
   
-  // Set defaults
+  // Set defaults - new status system
   if (!taskData.Status) {
-    taskData.Status = TASK_STATUS.DRAFT;
+    taskData.Status = TASK_STATUS.AI_ASSIST;
   }
   if (!taskData.Created_Date) {
     taskData.Created_Date = new Date();
@@ -860,8 +860,9 @@ function getTasksByAssignee(email) {
 function getActiveTaskCount(email) {
   const tasks = getTasksByAssignee(email);
   return tasks.filter(task => 
-    task.Status === TASK_STATUS.ACTIVE || 
-    task.Status === TASK_STATUS.ASSIGNED
+    task.Status === TASK_STATUS.ON_TIME || 
+    task.Status === TASK_STATUS.NOT_ACTIVE ||
+    task.Status === TASK_STATUS.SLOW_PROGRESS
   ).length;
 }
 
@@ -878,56 +879,210 @@ function updateAllActiveTaskCounts() {
   });
 }
 
+// ============================================
+// PROMPT MANAGEMENT FUNCTIONS
+// ============================================
+
 /**
- * Format the Due_Date column as plain text to prevent Google Sheets from auto-formatting dates
- * Run this once to set up the column format
+ * Get prompt sheet name based on type
+ * @param {string} promptType - 'voice', 'email', or 'mom'
+ * @returns {string} - Sheet name
  */
-function formatDueDateColumnAsText() {
+function getPromptSheetName(promptType) {
+  switch (promptType.toLowerCase()) {
+    case 'voice':
+      return SHEETS.VOICE_PROMPTS;
+    case 'email':
+      return SHEETS.EMAIL_PROMPTS;
+    case 'mom':
+      return SHEETS.MOM_PROMPTS;
+    default:
+      throw new Error(`Unknown prompt type: ${promptType}. Use 'voice', 'email', or 'mom'.`);
+  }
+}
+
+/**
+ * Get a prompt from the appropriate prompts sheet
+ * @param {string} promptName - The name/identifier of the prompt (e.g., 'parseVoiceCommand', 'classifyReplyType')
+ * @param {string} promptType - Type of prompt: 'voice', 'email', or 'mom'
+ * @returns {object|null} - Prompt object with Name, Content, Description, Last_Updated or null if not found
+ */
+function getPrompt(promptName, promptType) {
   try {
-    const sheet = getSheet(SHEETS.TASKS_DB);
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const dueDateColIndex = headers.indexOf('Due_Date');
+    const sheetName = getPromptSheetName(promptType);
     
-    if (dueDateColIndex === -1) {
-      Logger.log('Due_Date column not found');
-      return false;
+    // Check if sheet exists
+    let sheet;
+    try {
+      sheet = getSheet(sheetName);
+    } catch (e) {
+      Logger.log(`Prompt sheet ${sheetName} not found. Run createAllSheets() first.`);
+      return null;
     }
     
-    // Get the entire Due_Date column (starting from row 2 to skip header)
-    const lastRow = Math.max(sheet.getLastRow(), 2);
-    const dueDateRange = sheet.getRange(2, dueDateColIndex + 1, lastRow - 1, 1);
+    const data = sheet.getDataRange().getValues();
+    if (data.length <= 1) {
+      // Only headers or empty
+      return null;
+    }
     
-    // Set the number format to plain text (@)
-    dueDateRange.setNumberFormat('@');
+    const headers = data[0];
+    const nameIndex = headers.indexOf('Name');
+    const contentIndex = headers.indexOf('Content');
+    const descriptionIndex = headers.indexOf('Description');
+    const lastUpdatedIndex = headers.indexOf('Last_Updated');
     
-    Logger.log('Due_Date column formatted as plain text');
+    if (nameIndex === -1 || contentIndex === -1) {
+      Logger.log(`Prompt sheet ${sheetName} is missing required columns (Name, Content)`);
+      return null;
+    }
+    
+    // Search for the prompt by name
+    for (let i = 1; i < data.length; i++) {
+      if (data[i][nameIndex] === promptName) {
+        return {
+          Name: data[i][nameIndex],
+          Content: data[i][contentIndex],
+          Description: descriptionIndex >= 0 ? data[i][descriptionIndex] : '',
+          Last_Updated: lastUpdatedIndex >= 0 ? data[i][lastUpdatedIndex] : null
+        };
+      }
+    }
+    
+    // Prompt not found
+    return null;
+  } catch (error) {
+    Logger.log(`Error getting prompt ${promptName} from ${promptType}: ${error.toString()}`);
+    return null;
+  }
+}
+
+/**
+ * Save a prompt to the appropriate prompts sheet
+ * Creates or updates the prompt based on whether it already exists
+ * @param {string} promptName - The name/identifier of the prompt
+ * @param {string} promptType - Type of prompt: 'voice', 'email', or 'mom'
+ * @param {string} content - The prompt content/template
+ * @param {string} description - Optional description of what the prompt does
+ * @returns {boolean} - True if saved successfully
+ */
+function savePrompt(promptName, promptType, content, description = '') {
+  try {
+    const sheetName = getPromptSheetName(promptType);
+    
+    // Check if sheet exists, create if not
+    let sheet;
+    try {
+      sheet = getSheet(sheetName);
+    } catch (e) {
+      Logger.log(`Prompt sheet ${sheetName} not found. Creating it...`);
+      const spreadsheet = getSpreadsheet();
+      sheet = spreadsheet.insertSheet(sheetName);
+      // Add headers
+      sheet.appendRow(['Name', 'Content', 'Description', 'Last_Updated']);
+      sheet.setFrozenRows(1);
+    }
+    
+    const data = sheet.getDataRange().getValues();
+    const headers = data[0];
+    const nameIndex = headers.indexOf('Name');
+    const contentIndex = headers.indexOf('Content');
+    const descriptionIndex = headers.indexOf('Description');
+    const lastUpdatedIndex = headers.indexOf('Last_Updated');
+    
+    // Ensure required columns exist
+    if (nameIndex === -1) {
+      Logger.log(`Adding Name column to ${sheetName}`);
+      sheet.getRange(1, sheet.getLastColumn() + 1).setValue('Name');
+    }
+    if (contentIndex === -1) {
+      Logger.log(`Adding Content column to ${sheetName}`);
+      sheet.getRange(1, sheet.getLastColumn() + 1).setValue('Content');
+    }
+    
+    // Refresh data after potential column additions
+    const refreshedData = sheet.getDataRange().getValues();
+    const refreshedHeaders = refreshedData[0];
+    const finalNameIndex = refreshedHeaders.indexOf('Name');
+    const finalContentIndex = refreshedHeaders.indexOf('Content');
+    const finalDescriptionIndex = refreshedHeaders.indexOf('Description');
+    const finalLastUpdatedIndex = refreshedHeaders.indexOf('Last_Updated');
+    
+    // Check if prompt already exists
+    let existingRow = -1;
+    for (let i = 1; i < refreshedData.length; i++) {
+      if (refreshedData[i][finalNameIndex] === promptName) {
+        existingRow = i + 1; // 1-indexed for sheet operations
+        break;
+      }
+    }
+    
+    const timestamp = new Date();
+    
+    if (existingRow > 0) {
+      // Update existing prompt
+      sheet.getRange(existingRow, finalContentIndex + 1).setValue(content);
+      if (finalDescriptionIndex >= 0 && description) {
+        sheet.getRange(existingRow, finalDescriptionIndex + 1).setValue(description);
+      }
+      if (finalLastUpdatedIndex >= 0) {
+        sheet.getRange(existingRow, finalLastUpdatedIndex + 1).setValue(timestamp);
+      }
+      Logger.log(`Updated prompt: ${promptName} in ${sheetName}`);
+    } else {
+      // Add new prompt
+      const newRow = [];
+      for (let i = 0; i < refreshedHeaders.length; i++) {
+        if (i === finalNameIndex) {
+          newRow.push(promptName);
+        } else if (i === finalContentIndex) {
+          newRow.push(content);
+        } else if (i === finalDescriptionIndex) {
+          newRow.push(description);
+        } else if (i === finalLastUpdatedIndex) {
+          newRow.push(timestamp);
+        } else {
+          newRow.push('');
+        }
+      }
+      sheet.appendRow(newRow);
+      Logger.log(`Created prompt: ${promptName} in ${sheetName}`);
+    }
+    
     return true;
   } catch (error) {
-    Logger.log('Error formatting Due_Date column: ' + error.toString());
+    Logger.log(`Error saving prompt ${promptName} to ${promptType}: ${error.toString()}`);
     return false;
   }
 }
 
 /**
- * Add Team_Members column to Projects_DB if it doesn't exist
+ * List all prompts of a given type
+ * @param {string} promptType - Type of prompt: 'voice', 'email', or 'mom'
+ * @returns {Array<object>} - Array of prompt objects
  */
-function addTeamMembersColumn() {
+function listPrompts(promptType) {
   try {
-    const sheet = getSheet(SHEETS.PROJECTS_DB);
-    const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-    
-    if (headers.includes('Team_Members')) {
-      Logger.log('Team_Members column already exists');
-      return true;
-    }
-    
-    // Add Team_Members column at the end
-    const newColIndex = sheet.getLastColumn() + 1;
-    sheet.getRange(1, newColIndex).setValue('Team_Members');
-    Logger.log('Team_Members column added at position ' + newColIndex);
-    return true;
+    const sheetName = getPromptSheetName(promptType);
+    return getSheetData(sheetName);
   } catch (error) {
-    Logger.log('Error adding Team_Members column: ' + error.toString());
+    Logger.log(`Error listing prompts for ${promptType}: ${error.toString()}`);
+    return [];
+  }
+}
+
+/**
+ * Delete a prompt from the appropriate prompts sheet
+ * @param {string} promptName - The name/identifier of the prompt
+ * @param {string} promptType - Type of prompt: 'voice', 'email', or 'mom'
+ * @returns {boolean} - True if deleted successfully
+ */
+function deletePrompt(promptName, promptType) {
+  try {
+    const sheetName = getPromptSheetName(promptType);
+    return deleteRowByValue(sheetName, 'Name', promptName);
+  } catch (error) {
+    Logger.log(`Error deleting prompt ${promptName} from ${promptType}: ${error.toString()}`);
     return false;
   }
 }

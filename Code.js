@@ -272,6 +272,12 @@ function setupTriggers() {
       .everyMinutes(15)
       .create();
     
+    Logger.log('Creating trigger: syncCalendarChangesToTasks (every 30 minutes)');
+    ScriptApp.newTrigger('syncCalendarChangesToTasks')
+      .timeBased()
+      .everyMinutes(30)
+      .create();
+    
     // Verify triggers were created
     const newTriggers = ScriptApp.getProjectTriggers();
     Logger.log(`\n=== Triggers created successfully ===`);
@@ -322,6 +328,186 @@ function listTriggers() {
 }
 
 /**
+ * Verify triggers are correctly set up and diagnose any issues
+ * Run this to check if automatic email scanning is working
+ */
+function verifyTriggers() {
+  try {
+    Logger.log('═══════════════════════════════════════════════════════════════');
+    Logger.log('        TRIGGER VERIFICATION & DIAGNOSIS');
+    Logger.log('═══════════════════════════════════════════════════════════════');
+    
+    const triggers = ScriptApp.getProjectTriggers();
+    const requiredTriggers = {
+      'checkForReplies': { found: false, description: 'Email reply scanning (every 15 min)' },
+      'handleSilenceEscalation': { found: false, description: 'Follow-up/escalation (hourly)' },
+      'checkVoiceInbox': { found: false, description: 'Voice inbox processing (every 5 min)' },
+      'checkMeetingLake': { found: false, description: 'Meeting notes processing (every 15 min)' },
+      'updateReliabilityScores': { found: false, description: 'Staff reliability scores (daily)' },
+      'syncCalendarChangesToTasks': { found: false, description: 'Calendar bi-directional sync (every 30 min)' },
+    };
+    
+    let allTriggersFound = true;
+    
+    // Check which triggers exist
+    triggers.forEach(trigger => {
+      const funcName = trigger.getHandlerFunction();
+      if (requiredTriggers[funcName]) {
+        requiredTriggers[funcName].found = true;
+      }
+    });
+    
+    Logger.log('\n📋 TRIGGER STATUS:');
+    Logger.log('─────────────────────────────────────────────────────────────');
+    
+    for (const [funcName, info] of Object.entries(requiredTriggers)) {
+      const status = info.found ? '✅' : '❌';
+      Logger.log(`${status} ${funcName}`);
+      Logger.log(`   ${info.description}`);
+      if (!info.found) {
+        allTriggersFound = false;
+      }
+    }
+    
+    Logger.log('\n═══════════════════════════════════════════════════════════════');
+    
+    if (allTriggersFound) {
+      Logger.log('✅ ALL TRIGGERS ARE SET UP CORRECTLY');
+      Logger.log('   Your system should be automatically scanning for email replies.');
+      Logger.log('\n   To test manually, run: checkForReplies()');
+    } else {
+      Logger.log('⚠️  SOME TRIGGERS ARE MISSING');
+      Logger.log('\n   HOW TO FIX:');
+      Logger.log('   1. Run the setupTriggers() function');
+      Logger.log('   2. Or go to Apps Script Editor → Triggers (clock icon on left)');
+      Logger.log('   3. Click "+ Add Trigger" and set up the missing functions');
+      Logger.log('\n   To set up all triggers automatically, run: setupTriggers()');
+    }
+    
+    Logger.log('\n═══════════════════════════════════════════════════════════════');
+    Logger.log('📧 EMAIL REPLY SYSTEM STATUS:');
+    Logger.log('─────────────────────────────────────────────────────────────');
+    
+    // Check for tasks that need monitoring - using new status system
+    try {
+      const notActiveTasks = getTasksByStatus(TASK_STATUS.NOT_ACTIVE);
+      const onTimeTasks = getTasksByStatus(TASK_STATUS.ON_TIME);
+      const slowTasks = getTasksByStatus(TASK_STATUS.SLOW_PROGRESS);
+      Logger.log(`   Tasks with status "not_active": ${notActiveTasks.length}`);
+      Logger.log(`   Tasks with status "on_time": ${onTimeTasks.length}`);
+      Logger.log(`   Tasks with status "slow_progress": ${slowTasks.length}`);
+      Logger.log(`   Total tasks being monitored for replies: ${assignedTasks.length + activeTasks.length}`);
+    } catch (e) {
+      Logger.log(`   Could not check tasks: ${e.toString()}`);
+    }
+    
+    // Check AI configuration
+    Logger.log('\n🤖 AI CONFIGURATION:');
+    Logger.log('─────────────────────────────────────────────────────────────');
+    try {
+      const projectId = CONFIG.VERTEX_AI_PROJECT_ID();
+      const location = CONFIG.VERTEX_AI_LOCATION();
+      Logger.log(`   Vertex AI Project: ${projectId || '❌ NOT SET'}`);
+      Logger.log(`   Location: ${location}`);
+      Logger.log(`   Flash Model: ${CONFIG.GEMINI_FLASH_MODEL}`);
+      Logger.log(`   Pro Model: ${CONFIG.GEMINI_PRO_MODEL}`);
+      
+      if (!projectId) {
+        Logger.log('\n   ⚠️  VERTEX_AI_PROJECT_ID is not configured!');
+        Logger.log('   Add it to your Config sheet to enable AI classification.');
+      }
+    } catch (e) {
+      Logger.log(`   Could not check AI config: ${e.toString()}`);
+    }
+    
+    Logger.log('\n═══════════════════════════════════════════════════════════════');
+    Logger.log('📝 QUICK ACTIONS:');
+    Logger.log('─────────────────────────────────────────────────────────────');
+    Logger.log('   • setupTriggers()     - Set up all automatic triggers');
+    Logger.log('   • checkForReplies()   - Manually check for email replies now');
+    Logger.log('   • testCheckForReplies() - Run email check with detailed logging');
+    Logger.log('   • listTriggers()      - Show all currently installed triggers');
+    Logger.log('═══════════════════════════════════════════════════════════════');
+    
+    return {
+      success: true,
+      allTriggersFound: allTriggersFound,
+      triggerStatus: requiredTriggers
+    };
+    
+  } catch (error) {
+    Logger.log(`ERROR in verifyTriggers: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Quick setup function - sets up triggers and verifies configuration
+ * Run this as a one-stop setup for the email reply system
+ */
+function quickSetupEmailReplySystem() {
+  Logger.log('═══════════════════════════════════════════════════════════════');
+  Logger.log('        QUICK SETUP: EMAIL REPLY SYSTEM');
+  Logger.log('═══════════════════════════════════════════════════════════════\n');
+  
+  // Step 1: Check if triggers exist
+  Logger.log('Step 1: Checking existing triggers...');
+  const triggers = ScriptApp.getProjectTriggers();
+  const hasCheckForReplies = triggers.some(t => t.getHandlerFunction() === 'checkForReplies');
+  
+  if (hasCheckForReplies) {
+    Logger.log('   ✅ checkForReplies trigger already exists');
+  } else {
+    Logger.log('   ⚠️  checkForReplies trigger not found, creating...');
+    try {
+      ScriptApp.newTrigger('checkForReplies')
+        .timeBased()
+        .everyMinutes(15)
+        .create();
+      Logger.log('   ✅ Created checkForReplies trigger (every 15 minutes)');
+    } catch (e) {
+      Logger.log(`   ❌ Failed to create trigger: ${e.toString()}`);
+    }
+  }
+  
+  // Step 2: Verify AI configuration
+  Logger.log('\nStep 2: Verifying AI configuration...');
+  const projectId = CONFIG.VERTEX_AI_PROJECT_ID();
+  if (projectId) {
+    Logger.log(`   ✅ Vertex AI Project ID: ${projectId}`);
+  } else {
+    Logger.log('   ⚠️  VERTEX_AI_PROJECT_ID not set in Config sheet');
+    Logger.log('      AI classification will use fallback pattern matching');
+  }
+  
+  // Step 3: Check for tasks to monitor
+  Logger.log('\nStep 3: Checking tasks to monitor...');
+  try {
+    const notActiveTasks = getTasksByStatus(TASK_STATUS.NOT_ACTIVE);
+    const onTimeTasks = getTasksByStatus(TASK_STATUS.ON_TIME);
+    const slowTasks = getTasksByStatus(TASK_STATUS.SLOW_PROGRESS);
+    Logger.log(`   Found ${notActiveTasks.length} not_active tasks`);
+    Logger.log(`   Found ${onTimeTasks.length} on_time tasks`);
+    Logger.log(`   Found ${slowTasks.length} slow_progress tasks`);
+    
+    if (assignedTasks.length === 0 && activeTasks.length === 0) {
+      Logger.log('   ℹ️  No tasks currently being monitored for replies');
+      Logger.log('      Assign a task to start monitoring for email replies');
+    }
+  } catch (e) {
+    Logger.log(`   Could not check tasks: ${e.toString()}`);
+  }
+  
+  Logger.log('\n═══════════════════════════════════════════════════════════════');
+  Logger.log('SETUP COMPLETE!');
+  Logger.log('═══════════════════════════════════════════════════════════════');
+  Logger.log('\nThe system will now automatically check for email replies every 15 minutes.');
+  Logger.log('To test immediately, run: checkForReplies()');
+  Logger.log('\nTo see full trigger status, run: verifyTriggers()');
+}
+
+/**
  * Update reliability scores for all staff
  */
 function updateReliabilityScores() {
@@ -358,7 +544,7 @@ function calculateReliabilityScore(staffEmail) {
     let stagnations = 0;
     
     tasks.forEach(task => {
-      if (task.Status === TASK_STATUS.DONE) {
+      if (task.Status === TASK_STATUS.CLOSED) {
         totalCompleted++;
         const dueDate = task.Due_Date ? new Date(task.Due_Date) : null;
         const completedDate = task.Last_Updated ? new Date(task.Last_Updated) : null;
@@ -373,8 +559,8 @@ function calculateReliabilityScore(staffEmail) {
         extensionsRequested++;
       }
       
-      // Count stagnations
-      if (task.Status === TASK_STATUS.REVIEW_STAGNATION) {
+      // Count stagnations (now pending_action)
+      if (task.Status === TASK_STATUS.PENDING_ACTION) {
         stagnations++;
       }
     });
@@ -563,7 +749,8 @@ function createAllSheets() {
     'Task_ID', 'Task_Name', 'Status', 'Assignee_Name', 'Assignee_Email', 'Due_Date', 
     'Proposed_Date', 'Project_Tag', 'Meeting_Action', 'AI_Confidence', 
     'Tone_Detected', 'Context_Hidden', 'Interaction_Log', 'Boss_Reply_Draft',
-    'Employee_Reply', 'Created_Date', 'Last_Updated', 'Priority'
+    'Employee_Reply', 'Created_Date', 'Last_Updated', 'Priority',
+    'Calendar_Event_ID', 'Scheduled_Time', 'Previous_Status'
   ];
   
   if (!tasksSheet) {
@@ -1241,10 +1428,10 @@ function testSendAssignmentEmail() {
       return;
     }
     
-    // Update status to Assigned if needed
-    if (task.Status !== TASK_STATUS.ASSIGNED) {
-      Logger.log(`Updating status from "${task.Status}" to "Assigned"...`);
-      updateTask(taskId, { Status: TASK_STATUS.ASSIGNED });
+    // Update status to not_active if needed
+    if (task.Status !== TASK_STATUS.NOT_ACTIVE) {
+      Logger.log(`Updating status from "${task.Status}" to "not_active"...`);
+      updateTask(taskId, { Status: TASK_STATUS.NOT_ACTIVE });
       // Re-fetch task to get updated status
       const updatedTask = getTask(taskId);
       Logger.log(`Status updated to: ${updatedTask.Status}`);
@@ -1304,8 +1491,8 @@ function testSendAssignmentEmailForTask(taskId) {
     }
     
     // Update status if needed
-    if (task.Status !== TASK_STATUS.ASSIGNED) {
-      updateTask(taskId, { Status: TASK_STATUS.ASSIGNED });
+    if (task.Status !== TASK_STATUS.NOT_ACTIVE) {
+      updateTask(taskId, { Status: TASK_STATUS.NOT_ACTIVE });
     }
     
     Logger.log('Sending email...');
@@ -1337,6 +1524,66 @@ function setMeetingLakeFolderId() {
   } catch (e) {
     Logger.log('⚠ Warning: Could not verify folder access. Error: ' + e.toString());
     Logger.log('  Make sure the folder ID is correct and you have access to it.');
+  }
+}
+
+/**
+ * Add Calendar columns to Tasks_DB
+ * Run this function to add the new calendar bi-directional sync columns
+ * Columns added: Calendar_Event_ID, Scheduled_Time, Previous_Status
+ */
+function addCalendarColumnsToTasksDB() {
+  try {
+    Logger.log('=== Adding Calendar Columns to Tasks_DB ===');
+    
+    const spreadsheet = getSpreadsheet();
+    const tasksSheet = spreadsheet.getSheetByName('Tasks_DB');
+    
+    if (!tasksSheet) {
+      Logger.log('ERROR: Tasks_DB sheet not found. Run createAllSheets() first.');
+      return;
+    }
+    
+    // Get existing headers
+    const lastCol = tasksSheet.getLastColumn();
+    const existingHeaders = lastCol > 0 
+      ? tasksSheet.getRange(1, 1, 1, lastCol).getValues()[0] 
+      : [];
+    
+    Logger.log(`Found ${existingHeaders.length} existing columns`);
+    
+    // Columns to add
+    const newColumns = ['Calendar_Event_ID', 'Scheduled_Time', 'Previous_Status'];
+    let addedCount = 0;
+    
+    newColumns.forEach(columnName => {
+      if (!existingHeaders.includes(columnName)) {
+        // Add column at the end
+        const newColPosition = tasksSheet.getLastColumn() + 1;
+        tasksSheet.getRange(1, newColPosition).setValue(columnName);
+        tasksSheet.getRange(1, newColPosition).setFontWeight('bold');
+        Logger.log(`✓ Added column: ${columnName} at position ${newColPosition}`);
+        addedCount++;
+      } else {
+        Logger.log(`Column already exists: ${columnName}`);
+      }
+    });
+    
+    if (addedCount > 0) {
+      Logger.log(`\n=== Added ${addedCount} new column(s) ===`);
+      Logger.log('The calendar bi-directional sync is now ready to use.');
+    } else {
+      Logger.log('\n=== All calendar columns already exist ===');
+    }
+    
+    // Show final column list
+    const finalHeaders = tasksSheet.getRange(1, 1, 1, tasksSheet.getLastColumn()).getValues()[0];
+    Logger.log(`\nFinal columns (${finalHeaders.length} total):`);
+    finalHeaders.forEach((col, i) => Logger.log(`  ${i + 1}. ${col}`));
+    
+  } catch (error) {
+    Logger.log(`ERROR: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
   }
 }
 

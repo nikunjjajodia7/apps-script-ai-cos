@@ -15,6 +15,8 @@ cp ../apps-script/MeetingIntelligence.gs ./MeetingIntelligence.js
 cp ../apps-script/CalendarHelper.gs ./CalendarHelper.js
 cp ../apps-script/EmailHelper.gs ./EmailHelper.js
 cp ../apps-script/Config.gs ./Config.js
+cp ../apps-script/MigratePrompts.gs ./MigratePrompts.js
+cp ../apps-script/WorkflowEngine.gs ./WorkflowEngine.js
 
 echo "✅ Files synced! Now run: clasp push"
 

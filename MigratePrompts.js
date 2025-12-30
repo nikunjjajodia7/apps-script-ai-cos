@@ -69,7 +69,6 @@ Extract the following information and return ONLY a valid JSON object (no markdo
   "due_date": "date in YYYY-MM-DD format if mentioned, or null",
   "due_date_text": "exact original text about due date/timing (e.g., 'next Monday', 'by Friday', 'in 2 days'), or null",
   "due_time": "time if mentioned (HH:MM format in 24-hour), or null",
-  "priority": "High, Medium, or Low based on urgency indicators (urgent, ASAP, important = High; normal = Medium; low priority, whenever = Low), or null if not mentioned",
   "project_tag": "project name or tag if mentioned, or null",
   "context": "all additional details, background, requirements, constraints, or important notes mentioned",
   "tone": "urgent, normal, or calm based on speaker's tone and urgency words",
@@ -101,10 +100,10 @@ EXTRACTION GUIDELINES:
    - Preserve original text in due_date_text for reference
    - If time mentioned (e.g., "by 3 PM", "before noon"), extract in due_time field
 
-4. Priority:
-   - High: urgent, ASAP, immediately, critical, important, high priority, rush
-   - Medium: normal, standard, regular (default if not mentioned)
-   - Low: low priority, whenever, no rush, eventually
+4. Tone (indicates urgency level):
+   - urgent: ASAP, immediately, critical, important, rush
+   - normal: standard, regular (default if not mentioned)
+   - calm: whenever, no rush, eventually
 
 5. Project/Tag:
    - Look for: "for [project]", "related to [project]", "under [project]", "in [project]", "for the [project]", project names mentioned
@@ -145,7 +144,6 @@ Output: {
   "due_date": "2024-01-19",
   "due_date_text": "next Friday",
   "due_time": null,
-  "priority": "High",
   "project_tag": "Q4_Report",
   "context": "Q4 financial report needs review, urgent",
   "tone": "urgent",
@@ -162,7 +160,6 @@ Output: {
   "due_date": "2024-01-19",
   "due_date_text": "end of week",
   "due_time": null,
-  "priority": "Medium",
   "project_tag": "Website",
   "context": "Website homepage needs updating",
   "tone": "normal",
@@ -180,7 +177,6 @@ Output: {
   "due_date": null,
   "due_date_text": null,
   "due_time": null,
-  "priority": "Medium",
   "project_tag": "Marketing",
   "context": "Marketing campaign launch needs to be handled",
   "tone": "normal",

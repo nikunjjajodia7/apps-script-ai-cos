@@ -41,7 +41,8 @@
 function onTaskAssigned(taskId) {
   try {
     const task = getTask(taskId);
-    if (!task || task.Status !== TASK_STATUS.ASSIGNED) {
+    // Use new status system - NOT_ACTIVE is the assigned state
+    if (!task || task.Status !== TASK_STATUS.NOT_ACTIVE) {
       return;
     }
     
@@ -79,10 +80,10 @@ function onGmailReply(e) {
     
     const taskName = taskNameMatch[1];
     
-    // Find task by name
+    // Find task by name - use new status system
     const tasks = findRowsByCondition(SHEETS.TASKS_DB, task => 
       task.Task_Name === taskName && 
-      (task.Status === TASK_STATUS.ASSIGNED || task.Status === TASK_STATUS.ACTIVE)
+      (task.Status === TASK_STATUS.NOT_ACTIVE || task.Status === TASK_STATUS.ON_TIME || task.Status === TASK_STATUS.SLOW_PROGRESS)
     );
     
     if (tasks.length === 0) {
@@ -252,24 +253,44 @@ function cleanEmailContent(emailContent) {
   
   let cleaned = emailContent;
   
-  // Remove quoted sections (common patterns):
-  // - Lines starting with ">" (standard email quote)
-  // - "On [date] [person] wrote:" followed by quoted text
-  // - "From:" followed by quoted text
-  // - "-----Original Message-----" and everything after
-  // - "________________________________" (signature separator)
-  
-  // Remove everything after common quote markers
-  const quoteMarkers = [
-    /^On .+ wrote:.*$/m,  // "On Thu, Dec 25, 2025 at 10:05 PM ... wrote:"
-    /^From:.*$/m,         // "From: ..."
-    /^-----Original Message-----.*$/m,
-    /^________________________________.*$/m,
-    /^_{10,}.*$/m,        // Multiple underscores
-    /^={10,}.*$/m,        // Multiple equals signs
+  // Gmail-style quote patterns (can span multiple lines)
+  // Pattern: "On [date] at [time], [name] <email@domain.com>\nwrote:" or similar
+  // These patterns match the START of a quoted section
+  const gmailQuotePatterns = [
+    // Gmail: "On Sun, 28 Dec 2025 at 12:17 AM, Name <email@domain.com>\nwrote:"
+    /On\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[,\s]+\d{1,2}\s+\w+\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)?[,\s]+[^<]*<[^>]+>[\s\S]*?wrote:/gi,
+    // Gmail variant: "On Dec 28, 2025, at 12:17 AM, Name wrote:"
+    /On\s+\w+\s+\d{1,2},?\s+\d{4},?\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)?[,\s]+[^w]*wrote:/gi,
+    // Generic: "On [any date format] ... wrote:"
+    /On\s+[^]*?wrote:/gi,
   ];
   
-  for (const marker of quoteMarkers) {
+  // Try each Gmail pattern and cut off at the first match
+  for (const pattern of gmailQuotePatterns) {
+    const match = cleaned.match(pattern);
+    if (match) {
+      const index = cleaned.indexOf(match[0]);
+      if (index > 0) {
+        cleaned = cleaned.substring(0, index).trim();
+        break; // Stop after first successful cut
+      }
+    }
+  }
+  
+  // Additional single-line quote markers
+  const singleLineMarkers = [
+    /^From:\s*.*$/m,                    // "From: ..."
+    /^-----Original Message-----.*$/m,  // Outlook style
+    /^________________________________.*$/m, // Outlook separator
+    /^_{10,}.*$/m,                      // Multiple underscores
+    /^={10,}.*$/m,                      // Multiple equals signs
+    /^-{10,}.*$/m,                      // Multiple dashes
+    /^Forwarded message.*$/mi,          // Forwarded message header
+    /^Begin forwarded message.*$/mi,    // Apple Mail forward
+    /^\*From:\*.*$/m,                   // Bold From (some clients)
+  ];
+  
+  for (const marker of singleLineMarkers) {
     const match = cleaned.match(marker);
     if (match) {
       const index = cleaned.indexOf(match[0]);
@@ -279,26 +300,37 @@ function cleanEmailContent(emailContent) {
     }
   }
   
-  // Remove lines starting with ">" (quoted text)
+  // Remove lines starting with ">" (standard email quote)
   cleaned = cleaned.split('\n')
     .filter(line => !line.trim().startsWith('>'))
     .join('\n');
   
   // Remove email signatures (common patterns)
+  // These patterns match from the signature start to the end of the content
   const signaturePatterns = [
-    /Best regards,.*$/is,
-    /Regards,.*$/is,
-    /Thanks,.*$/is,
-    /Sincerely,.*$/is,
-    /Sent from.*$/is,
-    /Get Outlook.*$/is,
+    /\n\n--\s*\n[\s\S]*$/,              // Standard signature delimiter "--"
+    /\nBest regards,[\s\S]*$/i,
+    /\nKind regards,[\s\S]*$/i,
+    /\nRegards,[\s\S]*$/i,
+    /\nThanks,[\s\S]*$/i,
+    /\nThank you,[\s\S]*$/i,
+    /\nSincerely,[\s\S]*$/i,
+    /\nCheers,[\s\S]*$/i,
+    /\nSent from my [\s\S]*$/i,         // Mobile signatures
+    /\nGet Outlook[\s\S]*$/i,           // Outlook mobile
+    /\nSent from Mail[\s\S]*$/i,        // Apple Mail
   ];
   
   for (const pattern of signaturePatterns) {
     cleaned = cleaned.replace(pattern, '');
   }
   
-  return cleaned.trim();
+  // Clean up excessive whitespace
+  cleaned = cleaned
+    .replace(/\n{3,}/g, '\n\n')  // Replace 3+ newlines with 2
+    .trim();
+  
+  return cleaned;
 }
 
 /**
@@ -308,7 +340,7 @@ function handleAcceptanceReply(taskId, emailContent, messageId) {
   Logger.log(`Handling ACCEPTANCE reply for task ${taskId}`);
   
   updateTask(taskId, {
-    Status: TASK_STATUS.ACTIVE,
+    Status: TASK_STATUS.ON_TIME,
   });
   
   logInteraction(taskId, `Assignee accepted task (Message ID: ${messageId})`);
@@ -426,14 +458,15 @@ function handleOtherReply(taskId, emailContent, messageId) {
   
   logInteraction(taskId, `Received reply (unclassified type) (Message ID: ${messageId})`);
   
-  // For unclassified replies, still notify boss if task is in Assigned status
-  if (task.Status === TASK_STATUS.ASSIGNED) {
+  // For unclassified replies, still notify boss if task is in NOT_ACTIVE status
+  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
     notifyBossOfReviewRequest(taskId, 'OTHER', emailContent);
   }
 }
 
 /**
  * Notify boss about review request
+ * Enhanced with more context, AI summary, and quick action guidance
  */
 function notifyBossOfReviewRequest(taskId, reviewType, emailContent, proposedDate = null) {
   try {
@@ -443,46 +476,192 @@ function notifyBossOfReviewRequest(taskId, reviewType, emailContent, proposedDat
     const bossEmail = CONFIG.BOSS_EMAIL();
     if (!bossEmail) return;
     
+    // Get staff name for personalization
+    const staff = getStaff(task.Assignee_Email);
+    const assigneeName = staff ? staff.Name : task.Assignee_Email;
+    
+    // Format dates nicely
+    const tz = Session.getScriptTimeZone();
+    const currentDueDateFormatted = task.Due_Date 
+      ? Utilities.formatDate(new Date(task.Due_Date), tz, 'EEEE, MMMM d, yyyy')
+      : 'Not specified';
+    const proposedDateFormatted = proposedDate 
+      ? Utilities.formatDate(new Date(proposedDate), tz, 'EEEE, MMMM d, yyyy')
+      : 'Not specified in email';
+    
+    // Generate AI summary if possible (with fallback)
+    let aiSummary = '';
+    try {
+      aiSummary = summarizeReviewRequest(
+        reviewType, 
+        emailContent, 
+        task.Task_Name, 
+        currentDueDateFormatted, 
+        proposedDateFormatted
+      );
+    } catch (e) {
+      Logger.log(`Could not generate AI summary: ${e.toString()}`);
+    }
+    
     let subject = '';
     let body = '';
+    let htmlBody = '';
+    
+    // Header with emoji for quick visual identification
+    const emoji = {
+      'DATE_CHANGE': '📅',
+      'SCOPE_QUESTION': '❓',
+      'ROLE_REJECTION': '🔄',
+      'OTHER': '📧'
+    }[reviewType] || '📧';
     
     switch (reviewType) {
       case 'DATE_CHANGE':
-        subject = `Action Required: Date Change Request - ${task.Task_Name}`;
-        body = `The assignee (${task.Assignee_Email}) has requested a different due date for this task.\n\n`;
-        body += `Task: ${task.Task_Name}\n`;
-        body += `Current Due Date: ${task.Due_Date || 'Not specified'}\n`;
-        body += `Proposed Date: ${proposedDate || 'Not specified in email'}\n\n`;
-        body += `Assignee's message:\n${emailContent.substring(0, 500)}\n\n`;
-        body += `Please review and update the task in your dashboard.`;
+        subject = `${emoji} Date Change Request: ${task.Task_Name}`;
+        body = `═══════════════════════════════════════════════════════════════\n`;
+        body += `DATE CHANGE REQUEST\n`;
+        body += `═══════════════════════════════════════════════════════════════\n\n`;
+        body += `${assigneeName} has requested a different due date.\n\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `TASK DETAILS\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `• Task: ${task.Task_Name}\n`;
+        body += `• Assignee: ${assigneeName} (${task.Assignee_Email})\n`;
+        body += `• Project: ${task.Project_Tag || 'No project'}\n`;
+        body += `• Current Due Date: ${currentDueDateFormatted}\n`;
+        body += `• PROPOSED DATE: ${proposedDateFormatted}\n`;
+        if (task.Priority) body += `• Priority: ${task.Priority}\n`;
+        body += `\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `EMPLOYEE'S MESSAGE\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `"${emailContent.substring(0, 800)}"\n\n`;
+        if (aiSummary) {
+          body += `───────────────────────────────────────────────────────────────\n`;
+          body += `AI SUMMARY\n`;
+          body += `───────────────────────────────────────────────────────────────\n`;
+          body += `${aiSummary}\n\n`;
+        }
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `RECOMMENDED ACTIONS\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `1. APPROVE the new date (${proposedDateFormatted})\n`;
+        body += `   → Update the task due date in your dashboard\n\n`;
+        body += `2. NEGOTIATE a different date\n`;
+        body += `   → Reply to the assignee with your preferred date\n\n`;
+        body += `3. REJECT and keep the original date\n`;
+        body += `   → Send a message explaining why the deadline must be kept\n`;
         break;
         
       case 'SCOPE_QUESTION':
-        subject = `Action Required: Scope Question - ${task.Task_Name}`;
-        body = `The assignee (${task.Assignee_Email}) has questions about the scope of this task.\n\n`;
-        body += `Task: ${task.Task_Name}\n\n`;
-        body += `Assignee's message:\n${emailContent.substring(0, 500)}\n\n`;
-        body += `Please review and provide clarification.`;
+        subject = `${emoji} Scope Question: ${task.Task_Name}`;
+        body = `═══════════════════════════════════════════════════════════════\n`;
+        body += `SCOPE CLARIFICATION NEEDED\n`;
+        body += `═══════════════════════════════════════════════════════════════\n\n`;
+        body += `${assigneeName} has questions about this task.\n\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `TASK DETAILS\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `• Task: ${task.Task_Name}\n`;
+        body += `• Assignee: ${assigneeName} (${task.Assignee_Email})\n`;
+        body += `• Project: ${task.Project_Tag || 'No project'}\n`;
+        body += `• Due Date: ${currentDueDateFormatted}\n`;
+        if (task.Context_Hidden) body += `• Original Context: ${task.Context_Hidden.substring(0, 200)}...\n`;
+        body += `\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `EMPLOYEE'S QUESTION\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `"${emailContent.substring(0, 800)}"\n\n`;
+        if (aiSummary) {
+          body += `───────────────────────────────────────────────────────────────\n`;
+          body += `AI SUMMARY\n`;
+          body += `───────────────────────────────────────────────────────────────\n`;
+          body += `${aiSummary}\n\n`;
+        }
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `RECOMMENDED ACTIONS\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `1. Reply directly to clarify the task scope\n`;
+        body += `2. Update the task description with more details\n`;
+        body += `3. Schedule a quick call if the scope is complex\n`;
         break;
         
       case 'ROLE_REJECTION':
-        subject = `Action Required: Role Rejection - ${task.Task_Name}`;
-        body = `The assignee (${task.Assignee_Email}) claims this task is not their responsibility.\n\n`;
-        body += `Task: ${task.Task_Name}\n\n`;
-        body += `Assignee's message:\n${emailContent.substring(0, 500)}\n\n`;
-        body += `Please review and reassign if needed.`;
+        subject = `${emoji} Role Concern: ${task.Task_Name}`;
+        body = `═══════════════════════════════════════════════════════════════\n`;
+        body += `TASK REASSIGNMENT MAY BE NEEDED\n`;
+        body += `═══════════════════════════════════════════════════════════════\n\n`;
+        body += `${assigneeName} believes this task should be assigned to someone else.\n\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `TASK DETAILS\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `• Task: ${task.Task_Name}\n`;
+        body += `• Current Assignee: ${assigneeName} (${task.Assignee_Email})\n`;
+        body += `• Project: ${task.Project_Tag || 'No project'}\n`;
+        body += `• Due Date: ${currentDueDateFormatted}\n`;
+        body += `\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `EMPLOYEE'S CONCERN\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `"${emailContent.substring(0, 800)}"\n\n`;
+        if (aiSummary) {
+          body += `───────────────────────────────────────────────────────────────\n`;
+          body += `AI SUMMARY\n`;
+          body += `───────────────────────────────────────────────────────────────\n`;
+          body += `${aiSummary}\n\n`;
+        }
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `RECOMMENDED ACTIONS\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `1. REASSIGN to the correct person\n`;
+        body += `   → Update the assignee in your dashboard\n\n`;
+        body += `2. CLARIFY why this person is the right fit\n`;
+        body += `   → Reply explaining the assignment rationale\n\n`;
+        body += `3. DISCUSS with the team to determine ownership\n`;
         break;
         
       default:
-        subject = `Action Required: Reply Received - ${task.Task_Name}`;
-        body = `A reply was received from the assignee (${task.Assignee_Email}) that requires your attention.\n\n`;
-        body += `Task: ${task.Task_Name}\n\n`;
-        body += `Assignee's message:\n${emailContent.substring(0, 500)}\n\n`;
-        body += `Please review the task in your dashboard.`;
+        subject = `${emoji} Reply Received: ${task.Task_Name}`;
+        body = `═══════════════════════════════════════════════════════════════\n`;
+        body += `NEW REPLY RECEIVED\n`;
+        body += `═══════════════════════════════════════════════════════════════\n\n`;
+        body += `${assigneeName} has sent a reply about this task.\n\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `TASK DETAILS\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `• Task: ${task.Task_Name}\n`;
+        body += `• Assignee: ${assigneeName} (${task.Assignee_Email})\n`;
+        body += `• Project: ${task.Project_Tag || 'No project'}\n`;
+        body += `• Due Date: ${currentDueDateFormatted}\n`;
+        body += `• Current Status: ${task.Status}\n`;
+        body += `\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `EMPLOYEE'S MESSAGE\n`;
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `"${emailContent.substring(0, 800)}"\n\n`;
+        if (aiSummary) {
+          body += `───────────────────────────────────────────────────────────────\n`;
+          body += `AI SUMMARY\n`;
+          body += `───────────────────────────────────────────────────────────────\n`;
+          body += `${aiSummary}\n\n`;
+        }
+        body += `───────────────────────────────────────────────────────────────\n`;
+        body += `Please review this reply and take appropriate action.\n`;
     }
     
-    body += `\n\nTask ID: ${taskId}\n`;
-    body += `View in dashboard: [Link to your dashboard]`;
+    // Add footer with task metadata
+    body += `\n═══════════════════════════════════════════════════════════════\n`;
+    body += `QUICK REFERENCE\n`;
+    body += `═══════════════════════════════════════════════════════════════\n`;
+    body += `Task ID: ${taskId}\n`;
+    body += `Task Status: ${task.Status}\n`;
+    body += `Reply Type: ${reviewType}\n`;
+    body += `Processed: ${Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss z')}\n`;
+    body += `\n`;
+    body += `To take action, open your TaskFlow Hub dashboard or reply to the\n`;
+    body += `original task assignment email thread.\n`;
+    body += `═══════════════════════════════════════════════════════════════\n`;
+    body += `\nThis notification was sent by Chief of Staff AI\n`;
     
     GmailApp.sendEmail(
       bossEmail,
@@ -497,11 +676,13 @@ function notifyBossOfReviewRequest(taskId, reviewType, emailContent, proposedDat
     
   } catch (error) {
     Logger.log(`Failed to notify boss: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
   }
 }
 
 /**
  * Extract date from text (helper function)
+ * Handles various date formats including relative dates
  */
 function extractDateFromText(text) {
   Logger.log(`Extracting date from text: ${text.substring(0, 200)}...`);
@@ -514,10 +695,149 @@ function extractDateFromText(text) {
   const currentYear = now.getFullYear();
   const currentMonth = now.getMonth();
   const currentDay = now.getDate();
+  const tz = Session.getScriptTimeZone();
   
-  // Try common date patterns (order matters - try more specific first)
-  // Prioritize patterns that match "7th of Jan 2026" format
+  // Helper function to format date
+  function formatDate(date) {
+    return Utilities.formatDate(date, tz, 'yyyy-MM-dd');
+  }
+  
+  // Helper function to get next occurrence of a weekday
+  function getNextWeekday(dayIndex) {
+    const result = new Date(now);
+    const diff = (dayIndex - now.getDay() + 7) % 7;
+    result.setDate(now.getDate() + (diff === 0 ? 7 : diff)); // If today, get next week
+    return result;
+  }
+  
+  const lowerText = cleanedText.toLowerCase();
+  
+  // ========================================
+  // FIRST: Check for relative date expressions
+  // ========================================
+  
+  // Tomorrow
+  if (/\btomorrow\b/i.test(lowerText) || /\bkal\b/i.test(lowerText)) {
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    Logger.log('Found relative date: tomorrow');
+    return formatDate(tomorrow);
+  }
+  
+  // Day after tomorrow
+  if (/\bday after tomorrow\b/i.test(lowerText) || /\bparson\b/i.test(lowerText) || /\bparso\b/i.test(lowerText)) {
+    const dayAfter = new Date(now);
+    dayAfter.setDate(dayAfter.getDate() + 2);
+    Logger.log('Found relative date: day after tomorrow');
+    return formatDate(dayAfter);
+  }
+  
+  // Next week / next Monday
+  if (/\bnext\s+week\b/i.test(lowerText) || /\bnext\s+monday\b/i.test(lowerText) || /\bagle\s+hafte\b/i.test(lowerText)) {
+    const daysUntilMonday = (8 - now.getDay()) % 7 || 7;
+    const nextMonday = new Date(now);
+    nextMonday.setDate(now.getDate() + daysUntilMonday);
+    Logger.log('Found relative date: next week/next monday');
+    return formatDate(nextMonday);
+  }
+  
+  // This week / end of week / by Friday
+  if (/\bthis\s+week\b/i.test(lowerText) || /\bend\s+of\s+week\b/i.test(lowerText) || /\bby\s+friday\b/i.test(lowerText) || /\bis\s+hafte\b/i.test(lowerText)) {
+    const daysUntilFriday = (5 - now.getDay() + 7) % 7;
+    const friday = new Date(now);
+    friday.setDate(now.getDate() + (daysUntilFriday === 0 ? 0 : daysUntilFriday));
+    Logger.log('Found relative date: end of week/friday');
+    return formatDate(friday);
+  }
+  
+  // Next Friday specifically
+  if (/\bnext\s+friday\b/i.test(lowerText)) {
+    const daysUntilNextFriday = ((5 - now.getDay() + 7) % 7) + 7;
+    const nextFriday = new Date(now);
+    nextFriday.setDate(now.getDate() + daysUntilNextFriday);
+    Logger.log('Found relative date: next friday');
+    return formatDate(nextFriday);
+  }
+  
+  // In X days
+  const inDaysMatch = lowerText.match(/\bin\s+(\d+)\s+days?\b/i);
+  if (inDaysMatch) {
+    const days = parseInt(inDaysMatch[1], 10);
+    const futureDate = new Date(now);
+    futureDate.setDate(now.getDate() + days);
+    Logger.log(`Found relative date: in ${days} days`);
+    return formatDate(futureDate);
+  }
+  
+  // In a week / one week
+  if (/\bin\s+(?:a|one|1)\s+week\b/i.test(lowerText) || /\bek\s+hafte\s+mein\b/i.test(lowerText)) {
+    const oneWeek = new Date(now);
+    oneWeek.setDate(now.getDate() + 7);
+    Logger.log('Found relative date: in a week');
+    return formatDate(oneWeek);
+  }
+  
+  // In two weeks
+  if (/\bin\s+(?:two|2)\s+weeks\b/i.test(lowerText) || /\bdo\s+hafte\s+mein\b/i.test(lowerText)) {
+    const twoWeeks = new Date(now);
+    twoWeeks.setDate(now.getDate() + 14);
+    Logger.log('Found relative date: in two weeks');
+    return formatDate(twoWeeks);
+  }
+  
+  // End of month / month end
+  if (/\bend\s+of\s+month\b/i.test(lowerText) || /\bmonth\s+end\b/i.test(lowerText) || /\bmahine\s+ke\s+end\b/i.test(lowerText)) {
+    const endOfMonth = new Date(currentYear, currentMonth + 1, 0);
+    Logger.log('Found relative date: end of month');
+    return formatDate(endOfMonth);
+  }
+  
+  // Weekday names (next occurrence)
+  const weekdayMatch = lowerText.match(/\b(?:this\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i);
+  if (weekdayMatch && !lowerText.includes('next')) {
+    const weekdays = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    const targetDay = weekdays.indexOf(weekdayMatch[1].toLowerCase());
+    if (targetDay >= 0) {
+      const result = getNextWeekday(targetDay);
+      Logger.log(`Found weekday: ${weekdayMatch[1]}`);
+      return formatDate(result);
+    }
+  }
+  
+  // ========================================
+  // SECOND: Try absolute date patterns
+  // ========================================
+  
   const datePatterns = [
+    // "by 5th January 2026" or "by the 5th of January 2026" - prioritize "by" phrases
+    {
+      pattern: /by\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})/i,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.indexOf(match[2].toLowerCase().substring(0, 3));
+        const year = parseInt(match[3]);
+        if (month >= 0 && day >= 1 && day <= 31) {
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
+    // "by 5th January" without year
+    {
+      pattern: /by\s+(?:the\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*/i,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+        const month = monthNames.indexOf(match[2].toLowerCase().substring(0, 3));
+        if (month >= 0 && day >= 1 && day <= 31) {
+          const testDate = new Date(currentYear, month, day);
+          const year = (testDate < now) ? currentYear + 1 : currentYear;
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
     // "7th of Jan 2026" or "7th of January 2026" format
     {
       pattern: /(\d{1,2})(?:st|nd|rd|th)?\s+of\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})/i,
@@ -575,7 +895,7 @@ function extractDateFromText(text) {
         return null;
       }
     },
-    // "10th Jan" or "10 Jan" format without year - assume current or next year
+    // "10th Jan" or "10 Jan" format without year
     {
       pattern: /(\d{1,2})(?:st|nd|rd|th)?\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\b/i,
       parser: function(match) {
@@ -583,7 +903,6 @@ function extractDateFromText(text) {
         const monthNames = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
         const month = monthNames.indexOf(match[2].toLowerCase().substring(0, 3));
         if (month >= 0 && day >= 1 && day <= 31) {
-          // If date has passed this year, assume next year
           const testDate = new Date(currentYear, month, day);
           const year = (testDate < now) ? currentYear + 1 : currentYear;
           return new Date(year, month, day);
@@ -627,6 +946,19 @@ function extractDateFromText(text) {
         return new Date(year, month, day);
       }
     },
+    // DD-MM-YYYY (Indian format)
+    {
+      pattern: /(\d{1,2})-(\d{1,2})-(\d{4})/,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const month = parseInt(match[2]) - 1;
+        const year = parseInt(match[3]);
+        if (month <= 11 && day >= 1 && day <= 31) {
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
     // Full month names with year
     {
       pattern: /(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})/i,
@@ -636,6 +968,36 @@ function extractDateFromText(text) {
         const day = parseInt(match[2]);
         const year = parseInt(match[3]);
         if (month >= 0 && day >= 1 && day <= 31) {
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
+    // Full month names without year - "January 5th" or "5th January"
+    {
+      pattern: /(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})(?:st|nd|rd|th)?/i,
+      parser: function(match) {
+        const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+        const month = monthNames.indexOf(match[1].toLowerCase());
+        const day = parseInt(match[2]);
+        if (month >= 0 && day >= 1 && day <= 31) {
+          const testDate = new Date(currentYear, month, day);
+          const year = (testDate < now) ? currentYear + 1 : currentYear;
+          return new Date(year, month, day);
+        }
+        return null;
+      }
+    },
+    // "5th January" or "5 January" without year
+    {
+      pattern: /(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)/i,
+      parser: function(match) {
+        const day = parseInt(match[1]);
+        const monthNames = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+        const month = monthNames.indexOf(match[2].toLowerCase());
+        if (month >= 0 && day >= 1 && day <= 31) {
+          const testDate = new Date(currentYear, month, day);
+          const year = (testDate < now) ? currentYear + 1 : currentYear;
           return new Date(year, month, day);
         }
         return null;
@@ -651,7 +1013,7 @@ function extractDateFromText(text) {
         Logger.log(`Found date pattern match: ${match[0]}`);
         const date = datePattern.parser(match);
         if (date && !isNaN(date.getTime())) {
-          const formatted = Utilities.formatDate(date, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+          const formatted = formatDate(date);
           Logger.log(`Parsed date: ${formatted}`);
           return formatted;
         }
@@ -678,8 +1040,8 @@ function handleSilenceEscalation() {
     const followupThreshold = new Date(now.getTime() - followupHours * 60 * 60 * 1000);
     const bossAlertThreshold = new Date(now.getTime() - bossAlertHours * 60 * 60 * 1000);
     
-    // Get all assigned tasks
-    const assignedTasks = getTasksByStatus(TASK_STATUS.ASSIGNED);
+    // Get all not_active tasks (awaiting response)
+    const assignedTasks = getTasksByStatus(TASK_STATUS.NOT_ACTIVE);
     
     assignedTasks.forEach(task => {
       // Check last interaction time
@@ -703,9 +1065,9 @@ function handleSilenceEscalation() {
           // Send escalation email
           sendEscalationEmail(task.Task_ID);
           
-          // Update status to Review_Stagnation
+          // Update status to pending_action (new status for stagnation)
           updateTask(task.Task_ID, {
-            Status: TASK_STATUS.REVIEW_STAGNATION,
+            Status: TASK_STATUS.PENDING_ACTION,
           });
           
           logInteraction(task.Task_ID, 'Escalated to Boss (no response in 48h)');
@@ -726,12 +1088,13 @@ function checkForReplies() {
   try {
     Logger.log('=== Checking for email replies ===');
     
-    // Get all assigned tasks and active tasks (in case they reply after accepting)
-    const assignedTasks = getTasksByStatus(TASK_STATUS.ASSIGNED);
-    const activeTasks = getTasksByStatus(TASK_STATUS.ACTIVE);
-    const allTasks = [...assignedTasks, ...activeTasks];
+    // Get all tasks that need reply checking - new status system
+    const notActiveTasks = getTasksByStatus(TASK_STATUS.NOT_ACTIVE);
+    const onTimeTasks = getTasksByStatus(TASK_STATUS.ON_TIME);
+    const slowTasks = getTasksByStatus(TASK_STATUS.SLOW_PROGRESS);
+    const allTasks = [...notActiveTasks, ...onTimeTasks, ...slowTasks];
     
-    Logger.log(`Found ${allTasks.length} tasks to check (${assignedTasks.length} assigned, ${activeTasks.length} active)`);
+    Logger.log(`Found ${allTasks.length} tasks to check (${notActiveTasks.length} not_active, ${onTimeTasks.length} on_time, ${slowTasks.length} slow_progress)`);
     
     let processedCount = 0;
     
@@ -1011,9 +1374,10 @@ function testListTasksWithEmails() {
   try {
     Logger.log('=== Tasks with Email Threads ===');
     
-    const assignedTasks = getTasksByStatus(TASK_STATUS.ASSIGNED);
-    const activeTasks = getTasksByStatus(TASK_STATUS.ACTIVE);
-    const allTasks = [...assignedTasks, ...activeTasks];
+    const notActiveTasks = getTasksByStatus(TASK_STATUS.NOT_ACTIVE);
+    const onTimeTasks = getTasksByStatus(TASK_STATUS.ON_TIME);
+    const slowTasks = getTasksByStatus(TASK_STATUS.SLOW_PROGRESS);
+    const allTasks = [...notActiveTasks, ...onTimeTasks, ...slowTasks];
     
     Logger.log(`Found ${allTasks.length} tasks to check`);
     

@@ -3,6 +3,417 @@
  * Functions for calling Gemini models via Vertex AI API
  */
 
+// ============================================================
+// MODEL DISCOVERY AND TESTING FUNCTIONS
+// ============================================================
+
+/**
+ * List all available Gemini models in your Vertex AI project
+ * Run this function from the Apps Script editor to see available models
+ */
+function listAvailableGeminiModels() {
+  try {
+    const projectId = CONFIG.VERTEX_AI_PROJECT_ID();
+    const location = CONFIG.VERTEX_AI_LOCATION();
+    
+    if (!projectId) {
+      Logger.log('ERROR: VERTEX_AI_PROJECT_ID not configured');
+      return null;
+    }
+    
+    Logger.log('=== Listing Available Gemini Models ===');
+    Logger.log(`Project: ${projectId}`);
+    Logger.log(`Location: ${location}`);
+    Logger.log('');
+    
+    // List publisher models (Gemini models are publisher models from Google)
+    const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models`;
+    
+    const response = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: {
+        'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+        'Content-Type': 'application/json',
+      },
+      muteHttpExceptions: true,
+    });
+    
+    const responseCode = response.getResponseCode();
+    const responseText = response.getContentText();
+    
+    if (responseCode !== 200) {
+      Logger.log(`Error (${responseCode}): ${responseText}`);
+      return null;
+    }
+    
+    const result = JSON.parse(responseText);
+    
+    if (result.models) {
+      // Filter for Gemini models only
+      const geminiModels = result.models.filter(m => 
+        m.name && m.name.toLowerCase().includes('gemini')
+      );
+      
+      Logger.log(`Found ${geminiModels.length} Gemini models:`);
+      Logger.log('');
+      
+      geminiModels.forEach(model => {
+        const modelId = model.name.split('/').pop();
+        Logger.log(`📦 ${modelId}`);
+        if (model.displayName) Logger.log(`   Display: ${model.displayName}`);
+        if (model.description) Logger.log(`   Desc: ${model.description.substring(0, 100)}...`);
+      });
+      
+      return geminiModels;
+    } else {
+      Logger.log('No models found in response');
+      return [];
+    }
+    
+  } catch (error) {
+    Logger.log('Error listing models: ' + error.toString());
+    return null;
+  }
+}
+
+/**
+ * Test a specific model to see if it's available and working
+ * @param {string} modelName - The model name (e.g., 'gemini-2.0-flash')
+ * @returns {object} - Test result with success status and details
+ */
+function testGeminiModel(modelName) {
+  modelName = modelName || 'gemini-1.5-flash';
+  
+  try {
+    const projectId = CONFIG.VERTEX_AI_PROJECT_ID();
+    const location = CONFIG.VERTEX_AI_LOCATION();
+    
+    const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${location}/publishers/google/models/${modelName}:generateContent`;
+    
+    const payload = {
+      contents: [{
+        role: 'user',
+        parts: [{ text: 'Respond with only the word "OK" if you can read this.' }]
+      }],
+      generationConfig: {
+        maxOutputTokens: 10,
+        temperature: 0,
+      }
+    };
+    
+    const startTime = new Date().getTime();
+    
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      headers: {
+        'Authorization': 'Bearer ' + ScriptApp.getOAuthToken(),
+        'Content-Type': 'application/json',
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+    
+    const endTime = new Date().getTime();
+    const latency = endTime - startTime;
+    const responseCode = response.getResponseCode();
+    
+    if (responseCode === 200) {
+      const result = JSON.parse(response.getContentText());
+      const responseText = result.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      
+      return {
+        success: true,
+        model: modelName,
+        latency: latency,
+        response: responseText.trim(),
+        message: `✅ AVAILABLE (${latency}ms)`
+      };
+    } else {
+      const errorText = response.getContentText();
+      let errorMessage = 'Unknown error';
+      
+      try {
+        const errorJson = JSON.parse(errorText);
+        errorMessage = errorJson.error?.message || errorText.substring(0, 100);
+      } catch (e) {
+        errorMessage = errorText.substring(0, 100);
+      }
+      
+      return {
+        success: false,
+        model: modelName,
+        errorCode: responseCode,
+        message: `❌ NOT AVAILABLE: ${errorMessage}`
+      };
+    }
+    
+  } catch (error) {
+    return {
+      success: false,
+      model: modelName,
+      message: `❌ ERROR: ${error.toString()}`
+    };
+  }
+}
+
+/**
+ * Test all known Gemini models and report which ones are available
+ * Run this to discover what models you can use
+ */
+function testAllGeminiModels() {
+  // Comprehensive list of Gemini models to test (latest first)
+  const modelsToTest = [
+    // Latest 2.5 models
+    'gemini-2.5-pro-preview-06-05',
+    'gemini-2.5-flash-preview-05-20',
+    'gemini-2.5-pro',
+    'gemini-2.5-flash',
+    
+    // 2.0 models
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-exp',
+    'gemini-2.0-flash-lite',
+    'gemini-2.0-pro-exp',
+    
+    // Experimental models
+    'gemini-exp-1206',
+    'gemini-exp-1121',
+    
+    // 1.5 stable models (currently configured)
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-002',
+    'gemini-1.5-flash-001',
+    'gemini-1.5-pro',
+    'gemini-1.5-pro-002',
+    'gemini-1.5-pro-001',
+    
+    // Legacy models
+    'gemini-1.0-pro',
+    'gemini-pro',
+  ];
+  
+  Logger.log('╔════════════════════════════════════════════════════════════╗');
+  Logger.log('║           GEMINI MODEL AVAILABILITY TEST                   ║');
+  Logger.log('╚════════════════════════════════════════════════════════════╝');
+  Logger.log('');
+  Logger.log(`Project: ${CONFIG.VERTEX_AI_PROJECT_ID()}`);
+  Logger.log(`Location: ${CONFIG.VERTEX_AI_LOCATION()}`);
+  Logger.log(`Current Flash Model: ${CONFIG.GEMINI_FLASH_MODEL}`);
+  Logger.log(`Current Pro Model: ${CONFIG.GEMINI_PRO_MODEL}`);
+  Logger.log('');
+  Logger.log('Testing models...');
+  Logger.log('─────────────────────────────────────────────────────────────');
+  
+  const results = {
+    available: [],
+    unavailable: []
+  };
+  
+  modelsToTest.forEach(model => {
+    const result = testGeminiModel(model);
+    
+    if (result.success) {
+      results.available.push({
+        model: model,
+        latency: result.latency
+      });
+      Logger.log(`${result.message} - ${model}`);
+    } else {
+      results.unavailable.push(model);
+      Logger.log(`${result.message} - ${model}`);
+    }
+  });
+  
+  Logger.log('');
+  Logger.log('═════════════════════════════════════════════════════════════');
+  Logger.log('SUMMARY');
+  Logger.log('═════════════════════════════════════════════════════════════');
+  Logger.log('');
+  Logger.log(`✅ AVAILABLE MODELS (${results.available.length}):`);
+  results.available.forEach(r => {
+    Logger.log(`   • ${r.model} (${r.latency}ms latency)`);
+  });
+  
+  Logger.log('');
+  Logger.log(`❌ UNAVAILABLE MODELS (${results.unavailable.length}):`);
+  results.unavailable.forEach(m => {
+    Logger.log(`   • ${m}`);
+  });
+  
+  // Recommend best models
+  Logger.log('');
+  Logger.log('═════════════════════════════════════════════════════════════');
+  Logger.log('RECOMMENDATIONS');
+  Logger.log('═════════════════════════════════════════════════════════════');
+  
+  const flashModels = results.available.filter(r => r.model.includes('flash'));
+  const proModels = results.available.filter(r => r.model.includes('pro'));
+  
+  if (flashModels.length > 0) {
+    // Sort by version (newest first based on name)
+    const bestFlash = flashModels[0].model;
+    Logger.log(`🚀 Recommended Flash Model: ${bestFlash}`);
+  }
+  
+  if (proModels.length > 0) {
+    const bestPro = proModels[0].model;
+    Logger.log(`🚀 Recommended Pro Model: ${bestPro}`);
+  }
+  
+  Logger.log('');
+  Logger.log('To update your models, run: updateToLatestModels()');
+  Logger.log('Or manually update CONFIG.GEMINI_FLASH_MODEL and CONFIG.GEMINI_PRO_MODEL in Config.gs');
+  
+  return results;
+}
+
+/**
+ * Find and set the best available models automatically
+ * This will test models and update the Config sheet with the best available ones
+ */
+function updateToLatestModels() {
+  Logger.log('Finding best available Gemini models...');
+  Logger.log('');
+  
+  // Test Flash models (fastest first for quick tasks)
+  const flashCandidates = [
+    'gemini-2.5-flash-preview-05-20',
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
+    'gemini-1.5-flash-002',
+    'gemini-1.5-flash',
+  ];
+  
+  // Test Pro models (most capable for complex reasoning)
+  const proCandidates = [
+    'gemini-2.5-pro-preview-06-05',
+    'gemini-2.5-pro',
+    'gemini-2.0-pro-exp',
+    'gemini-1.5-pro-002',
+    'gemini-1.5-pro',
+  ];
+  
+  let bestFlash = null;
+  let bestPro = null;
+  
+  // Find best Flash model
+  Logger.log('Testing Flash models...');
+  for (const model of flashCandidates) {
+    const result = testGeminiModel(model);
+    if (result.success) {
+      bestFlash = model;
+      Logger.log(`✅ Found best Flash: ${model} (${result.latency}ms)`);
+      break;
+    } else {
+      Logger.log(`❌ ${model}: Not available`);
+    }
+  }
+  
+  Logger.log('');
+  
+  // Find best Pro model
+  Logger.log('Testing Pro models...');
+  for (const model of proCandidates) {
+    const result = testGeminiModel(model);
+    if (result.success) {
+      bestPro = model;
+      Logger.log(`✅ Found best Pro: ${model} (${result.latency}ms)`);
+      break;
+    } else {
+      Logger.log(`❌ ${model}: Not available`);
+    }
+  }
+  
+  Logger.log('');
+  Logger.log('═════════════════════════════════════════════════════════════');
+  Logger.log('RESULTS');
+  Logger.log('═════════════════════════════════════════════════════════════');
+  
+  if (bestFlash) {
+    Logger.log(`Best Flash Model: ${bestFlash}`);
+    Logger.log(`  Current setting: ${CONFIG.GEMINI_FLASH_MODEL}`);
+    
+    if (bestFlash !== CONFIG.GEMINI_FLASH_MODEL) {
+      Logger.log(`  ⚠️  You could upgrade to: ${bestFlash}`);
+      Logger.log(`     Update CONFIG.GEMINI_FLASH_MODEL in Config.gs to use it`);
+    } else {
+      Logger.log(`  ✅ Already using the best available`);
+    }
+  } else {
+    Logger.log('❌ No Flash model available!');
+  }
+  
+  Logger.log('');
+  
+  if (bestPro) {
+    Logger.log(`Best Pro Model: ${bestPro}`);
+    Logger.log(`  Current setting: ${CONFIG.GEMINI_PRO_MODEL}`);
+    
+    if (bestPro !== CONFIG.GEMINI_PRO_MODEL) {
+      Logger.log(`  ⚠️  You could upgrade to: ${bestPro}`);
+      Logger.log(`     Update CONFIG.GEMINI_PRO_MODEL in Config.gs to use it`);
+    } else {
+      Logger.log(`  ✅ Already using the best available`);
+    }
+  } else {
+    Logger.log('❌ No Pro model available!');
+  }
+  
+  Logger.log('');
+  Logger.log('═════════════════════════════════════════════════════════════');
+  Logger.log('HOW TO UPDATE');
+  Logger.log('═════════════════════════════════════════════════════════════');
+  Logger.log('');
+  Logger.log('To update your models, edit Config.gs and change:');
+  Logger.log('');
+  if (bestFlash && bestFlash !== CONFIG.GEMINI_FLASH_MODEL) {
+    Logger.log(`  GEMINI_FLASH_MODEL: '${CONFIG.GEMINI_FLASH_MODEL}' → '${bestFlash}'`);
+  }
+  if (bestPro && bestPro !== CONFIG.GEMINI_PRO_MODEL) {
+    Logger.log(`  GEMINI_PRO_MODEL: '${CONFIG.GEMINI_PRO_MODEL}' → '${bestPro}'`);
+  }
+  
+  return {
+    bestFlash: bestFlash,
+    bestPro: bestPro,
+    currentFlash: CONFIG.GEMINI_FLASH_MODEL,
+    currentPro: CONFIG.GEMINI_PRO_MODEL
+  };
+}
+
+/**
+ * Quick test of current configured models
+ * Use this to verify your current configuration is working
+ */
+function testCurrentModels() {
+  Logger.log('Testing currently configured models...');
+  Logger.log('');
+  
+  const flashResult = testGeminiModel(CONFIG.GEMINI_FLASH_MODEL);
+  const proResult = testGeminiModel(CONFIG.GEMINI_PRO_MODEL);
+  
+  Logger.log(`Flash (${CONFIG.GEMINI_FLASH_MODEL}): ${flashResult.message}`);
+  Logger.log(`Pro (${CONFIG.GEMINI_PRO_MODEL}): ${proResult.message}`);
+  
+  if (flashResult.success && proResult.success) {
+    Logger.log('');
+    Logger.log('✅ All configured models are working!');
+  } else {
+    Logger.log('');
+    Logger.log('⚠️  Some models are not working. Run testAllGeminiModels() to find alternatives.');
+  }
+  
+  return {
+    flash: flashResult,
+    pro: proResult
+  };
+}
+
+// ============================================================
+// CORE API FUNCTIONS
+// ============================================================
+
 /**
  * Call Vertex AI API using UrlFetchApp
  * Note: This requires proper authentication setup in Google Cloud
@@ -71,11 +482,27 @@ function callGeminiFlash(prompt, options = {}) {
 /**
  * Call Gemini Pro for complex reasoning
  */
+/**
+ * Call Gemini Pro for complex reasoning
+ * Falls back to GEMINI_PRO_FALLBACK_MODEL if primary model is not available
+ */
 function callGeminiPro(prompt, options = {}) {
-  return callVertexAI(CONFIG.GEMINI_PRO_MODEL, prompt, {
-    ...options,
-    temperature: options.temperature || 0.7,
-  });
+  try {
+    return callVertexAI(CONFIG.GEMINI_PRO_MODEL, prompt, {
+      ...options,
+      temperature: options.temperature || 0.7,
+    });
+  } catch (error) {
+    // Check if it's a model not found error (404)
+    if (error.toString().includes('404') || error.toString().includes('not found')) {
+      Logger.log(`${CONFIG.GEMINI_PRO_MODEL} not available, falling back to ${CONFIG.GEMINI_PRO_FALLBACK_MODEL}...`);
+      return callVertexAI(CONFIG.GEMINI_PRO_FALLBACK_MODEL, prompt, {
+        ...options,
+        temperature: options.temperature || 0.7,
+      });
+    }
+    throw error;
+  }
 }
 
 /**
@@ -113,7 +540,7 @@ function transcribeAudioWithDiarization(audioFileId) {
     Logger.log(`Project ID: ${projectId}`);
     
     // Speech-to-Text API endpoint
-    const url = `https://speech.googleapis.com/v1/projects/${projectId}/locations/global:recognize`;
+    const url = `https://speech.googleapis.com/v1/speech:recognize`;
     Logger.log(`API URL: ${url}`);
     
     // Map MIME types to Speech-to-Text encoding
@@ -704,7 +1131,6 @@ Extract the following information and return ONLY a valid JSON object (no markdo
   "due_date": "date in DD-MM-YYYY format (MUST be calculated from today={{TODAY_DATE}}), or null",
   "due_date_text": "exact original text about due date/timing as spoken, or null",
   "due_time": "time if mentioned (HH:MM format in 24-hour), or null",
-  "priority": "High, Medium, or Low based on urgency indicators",
   "project_tag": "project name or tag if mentioned, or null",
   "context": "all additional details, background, requirements, constraints mentioned",
   "tone": "urgent, normal, or calm",
@@ -723,10 +1149,10 @@ EXTRACTION GUIDELINES
    - Keep it concise but descriptive (3-8 words ideal)
    - Use action verbs: "Review", "Update", "Create", "Send", "Schedule", etc.
 
-2. Priority:
-   - High: urgent, ASAP, immediately, critical, important, high priority, rush, jaldi
-   - Medium: normal, standard, regular (default if not mentioned)
-   - Low: low priority, whenever, no rush, eventually
+2. Tone (indicates urgency level):
+   - urgent: ASAP, immediately, critical, important, rush, jaldi
+   - normal: standard, regular (default if not mentioned)
+   - calm: whenever, no rush, eventually
 
 3. Context:
    - Include: why the task exists, background info, specific requirements, constraints, dependencies
@@ -757,7 +1183,6 @@ Output: {
   "due_date": "31-01-2025",
   "due_date_text": "next Friday",
   "due_time": null,
-  "priority": "High",
   "project_tag": null,
   "context": "Q4 financial report needs review, marked urgent",
   "tone": "urgent",
@@ -778,7 +1203,6 @@ Output: {
   "due_date": "28-01-2025",
   "due_date_text": "kal tak",
   "due_time": null,
-  "priority": "Medium",
   "project_tag": null,
   "context": "Website update needed",
   "tone": "normal",
@@ -798,7 +1222,6 @@ Output: {
   "due_date": "31-01-2025",
   "due_date_text": "end of week",
   "due_time": null,
-  "priority": "Medium",
   "project_tag": null,
   "context": "Presentation needs to be completed",
   "tone": "normal",
@@ -819,7 +1242,6 @@ Output: {
   "due_date": "29-01-2025",
   "due_date_text": "parson tak",
   "due_time": null,
-  "priority": "Medium",
   "project_tag": null,
   "context": "Report needs to be submitted",
   "tone": "normal",
@@ -1418,4 +1840,5 @@ Return your response as a JSON object with this structure.`;
     };
   }
 }
+
 

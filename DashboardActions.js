@@ -105,9 +105,7 @@ function doPost(e) {
       case 'change_owner':
         result = handleChangeOwner(taskId, data);
         break;
-      case 'increase_priority':
-        result = handleIncreasePriority(taskId);
-        break;
+      // increase_priority removed - priority field no longer used
       case 'cancel_task_scope':
         result = handleCancelTask(taskId);
         break;
@@ -175,6 +173,17 @@ function doPost(e) {
         result = handleMarkHandled(taskId);
         break;
       
+      // New status management actions
+      case 'put_on_hold':
+        result = handlePutOnHold(taskId, data);
+        break;
+      case 'defer_task':
+        result = handleDeferTask(taskId, data);
+        break;
+      case 'reactivate_task':
+        result = handleReactivateTask(taskId);
+        break;
+      
       // Admin actions
       case 'save_prompt':
         result = handleSavePrompt(postData);
@@ -187,6 +196,47 @@ function doPost(e) {
         break;
       case 'test_workflow':
         result = handleTestWorkflow(postData);
+        break;
+      
+      // Bulk operations
+      case 'bulk_delete_tasks':
+        result = handleBulkDeleteTasks(postData);
+        break;
+      case 'bulk_assign_tasks':
+        result = handleBulkAssignTasks(postData);
+        break;
+      case 'bulk_update_tasks':
+        result = handleBulkUpdateTasks(postData);
+        break;
+      
+      // Config operations
+      case 'update_config':
+        result = handleUpdateConfigValue(postData);
+        break;
+      case 'update_config_batch':
+        result = handleUpdateConfigBatch(postData);
+        break;
+      
+      // Staff operations
+      case 'update_staff':
+        result = handleUpdateStaffMember(postData);
+        break;
+      case 'delete_staff':
+        result = handleDeleteStaffMember(postData);
+        break;
+      case 'recalculate_reliability':
+        result = handleRecalculateReliability(postData);
+        break;
+      
+      // Force actions
+      case 'force_reprocess':
+        result = handleForceReprocess(taskId);
+        break;
+      case 'send_followup':
+        result = handleSendFollowUp(taskId);
+        break;
+      case 'send_assignment_email':
+        result = handleSendAssignmentEmail(taskId);
         break;
       
       default:
@@ -207,18 +257,18 @@ function doPost(e) {
   }
 }
 
-// Category B1: Review_AI_Assist handlers
+// Category B1: AI Assist handlers
 function handleApproveInterpretation(taskId, data) {
   const task = getTask(taskId);
   if (!task) {
     return { success: false, message: 'Task not found' };
   }
   
-  // Move to next status
-  const newStatus = task.Assignee_Email ? TASK_STATUS.ASSIGNED : TASK_STATUS.NEW;
+  // Move to next status - not_active if assigned, otherwise stay in ai_assist
+  const newStatus = task.Assignee_Email ? TASK_STATUS.NOT_ACTIVE : TASK_STATUS.AI_ASSIST;
   updateTask(taskId, { Status: newStatus });
   
-  if (newStatus === TASK_STATUS.ASSIGNED) {
+  if (newStatus === TASK_STATUS.NOT_ACTIVE) {
     sendTaskAssignmentEmail(taskId);
   }
   
@@ -240,30 +290,10 @@ function handleModifyTask(taskId, data) {
   
   const updates = {};
   if (data.taskName) updates.Task_Name = data.taskName;
-  if (data.dueDate) {
-    // Store date as text in dd-MM-yyyy format
-    if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(data.dueDate)) {
-      updates.Due_Date = data.dueDate; // Already in correct format
-    } else {
-      // Try to parse and convert to dd-MM-yyyy
-      try {
-        const parsed = new Date(data.dueDate);
-        if (!isNaN(parsed.getTime())) {
-          const day = String(parsed.getDate()).padStart(2, '0');
-          const month = String(parsed.getMonth() + 1).padStart(2, '0');
-          const year = parsed.getFullYear();
-          updates.Due_Date = day + '-' + month + '-' + year;
-        } else {
-          updates.Due_Date = data.dueDate; // Keep as-is if can't parse
-        }
-      } catch (e) {
-        updates.Due_Date = data.dueDate;
-      }
-    }
-  }
+  if (data.dueDate) updates.Due_Date = data.dueDate;
   if (data.context) updates.Context_Hidden = data.context;
   if (data.description) updates.Context_Hidden = data.description;
-  if (data.priority) updates.Priority = data.priority;
+  // Priority field removed from new status system
   
   // Handle assignee - support both email and name
   let finalAssigneeName = data.assigneeName;
@@ -323,10 +353,10 @@ function handleModifyTask(taskId, data) {
   
   // Update status based on assignee
   if (updates.Assignee_Email) {
-    updates.Status = TASK_STATUS.ASSIGNED;
+    updates.Status = TASK_STATUS.NOT_ACTIVE;
   } else if (data.assigneeEmail === null || data.assigneeEmail === '') {
     // Explicitly unassigning
-    updates.Status = TASK_STATUS.NEW;
+    updates.Status = TASK_STATUS.AI_ASSIST;
     updates.Assignee_Name = '';
     updates.Assignee_Email = '';
   }
@@ -358,7 +388,7 @@ function handleModifyTask(taskId, data) {
   }));
   // #endregion
   
-  if (updates.Status === TASK_STATUS.ASSIGNED && updates.Assignee_Email) {
+  if (updates.Status === TASK_STATUS.NOT_ACTIVE && updates.Assignee_Email) {
     sendTaskAssignmentEmail(taskId);
   }
   
@@ -372,7 +402,7 @@ function handleAssignTask(taskId, data) {
   
   updateTask(taskId, {
     Assignee_Email: data.assigneeEmail,
-    Status: TASK_STATUS.ASSIGNED,
+    Status: TASK_STATUS.NOT_ACTIVE,
   });
   
   sendTaskAssignmentEmail(taskId);
@@ -386,14 +416,14 @@ function handleRewriteTask(taskId, data) {
   
   updateTask(taskId, {
     Task_Name: data.newTaskName,
-    Status: TASK_STATUS.DRAFT,
+    Status: TASK_STATUS.AI_ASSIST,
   });
   
   return { success: true, message: 'Task rewritten' };
 }
 
 function handleRejectTask(taskId) {
-  updateTask(taskId, { Status: TASK_STATUS.CANCELLED });
+  updateTask(taskId, { Status: TASK_STATUS.CLOSED });
   return { success: true, message: 'Task rejected' };
 }
 
@@ -407,7 +437,7 @@ function handleApproveNewDate(taskId) {
   updateTask(taskId, {
     Due_Date: task.Proposed_Date,
     Proposed_Date: '',
-    Status: TASK_STATUS.ACTIVE,
+    Status: TASK_STATUS.ON_TIME,
     Employee_Reply: '', // Clear employee reply after review
   });
   
@@ -440,7 +470,7 @@ function handleRejectDateChange(taskId) {
   
   updateTask(taskId, {
     Proposed_Date: '',
-    Status: TASK_STATUS.ACTIVE,
+    Status: TASK_STATUS.ON_TIME,
     Employee_Reply: '', // Clear employee reply after review
   });
   
@@ -513,7 +543,7 @@ function handleProvideClarification(taskId, data) {
   
   updateTask(taskId, {
     Context_Hidden: newContext,
-    Status: TASK_STATUS.ACTIVE,
+    Status: TASK_STATUS.ON_TIME,
     Employee_Reply: '', // Clear employee reply after review
   });
   
@@ -545,7 +575,7 @@ function handleReduceScope(taskId, data) {
   
   updateTask(taskId, {
     Task_Name: data.newScope,
-    Status: TASK_STATUS.ACTIVE,
+    Status: TASK_STATUS.ON_TIME,
   });
   
   return { success: true, message: 'Scope reduced' };
@@ -561,7 +591,7 @@ function handleChangeOwner(taskId, data) {
   
   updateTask(taskId, {
     Assignee_Email: data.newAssigneeEmail,
-    Status: TASK_STATUS.ASSIGNED,
+    Status: TASK_STATUS.NOT_ACTIVE,
   });
   
   sendTaskAssignmentEmail(taskId);
@@ -569,13 +599,10 @@ function handleChangeOwner(taskId, data) {
   return { success: true, message: 'Owner changed' };
 }
 
-function handleIncreasePriority(taskId) {
-  updateTask(taskId, { Priority: 'High' });
-  return { success: true, message: 'Priority increased' };
-}
+// handleIncreasePriority removed - priority field no longer used in new status system
 
 function handleCancelTask(taskId) {
-  updateTask(taskId, { Status: TASK_STATUS.CANCELLED });
+  updateTask(taskId, { Status: TASK_STATUS.CLOSED });
   return { success: true, message: 'Task cancelled' };
 }
 
@@ -681,7 +708,7 @@ function handleAcceptReassign(taskId, data) {
   
   updateTask(taskId, {
     Assignee_Email: data.newAssigneeEmail,
-    Status: TASK_STATUS.ASSIGNED,
+    Status: TASK_STATUS.NOT_ACTIVE,
   });
   
   sendTaskAssignmentEmail(taskId);
@@ -713,7 +740,7 @@ function handleOverrideRole(taskId, data) {
   );
   
   updateTask(taskId, { 
-    Status: TASK_STATUS.ACTIVE,
+    Status: TASK_STATUS.ON_TIME,
     Employee_Reply: '', // Clear employee reply after review
   });
   
@@ -727,7 +754,7 @@ function handleRedirectTask(taskId, data) {
   
   updateTask(taskId, {
     Assignee_Email: data.newTeamEmail,
-    Status: TASK_STATUS.ASSIGNED,
+    Status: TASK_STATUS.NOT_ACTIVE,
   });
   
   sendTaskAssignmentEmail(taskId);
@@ -738,7 +765,7 @@ function handleAssignToSelf(taskId) {
   const bossEmail = CONFIG.BOSS_EMAIL();
   updateTask(taskId, {
     Assignee_Email: bossEmail,
-    Status: TASK_STATUS.ACTIVE,
+    Status: TASK_STATUS.ON_TIME,
   });
   
   return { success: true, message: 'Task assigned to Boss' };
@@ -746,13 +773,13 @@ function handleAssignToSelf(taskId) {
 
 // Category A1: Completion Review handlers
 function handleApproveDone(taskId) {
-  updateTask(taskId, { Status: TASK_STATUS.DONE });
+  updateTask(taskId, { Status: TASK_STATUS.CLOSED });
   return { success: true, message: 'Task marked as done' };
 }
 
 function handleReopenTask(taskId, data) {
   updateTask(taskId, {
-    Status: TASK_STATUS.REOPENED,
+    Status: TASK_STATUS.ON_TIME,
     Context_Hidden: (getTask(taskId).Context_Hidden || '') + '\n\nReopened: ' + (data.reason || ''),
   });
   
@@ -791,7 +818,7 @@ function handleReassign(taskId, data) {
   
   updateTask(taskId, {
     Assignee_Email: data.newAssigneeEmail,
-    Status: TASK_STATUS.ASSIGNED,
+    Status: TASK_STATUS.NOT_ACTIVE,
   });
   
   sendTaskAssignmentEmail(taskId);
@@ -800,7 +827,7 @@ function handleReassign(taskId, data) {
 
 // Category A3: Significant Update handlers
 function handleAcknowledgeUpdate(taskId) {
-  updateTask(taskId, { Status: TASK_STATUS.ACTIVE });
+  updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
   return { success: true, message: 'Update acknowledged' };
 }
 
@@ -847,8 +874,30 @@ function handleScheduleFocusTime(taskId, data) {
 }
 
 function handleMarkHandled(taskId) {
-  updateTask(taskId, { Status: TASK_STATUS.ACTIVE });
+  updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
   return { success: true, message: 'Marked as handled' };
+}
+
+// New handlers for Hold/Someday states
+function handlePutOnHold(taskId, data) {
+  updateTask(taskId, { 
+    Status: TASK_STATUS.ON_HOLD,
+    Context_Hidden: (getTask(taskId).Context_Hidden || '') + '\n\nPut on hold: ' + (data.reason || ''),
+  });
+  return { success: true, message: 'Task put on hold' };
+}
+
+function handleDeferTask(taskId, data) {
+  updateTask(taskId, { 
+    Status: TASK_STATUS.SOMEDAY,
+    Context_Hidden: (getTask(taskId).Context_Hidden || '') + '\n\nDeferred: ' + (data.reason || ''),
+  });
+  return { success: true, message: 'Task deferred to someday' };
+}
+
+function handleReactivateTask(taskId) {
+  updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
+  return { success: true, message: 'Task reactivated' };
 }
 
 // Frontend API handlers
@@ -856,11 +905,13 @@ function handleCreateTask(postData) {
   try {
     // Debug logging
     Logger.log('handleCreateTask received postData: ' + JSON.stringify(postData));
+    Logger.log('postData.data: ' + JSON.stringify(postData.data));
     
     // Extract from postData.data (frontend sends data nested under 'data' key)
     const inputData = postData.data || postData;
-    const { taskName, assigneeEmail, assigneeName, dueDate, priority, description, projectId, projectName } = inputData;
+    Logger.log('inputData after extraction: ' + JSON.stringify(inputData));
     
+    const { taskName, assigneeEmail, assigneeName, dueDate, description, projectId, projectName } = inputData;
     Logger.log('Extracted taskName: ' + taskName);
     
     if (!taskName) {
@@ -939,33 +990,20 @@ function handleCreateTask(postData) {
     // Create task data object
     const taskData = {
       Task_Name: taskName,
-      Status: finalAssigneeEmail ? TASK_STATUS.ASSIGNED : TASK_STATUS.NEW,
+      Status: finalAssigneeEmail ? TASK_STATUS.NOT_ACTIVE : TASK_STATUS.AI_ASSIST,
       Assignee_Name: finalAssigneeName || '',
       Assignee_Email: finalAssigneeEmail || '',
       Project_Tag: projectTag || '',
-      Priority: priority || 'Medium',
       Context_Hidden: description || '',
       Created_By: 'Manual'
     };
     
-    // Store due date as text in dd-MM-yyyy format
+    // Parse due date if provided
     if (dueDate) {
-      // If it's already in dd-MM-yyyy format, use as-is
-      if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(dueDate)) {
-        taskData.Due_Date = dueDate;
-      } else {
-        // Try to parse and convert to dd-MM-yyyy
-        try {
-          const parsed = new Date(dueDate);
-          if (!isNaN(parsed.getTime())) {
-            const day = String(parsed.getDate()).padStart(2, '0');
-            const month = String(parsed.getMonth() + 1).padStart(2, '0');
-            const year = parsed.getFullYear();
-            taskData.Due_Date = day + '-' + month + '-' + year;
-          }
-        } catch (e) {
-          Logger.log('Invalid due date format: ' + dueDate);
-        }
+      try {
+        taskData.Due_Date = new Date(dueDate);
+      } catch (e) {
+        Logger.log('Invalid due date format: ' + dueDate);
       }
     }
     
@@ -973,7 +1011,7 @@ function handleCreateTask(postData) {
     const taskId = createTask(taskData);
     
     // Send assignment email if assignee is provided
-    if (finalAssigneeEmail && taskData.Status === TASK_STATUS.ASSIGNED) {
+    if (finalAssigneeEmail && taskData.Status === TASK_STATUS.NOT_ACTIVE) {
       try {
         sendTaskAssignmentEmail(taskId);
       } catch (emailError) {
@@ -1068,27 +1106,12 @@ function handleUpdateTask(postData) {
     }
     
     if (fieldsToUpdate.status !== undefined) updates.Status = fieldsToUpdate.status;
-    if (fieldsToUpdate.priority !== undefined) updates.Priority = fieldsToUpdate.priority;
+    // Priority field removed from new status system
     if (fieldsToUpdate.dueDate !== undefined) {
-      const dueDate = fieldsToUpdate.dueDate;
-      // If it's already in dd-MM-yyyy format, use as-is
-      if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(dueDate)) {
-        updates.Due_Date = dueDate;
-      } else if (dueDate) {
-        // Try to parse and convert to dd-MM-yyyy
-        try {
-          const parsed = new Date(dueDate);
-          if (!isNaN(parsed.getTime())) {
-            const day = String(parsed.getDate()).padStart(2, '0');
-            const month = String(parsed.getMonth() + 1).padStart(2, '0');
-            const year = parsed.getFullYear();
-            updates.Due_Date = day + '-' + month + '-' + year;
-          }
-        } catch (e) {
-          Logger.log('Invalid due date format: ' + dueDate);
-        }
-      } else {
-        updates.Due_Date = ''; // Clear the date
+      try {
+        updates.Due_Date = new Date(fieldsToUpdate.dueDate);
+      } catch (e) {
+        Logger.log('Invalid due date format: ' + fieldsToUpdate.dueDate);
       }
     }
     if (fieldsToUpdate.description !== undefined) updates.Context_Hidden = fieldsToUpdate.description;
@@ -1115,7 +1138,7 @@ function handleUpdateTask(postData) {
     }
     
     // If assignee changed and task is now assigned, send email
-    if (updates.Assignee_Email && updates.Status === TASK_STATUS.ASSIGNED) {
+    if (updates.Assignee_Email && updates.Status === TASK_STATUS.NOT_ACTIVE) {
       try {
         sendTaskAssignmentEmail(taskId);
       } catch (emailError) {
@@ -1158,12 +1181,14 @@ function doGet(e) {
         availableActions: [
           'approve_interpretation', 'modify_task', 'assign_task', 'rewrite_task', 'reject_task',
           'approve_new_date', 'reject_date_change', 'negotiate_date', 'force_meeting_date',
-          'provide_clarification', 'reduce_scope', 'change_owner', 'increase_priority', 'cancel_task_scope',
+          'provide_clarification', 'reduce_scope', 'change_owner', 'cancel_task_scope',
           'accept_reassign', 'override_role', 'redirect_task', 'assign_to_self', 'cancel_task_role',
           'approve_done', 'reopen_task', 'request_proof',
           'force_meeting_stagnation', 'send_hard_nudge', 'reassign_stagnation', 'kill_task',
-          'acknowledge_update', 'clarify_update', 'convert_to_meeting', 'add_to_weekly', 'mark_handled'
+          'acknowledge_update', 'clarify_update', 'convert_to_meeting', 'add_to_weekly', 'mark_handled',
+          'put_on_hold', 'defer_task', 'reactivate_task'
         ],
+        validStatuses: Object.values(TASK_STATUS),
         usage: 'POST JSON with { action, taskId, data } to this URL'
       })).setMimeType(ContentService.MimeType.JSON);
     }
@@ -1172,18 +1197,25 @@ function doGet(e) {
     if (action === 'get_tasks') {
       const status = e.parameter.status;
       const tasks = getSheetData(SHEETS.TASKS_DB);
-      let filteredTasks = status 
-        ? tasks.filter(t => t.Status === status)
-        : tasks;
       
-      // Format tasks to match expected frontend format
+      // Normalize all task statuses to new system
+      let filteredTasks = tasks.map(task => ({
+        ...task,
+        Status: normalizeStatus(task.Status)
+      }));
+      
+      // Filter by status if provided
+      if (status) {
+        filteredTasks = filteredTasks.filter(t => t.Status === status);
+      }
+      
+      // Format tasks to match expected frontend format (no priority)
       const formattedTasks = filteredTasks.map(task => ({
         taskId: task.Task_ID || '',
         taskName: task.Task_Name || '',
         assigneeName: task.Assignee_Name || '',
         assigneeEmail: task.Assignee_Email || '',
-        status: task.Status || '',
-        priority: task.Priority || '',
+        status: task.Status || TASK_STATUS.AI_ASSIST,
         dueDate: task.Due_Date || '',
         description: task.Context_Hidden || '',
         projectId: task.Project_Tag || '',
@@ -1200,9 +1232,37 @@ function doGet(e) {
     if (action === 'tasks') {
       const status = e.parameter.status;
       const tasks = getSheetData(SHEETS.TASKS_DB);
+      const staffList = getSheetData(SHEETS.STAFF_DB);
+      
+      // Create a map of email -> name for quick lookup
+      const staffMap = {};
+      staffList.forEach(s => {
+        if (s.Email) {
+          staffMap[s.Email.toLowerCase()] = s.Name || '';
+        }
+      });
+      
+      // Enrich tasks with Assignee_Name from staff list if missing and normalize status
+      const enrichedTasks = tasks.map(task => {
+        const enrichedTask = { 
+          ...task,
+          Status: normalizeStatus(task.Status)  // Normalize to new status system
+        };
+        
+        // If Assignee_Name is missing but we have Assignee_Email, look it up
+        if ((!enrichedTask.Assignee_Name || enrichedTask.Assignee_Name === '') && enrichedTask.Assignee_Email) {
+          const email = enrichedTask.Assignee_Email.toLowerCase();
+          if (staffMap[email]) {
+            enrichedTask.Assignee_Name = staffMap[email];
+          }
+        }
+        
+        return enrichedTask;
+      });
+      
       const filteredTasks = status 
-        ? tasks.filter(t => t.Status === status)
-        : tasks;
+        ? enrichedTasks.filter(t => t.Status === status)
+        : enrichedTasks;
       
       return ContentService.createTextOutput(JSON.stringify({
         success: true,
@@ -1266,16 +1326,19 @@ function doGet(e) {
         })).setMimeType(ContentService.MimeType.JSON);
       }
       
+      // Normalize task status to new system
+      const normalizedStatus = normalizeStatus(task.Status);
+      
       // Generate review summary if this is a review task with employee reply
       let reviewSummary = null;
-      if ((task.Status === TASK_STATUS.REVIEW_DATE || 
-           task.Status === TASK_STATUS.REVIEW_SCOPE || 
-           task.Status === TASK_STATUS.REVIEW_ROLE) && 
+      if ((normalizedStatus === TASK_STATUS.REVIEW_DATE || 
+           normalizedStatus === TASK_STATUS.REVIEW_SCOPE || 
+           normalizedStatus === TASK_STATUS.REVIEW_ROLE) && 
           task.Employee_Reply) {
         try {
-          const reviewType = task.Status === TASK_STATUS.REVIEW_DATE ? 'DATE_CHANGE' :
-                           task.Status === TASK_STATUS.REVIEW_SCOPE ? 'SCOPE_QUESTION' :
-                           task.Status === TASK_STATUS.REVIEW_ROLE ? 'ROLE_REJECTION' : 'OTHER';
+          const reviewType = normalizedStatus === TASK_STATUS.REVIEW_DATE ? 'DATE_CHANGE' :
+                           normalizedStatus === TASK_STATUS.REVIEW_SCOPE ? 'SCOPE_QUESTION' :
+                           normalizedStatus === TASK_STATUS.REVIEW_ROLE ? 'ROLE_REJECTION' : 'OTHER';
           reviewSummary = summarizeReviewRequest(
             reviewType,
             task.Employee_Reply,
@@ -1289,8 +1352,11 @@ function doGet(e) {
         }
       }
       
-      // Add review summary to response
-      const taskResponse = { ...task };
+      // Add review summary and normalized status to response
+      const taskResponse = { 
+        ...task,
+        Status: normalizedStatus  // Return normalized status
+      };
       if (reviewSummary) {
         taskResponse.Review_Summary = reviewSummary;
       }
@@ -1329,9 +1395,84 @@ function doGet(e) {
       })).setMimeType(ContentService.MimeType.JSON);
     }
     
+    if (action === 'get_config_all') {
+      const config = getConfig();
+      // Transform config object to array format
+      const configArray = Object.entries(config).map(([key, value]) => ({
+        key: key,
+        value: value,
+        description: '',
+        category: 'System'
+      }));
+      return ContentService.createTextOutput(JSON.stringify({
+        success: true,
+        data: configArray
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    if (action === 'task_analytics') {
+      const tasks = getSheetData(SHEETS.TASKS_DB);
+      const now = new Date();
+      const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      
+      // Calculate analytics with normalized statuses
+      const byStatus = {};
+      const byAssignee = {};
+      let overdueTasks = 0;
+      let completedThisWeek = 0;
+      let createdThisWeek = 0;
+      
+      tasks.forEach(task => {
+        // Normalize status to new system
+        const status = normalizeStatus(task.Status);
+        byStatus[status] = (byStatus[status] || 0) + 1;
+        
+        // Assignee count
+        const assignee = task.Assignee_Name || task.Assignee_Email || 'Unassigned';
+        byAssignee[assignee] = (byAssignee[assignee] || 0) + 1;
+        
+        // Overdue tasks (not closed or on_hold)
+        if (task.Due_Date && status !== TASK_STATUS.CLOSED && status !== TASK_STATUS.ON_HOLD && status !== TASK_STATUS.SOMEDAY) {
+          const dueDate = new Date(task.Due_Date);
+          if (dueDate < now) {
+            overdueTasks++;
+          }
+        }
+        
+        // Completed this week (closed status)
+        if (status === TASK_STATUS.CLOSED && task.Last_Updated) {
+          const updatedDate = new Date(task.Last_Updated);
+          if (updatedDate >= weekAgo) {
+            completedThisWeek++;
+          }
+        }
+        
+        // Created this week
+        if (task.Created_Date) {
+          const createdDate = new Date(task.Created_Date);
+          if (createdDate >= weekAgo) {
+            createdThisWeek++;
+          }
+        }
+      });
+      
+      return ContentService.createTextOutput(JSON.stringify({
+        success: true,
+        data: {
+          totalTasks: tasks.length,
+          byStatus: byStatus,
+          byAssignee: byAssignee,
+          overdueTasks: overdueTasks,
+          completedThisWeek: completedThisWeek,
+          createdThisWeek: createdThisWeek,
+          avgCompletionDays: 0 // Would need more calculation
+        }
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
     return ContentService.createTextOutput(JSON.stringify({
       error: 'Unknown action',
-      availableActions: ['health', 'info', 'tasks', 'staff', 'projects', 'task', 'admin_tasks', 'get_prompts', 'get_workflows']
+      availableActions: ['health', 'info', 'tasks', 'staff', 'projects', 'task', 'admin_tasks', 'get_prompts', 'get_workflows', 'get_config_all', 'task_analytics']
     })).setMimeType(ContentService.MimeType.JSON);
     
   } catch (error) {
@@ -1666,6 +1807,432 @@ function handleAddStaff(postData) {
     }
   } catch (error) {
     Logger.log('Error in handleAddStaff: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+// ============================================
+// BULK OPERATIONS HANDLERS
+// ============================================
+
+/**
+ * Handle bulk delete tasks
+ */
+function handleBulkDeleteTasks(postData) {
+  try {
+    const taskIds = postData.taskIds || [];
+    
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+      return { success: false, error: 'taskIds array is required' };
+    }
+    
+    let deletedCount = 0;
+    let errors = [];
+    
+    for (const taskId of taskIds) {
+      try {
+        const deleted = deleteRowByValue(SHEETS.TASKS_DB, 'Task_ID', taskId);
+        if (deleted) {
+          deletedCount++;
+        } else {
+          errors.push(`Task ${taskId} not found`);
+        }
+      } catch (e) {
+        errors.push(`Error deleting ${taskId}: ${e.toString()}`);
+      }
+    }
+    
+    return {
+      success: true,
+      message: `Deleted ${deletedCount} of ${taskIds.length} tasks`,
+      deletedCount: deletedCount,
+      errors: errors.length > 0 ? errors : undefined
+    };
+  } catch (error) {
+    Logger.log('Error in handleBulkDeleteTasks: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle bulk assign tasks
+ */
+function handleBulkAssignTasks(postData) {
+  try {
+    const taskIds = postData.taskIds || [];
+    const assigneeEmail = postData.assigneeEmail;
+    const assigneeName = postData.assigneeName;
+    
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+      return { success: false, error: 'taskIds array is required' };
+    }
+    
+    if (!assigneeEmail) {
+      return { success: false, error: 'assigneeEmail is required' };
+    }
+    
+    // Get assignee name from staff if not provided
+    let finalAssigneeName = assigneeName;
+    if (!finalAssigneeName) {
+      const staff = getStaff(assigneeEmail);
+      if (staff) {
+        finalAssigneeName = staff.Name;
+      }
+    }
+    
+    let updatedCount = 0;
+    let errors = [];
+    
+    for (const taskId of taskIds) {
+      try {
+        const updated = updateTask(taskId, {
+          Assignee_Email: assigneeEmail,
+          Assignee_Name: finalAssigneeName || '',
+          Status: TASK_STATUS.NOT_ACTIVE
+        });
+        if (updated) {
+          updatedCount++;
+          // Optionally send assignment email
+          try {
+            sendTaskAssignmentEmail(taskId);
+          } catch (emailError) {
+            Logger.log(`Could not send email for ${taskId}: ${emailError.toString()}`);
+          }
+        } else {
+          errors.push(`Task ${taskId} not found`);
+        }
+      } catch (e) {
+        errors.push(`Error assigning ${taskId}: ${e.toString()}`);
+      }
+    }
+    
+    return {
+      success: true,
+      message: `Assigned ${updatedCount} of ${taskIds.length} tasks to ${finalAssigneeName || assigneeEmail}`,
+      updatedCount: updatedCount,
+      errors: errors.length > 0 ? errors : undefined
+    };
+  } catch (error) {
+    Logger.log('Error in handleBulkAssignTasks: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle bulk update tasks
+ */
+function handleBulkUpdateTasks(postData) {
+  try {
+    const taskIds = postData.taskIds || [];
+    const updates = postData.updates || {};
+    
+    if (!Array.isArray(taskIds) || taskIds.length === 0) {
+      return { success: false, error: 'taskIds array is required' };
+    }
+    
+    // Build update object
+    const taskUpdates = {};
+    if (updates.status) taskUpdates.Status = updates.status;
+    // Priority field removed from new status system
+    
+    // Handle due date shift
+    const dueDateShiftDays = updates.dueDateShiftDays;
+    
+    if (Object.keys(taskUpdates).length === 0 && !dueDateShiftDays) {
+      return { success: false, error: 'No valid updates provided' };
+    }
+    
+    let updatedCount = 0;
+    let errors = [];
+    
+    for (const taskId of taskIds) {
+      try {
+        const task = getTask(taskId);
+        if (!task) {
+          errors.push(`Task ${taskId} not found`);
+          continue;
+        }
+        
+        const finalUpdates = { ...taskUpdates };
+        
+        // Handle due date shift
+        if (dueDateShiftDays && task.Due_Date) {
+          const currentDate = new Date(task.Due_Date);
+          currentDate.setDate(currentDate.getDate() + parseInt(dueDateShiftDays));
+          finalUpdates.Due_Date = currentDate;
+        }
+        
+        const updated = updateTask(taskId, finalUpdates);
+        if (updated) {
+          updatedCount++;
+        }
+      } catch (e) {
+        errors.push(`Error updating ${taskId}: ${e.toString()}`);
+      }
+    }
+    
+    return {
+      success: true,
+      message: `Updated ${updatedCount} of ${taskIds.length} tasks`,
+      updatedCount: updatedCount,
+      errors: errors.length > 0 ? errors : undefined
+    };
+  } catch (error) {
+    Logger.log('Error in handleBulkUpdateTasks: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+// ============================================
+// CONFIG HANDLERS
+// ============================================
+
+/**
+ * Handle update single config value
+ */
+function handleUpdateConfigValue(postData) {
+  try {
+    const { key, value, description, category } = postData;
+    
+    if (!key || value === undefined) {
+      return { success: false, error: 'key and value are required' };
+    }
+    
+    setConfigValue(key, value, description || '', category || 'System');
+    return { success: true, message: `Config ${key} updated` };
+  } catch (error) {
+    Logger.log('Error in handleUpdateConfigValue: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle update multiple config values
+ */
+function handleUpdateConfigBatch(postData) {
+  try {
+    const configs = postData.configs || [];
+    
+    if (!Array.isArray(configs) || configs.length === 0) {
+      return { success: false, error: 'configs array is required' };
+    }
+    
+    let updatedCount = 0;
+    let errors = [];
+    
+    for (const config of configs) {
+      try {
+        if (config.key && config.value !== undefined) {
+          setConfigValue(config.key, config.value, config.description || '', config.category || 'System');
+          updatedCount++;
+        }
+      } catch (e) {
+        errors.push(`Error updating ${config.key}: ${e.toString()}`);
+      }
+    }
+    
+    return {
+      success: true,
+      message: `Updated ${updatedCount} config values`,
+      updatedCount: updatedCount,
+      errors: errors.length > 0 ? errors : undefined
+    };
+  } catch (error) {
+    Logger.log('Error in handleUpdateConfigBatch: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+// ============================================
+// STAFF HANDLERS
+// ============================================
+
+/**
+ * Handle update staff member
+ */
+function handleUpdateStaffMember(postData) {
+  try {
+    const email = postData.email;
+    const updates = postData.updates || {};
+    
+    if (!email) {
+      return { success: false, error: 'email is required' };
+    }
+    
+    const existingStaff = getStaff(email);
+    if (!existingStaff) {
+      return { success: false, error: 'Staff member not found' };
+    }
+    
+    // Build update object
+    const staffUpdates = {};
+    if (updates.name) staffUpdates.Name = updates.name;
+    if (updates.role) staffUpdates.Role = updates.role;
+    if (updates.department) staffUpdates.Department = updates.department;
+    if (updates.managerEmail) staffUpdates.Manager_Email = updates.managerEmail;
+    
+    const updated = updateStaff(email, staffUpdates);
+    
+    if (updated) {
+      return { success: true, message: 'Staff member updated' };
+    } else {
+      return { success: false, error: 'Failed to update staff member' };
+    }
+  } catch (error) {
+    Logger.log('Error in handleUpdateStaffMember: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle delete staff member
+ */
+function handleDeleteStaffMember(postData) {
+  try {
+    const email = postData.email;
+    
+    if (!email) {
+      return { success: false, error: 'email is required' };
+    }
+    
+    const deleted = deleteRowByValue(SHEETS.STAFF_DB, 'Email', email);
+    
+    if (deleted) {
+      return { success: true, message: 'Staff member deleted' };
+    } else {
+      return { success: false, error: 'Staff member not found' };
+    }
+  } catch (error) {
+    Logger.log('Error in handleDeleteStaffMember: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle recalculate reliability score
+ */
+function handleRecalculateReliability(postData) {
+  try {
+    const email = postData.email;
+    
+    if (!email) {
+      return { success: false, error: 'email is required' };
+    }
+    
+    // Calculate reliability score based on task history
+    const tasks = getSheetData(SHEETS.TASKS_DB);
+    const staffTasks = tasks.filter(t => t.Assignee_Email === email);
+    
+    if (staffTasks.length === 0) {
+      return { success: true, message: 'No tasks found for this staff member', score: null };
+    }
+    
+    const completedTasks = staffTasks.filter(t => t.Status === TASK_STATUS.CLOSED);
+    const totalTasks = staffTasks.length;
+    
+    // Calculate base score
+    let score = totalTasks > 0 ? Math.round((completedTasks.length / totalTasks) * 100) : 50;
+    
+    // Adjustments
+    const stagnantTasks = staffTasks.filter(t => t.Status === TASK_STATUS.PENDING_ACTION);
+    score -= stagnantTasks.length * 10;
+    
+    const dateChangeTasks = staffTasks.filter(t => t.Status === TASK_STATUS.REVIEW_DATE);
+    score -= dateChangeTasks.length * 5;
+    
+    // Clamp score between 0 and 100
+    score = Math.max(0, Math.min(100, score));
+    
+    // Update staff record
+    updateStaff(email, { Reliability_Score: score, Last_Updated: new Date() });
+    
+    return { success: true, message: 'Reliability score recalculated', score: score };
+  } catch (error) {
+    Logger.log('Error in handleRecalculateReliability: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+// ============================================
+// FORCE ACTION HANDLERS
+// ============================================
+
+/**
+ * Handle force reprocess task
+ */
+function handleForceReprocess(taskId) {
+  try {
+    if (!taskId) {
+      return { success: false, error: 'taskId is required' };
+    }
+    
+    const task = getTask(taskId);
+    if (!task) {
+      return { success: false, error: 'Task not found' };
+    }
+    
+    // Re-run AI processing on the task
+    // This would typically call the AI processing function
+    logInteraction(taskId, 'Force reprocess initiated');
+    
+    // For now, just log and return success
+    // In a full implementation, this would call processVoiceNote or similar
+    
+    return { success: true, message: 'Task queued for reprocessing' };
+  } catch (error) {
+    Logger.log('Error in handleForceReprocess: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle send follow-up email
+ */
+function handleSendFollowUp(taskId) {
+  try {
+    if (!taskId) {
+      return { success: false, error: 'taskId is required' };
+    }
+    
+    const task = getTask(taskId);
+    if (!task) {
+      return { success: false, error: 'Task not found' };
+    }
+    
+    if (!task.Assignee_Email) {
+      return { success: false, error: 'Task has no assignee' };
+    }
+    
+    sendFollowUpEmail(taskId);
+    return { success: true, message: 'Follow-up email sent' };
+  } catch (error) {
+    Logger.log('Error in handleSendFollowUp: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle send assignment email
+ */
+function handleSendAssignmentEmail(taskId) {
+  try {
+    if (!taskId) {
+      return { success: false, error: 'taskId is required' };
+    }
+    
+    const task = getTask(taskId);
+    if (!task) {
+      return { success: false, error: 'Task not found' };
+    }
+    
+    if (!task.Assignee_Email) {
+      return { success: false, error: 'Task has no assignee' };
+    }
+    
+    sendTaskAssignmentEmail(taskId);
+    return { success: true, message: 'Assignment email sent' };
+  } catch (error) {
+    Logger.log('Error in handleSendAssignmentEmail: ' + error.toString());
     return { success: false, error: error.toString() };
   }
 }

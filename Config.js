@@ -172,8 +172,9 @@ const CONFIG = {
   VERTEX_AI_LOCATION: () => getConfigValue('VERTEX_AI_LOCATION', 'us-central1'),
   
   // Model names
-  GEMINI_FLASH_MODEL: 'gemini-2.0-flash-exp',
-  GEMINI_PRO_MODEL: 'gemini-2.0-pro-exp',
+  GEMINI_FLASH_MODEL: 'gemini-2.5-flash',
+  GEMINI_PRO_MODEL: 'gemini-2.5-pro',
+  GEMINI_PRO_FALLBACK_MODEL: 'gemini-1.5-pro',  // Fallback if 2.5 not available
   
   // Speech-to-Text API
   SPEECH_TO_TEXT_ENABLED: () => getConfigValue('SPEECH_TO_TEXT_ENABLED', 'true') === 'true',
@@ -199,25 +200,66 @@ const SHEETS = {
   WORKFLOWS: 'Workflows',
 };
 
-// Task statuses
+// Task statuses - Simplified unified status system
+// All statuses map directly to dashboard buckets for clarity
 const TASK_STATUS = {
-  DRAFT: 'Draft',
-  NEW: 'New',
-  ASSIGNED: 'Assigned',
-  ACTIVE: 'Active',
-  DONE_PENDING_REVIEW: 'Done Pending Review',
-  DONE: 'Done',
-  REVIEW_AI_ASSIST: 'Review_AI_Assist',
-  REVIEW_DATE: 'Review_Date',
-  REVIEW_SCOPE: 'Review_Scope',
-  REVIEW_ROLE: 'Review_Role',
-  REVIEW_STAGNATION: 'Review_Stagnation',
-  REVIEW_UPDATE: 'Review_Update',
-  SCHEDULED: 'Scheduled',
-  SCHEDULING_CONFLICT: 'Scheduling_Conflict',
-  CANCELLED: 'Cancelled',
-  REOPENED: 'Reopened',
+  // AI Assist Bucket - Tasks needing clarification or AI help
+  AI_ASSIST: 'ai_assist',
+  
+  // Pending Action Bucket - Assigned but no response yet, or stagnant
+  NOT_ACTIVE: 'not_active',           // Assigned, awaiting first response
+  PENDING_ACTION: 'pending_action',   // No response after X days, needs nudge
+  
+  // Review Bucket - Employee requested changes
+  REVIEW_DATE: 'review_date',         // Date change request from employee
+  REVIEW_SCOPE: 'review_scope',       // Scope question from employee
+  REVIEW_ROLE: 'review_role',         // Role/ownership question from employee
+  
+  // Active Bucket - Tasks in progress
+  ON_TIME: 'on_time',                 // Active, on track
+  SLOW_PROGRESS: 'slow_progress',     // Active, behind schedule
+  
+  // Done Pending Bucket - Awaiting manager approval
+  COMPLETED: 'completed',             // Employee claims done, pending review
+  
+  // On Hold Bucket - Paused tasks
+  ON_HOLD: 'on_hold',                 // Temporarily paused
+  SOMEDAY: 'someday',                 // Deferred to future
+  
+  // Archived - No longer active
+  CLOSED: 'closed',                   // Manager approved or cancelled
 };
+
+// Legacy status mapping for backward compatibility with existing data
+const LEGACY_STATUS_MAP = {
+  'Draft': TASK_STATUS.AI_ASSIST,
+  'New': TASK_STATUS.AI_ASSIST,
+  'Assigned': TASK_STATUS.NOT_ACTIVE,
+  'Active': TASK_STATUS.ON_TIME,
+  'Done Pending Review': TASK_STATUS.COMPLETED,
+  'Done': TASK_STATUS.CLOSED,
+  'Review_AI_Assist': TASK_STATUS.AI_ASSIST,
+  'Review_Date': TASK_STATUS.REVIEW_DATE,
+  'Review_Scope': TASK_STATUS.REVIEW_SCOPE,
+  'Review_Role': TASK_STATUS.REVIEW_ROLE,
+  'Review_Stagnation': TASK_STATUS.PENDING_ACTION,
+  'Review_Update': TASK_STATUS.ON_TIME,
+  'Scheduled': TASK_STATUS.ON_TIME,
+  'Scheduling_Conflict': TASK_STATUS.AI_ASSIST,
+  'Cancelled': TASK_STATUS.CLOSED,
+  'Reopened': TASK_STATUS.ON_TIME,
+};
+
+// Helper function to normalize legacy statuses to new system
+function normalizeStatus(status) {
+  if (!status) return TASK_STATUS.AI_ASSIST;
+  // Check if it's already a new status
+  if (Object.values(TASK_STATUS).includes(status)) {
+    return status;
+  }
+  // Map legacy status to new
+  return LEGACY_STATUS_MAP[status] || TASK_STATUS.AI_ASSIST;
+}
 
 // Meeting actions
 const MEETING_ACTION = {

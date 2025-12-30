@@ -340,13 +340,12 @@ function createTasksFromActionItems(actionItems, meetingContext) {
         // Create task
         const taskData = {
           Task_Name: item.description || `Action Item ${index + 1}`,
-          Status: assigneeEmail ? TASK_STATUS.DRAFT : TASK_STATUS.REVIEW_AI_ASSIST,
+          Status: assigneeEmail ? TASK_STATUS.NOT_ACTIVE : TASK_STATUS.AI_ASSIST,
           Assignee_Email: assigneeEmail || '',
           Due_Date: item.deadline || '',
           Project_Tag: projectTag || '',
           Context_Hidden: `From meeting: ${meetingContext.meetingName} on ${Utilities.formatDate(meetingContext.meetingDate, Session.getScriptTimeZone(), 'yyyy-MM-dd')}`,
           Created_By: 'Meeting',
-          Priority: 'Medium',
         };
         
         const taskId = createTask(taskData);

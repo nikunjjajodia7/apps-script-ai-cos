@@ -129,9 +129,9 @@ function scheduleOneOnOne(taskId, preferredDate, preferredTime, durationMinutes)
     }
     
     if (!slot) {
-      // No slot found, set status to conflict
+      // No slot found, set status to ai_assist for review
       updateTask(taskId, {
-        Status: TASK_STATUS.SCHEDULING_CONFLICT,
+        Status: TASK_STATUS.AI_ASSIST,
       });
       logInteraction(taskId, 'Could not find available slot for 1-on-1 meeting');
       return null;
@@ -153,20 +153,23 @@ function scheduleOneOnOne(taskId, preferredDate, preferredTime, durationMinutes)
       }
     );
     
-    // Update task
+    // Update task with calendar event info for bi-directional sync
     updateTask(taskId, {
-      Status: TASK_STATUS.SCHEDULED,
+      Status: TASK_STATUS.ON_TIME,  // Scheduled tasks are on_time
       Meeting_Action: '', // Clear the action
+      Calendar_Event_ID: event.getId(),
+      Scheduled_Time: slot.start,
+      Previous_Status: task.Status, // Store previous status for reverting if event deleted
     });
     
-    logInteraction(taskId, `1-on-1 meeting scheduled: ${Utilities.formatDate(slot.start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')}`);
+    logInteraction(taskId, `1-on-1 meeting scheduled: ${Utilities.formatDate(slot.start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')} (Event ID: ${event.getId()})`);
     
     return event.getId();
     
   } catch (error) {
     logError(ERROR_TYPE.API_ERROR, 'scheduleOneOnOne', error.toString(), taskId, error.stack);
     updateTask(taskId, {
-      Status: TASK_STATUS.SCHEDULING_CONFLICT,
+      Status: TASK_STATUS.AI_ASSIST,  // Conflict needs review
     });
     return null;
   }
@@ -222,17 +225,20 @@ function addToWeeklyAgenda(taskId, preferredDate) {
     // Append task to event description
     const currentDescription = weeklyEvent.getDescription() || '';
     const newDescription = currentDescription + 
-      `\n\n---\nTask: ${task.Task_Name}\nContext: ${task.Context_Hidden || ''}`;
+      `\n\n---\nTask: ${task.Task_Name}\nTask ID: ${taskId}\nContext: ${task.Context_Hidden || ''}`;
     
     weeklyEvent.setDescription(newDescription);
     
-    // Update task
+    // Update task with calendar event info for bi-directional sync
     updateTask(taskId, {
-      Status: TASK_STATUS.SCHEDULED,
+      Status: TASK_STATUS.ON_TIME,  // Added to weekly is on_time
       Meeting_Action: '', // Clear the action
+      Calendar_Event_ID: weeklyEvent.getId(),
+      Scheduled_Time: weeklyEvent.getStartTime(),
+      Previous_Status: task.Status, // Store previous status for reverting if event deleted
     });
     
-    logInteraction(taskId, `Added to weekly agenda: ${weeklyEvent.getTitle()}`);
+    logInteraction(taskId, `Added to weekly agenda: ${weeklyEvent.getTitle()} (Event ID: ${weeklyEvent.getId()})`);
     
     return weeklyEvent.getId();
     
@@ -292,7 +298,7 @@ function scheduleFocusTime(taskId, preferredDate, preferredTime, durationMinutes
     
     if (!slot) {
       updateTask(taskId, {
-        Status: TASK_STATUS.SCHEDULING_CONFLICT,
+        Status: TASK_STATUS.AI_ASSIST,  // Conflict needs review
       });
       logInteraction(taskId, 'Could not find available slot for focus time');
       return null;
@@ -300,7 +306,7 @@ function scheduleFocusTime(taskId, preferredDate, preferredTime, durationMinutes
     
     // Create focus time event
     const eventTitle = `Deep Work: ${task.Task_Name}`;
-    const eventDescription = `Focus time for task: ${task.Task_Name}\n\nContext: ${task.Context_Hidden || ''}`;
+    const eventDescription = `Focus time for task: ${task.Task_Name}\nTask ID: ${taskId}\n\nContext: ${task.Context_Hidden || ''}`;
     
     const event = calendar.createEvent(
       eventTitle,
@@ -311,20 +317,23 @@ function scheduleFocusTime(taskId, preferredDate, preferredTime, durationMinutes
       }
     );
     
-    // Update task
+    // Update task with calendar event info for bi-directional sync
     updateTask(taskId, {
-      Status: TASK_STATUS.SCHEDULED,
+      Status: TASK_STATUS.ON_TIME,  // Focus time scheduled is on_time
       Meeting_Action: '', // Clear the action
+      Calendar_Event_ID: event.getId(),
+      Scheduled_Time: slot.start,
+      Previous_Status: task.Status, // Store previous status for reverting if event deleted
     });
     
-    logInteraction(taskId, `Focus time scheduled: ${Utilities.formatDate(slot.start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')}`);
+    logInteraction(taskId, `Focus time scheduled: ${Utilities.formatDate(slot.start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')} (Event ID: ${event.getId()})`);
     
     return event.getId();
     
   } catch (error) {
     logError(ERROR_TYPE.API_ERROR, 'scheduleFocusTime', error.toString(), taskId, error.stack);
     updateTask(taskId, {
-      Status: TASK_STATUS.SCHEDULING_CONFLICT,
+      Status: TASK_STATUS.AI_ASSIST,  // Conflict needs review
     });
     return null;
   }
@@ -420,8 +429,8 @@ function testScheduleOneOnOneAuto() {
     const taskWithAssignee = tasks.find(t => 
       t.Assignee_Email && 
       t.Assignee_Email.trim() !== '' && 
-      t.Status !== TASK_STATUS.SCHEDULED &&
-      t.Status !== TASK_STATUS.DONE
+      t.Status !== TASK_STATUS.ON_TIME &&  // Already active/scheduled
+      t.Status !== TASK_STATUS.CLOSED
     );
     
     if (!taskWithAssignee) {
@@ -626,6 +635,271 @@ function testCalendarAccess() {
   } catch (error) {
     Logger.log(`ERROR: ${error.toString()}`);
     Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+  }
+}
+
+// ============================================
+// CALENDAR BI-DIRECTIONAL SYNC
+// ============================================
+
+/**
+ * Sync calendar changes back to tasks
+ * Detects when calendar events are deleted, rescheduled, or modified
+ * Run this periodically (every 15-30 minutes) via time-driven trigger
+ */
+function syncCalendarChangesToTasks() {
+  try {
+    Logger.log('=== Syncing Calendar Changes to Tasks ===');
+    
+    const calendar = CalendarApp.getDefaultCalendar();
+    const tz = Session.getScriptTimeZone();
+    
+    // Get all tasks with a Calendar_Event_ID
+    const allTasks = getSheetData(SHEETS.TASKS_DB);
+    const scheduledTasks = allTasks.filter(task => 
+      task.Calendar_Event_ID && 
+      task.Calendar_Event_ID.trim() !== '' &&
+      task.Status === TASK_STATUS.ON_TIME  // Tasks with calendar events
+    );
+    
+    Logger.log(`Found ${scheduledTasks.length} task(s) with calendar events to check`);
+    
+    let deletedCount = 0;
+    let rescheduledCount = 0;
+    let unchangedCount = 0;
+    
+    scheduledTasks.forEach(task => {
+      try {
+        const eventId = task.Calendar_Event_ID;
+        const taskId = task.Task_ID;
+        
+        Logger.log(`\nChecking task ${taskId}: Event ID ${eventId}`);
+        
+        // Try to get the calendar event
+        let event = null;
+        try {
+          event = calendar.getEventById(eventId);
+        } catch (e) {
+          Logger.log(`Could not retrieve event: ${e.toString()}`);
+        }
+        
+        if (!event) {
+          // Event was deleted in Google Calendar
+          Logger.log(`Event DELETED for task ${taskId}`);
+          handleCalendarEventDeleted(task);
+          deletedCount++;
+        } else {
+          // Event exists - check if it was rescheduled
+          const eventStartTime = event.getStartTime();
+          const storedScheduledTime = task.Scheduled_Time ? new Date(task.Scheduled_Time) : null;
+          
+          // Check if event is cancelled
+          if (event.getGuestList && event.getGuestList().length > 0) {
+            const myStatus = event.getMyStatus();
+            if (myStatus === CalendarApp.GuestStatus.NO) {
+              Logger.log(`Event DECLINED for task ${taskId}`);
+              handleCalendarEventDeleted(task);
+              deletedCount++;
+              return;
+            }
+          }
+          
+          // Compare times (allow 1 minute tolerance for timezone issues)
+          if (storedScheduledTime) {
+            const timeDiff = Math.abs(eventStartTime.getTime() - storedScheduledTime.getTime());
+            const oneMinute = 60 * 1000;
+            
+            if (timeDiff > oneMinute) {
+              // Event was rescheduled
+              Logger.log(`Event RESCHEDULED for task ${taskId}`);
+              Logger.log(`  Old time: ${storedScheduledTime}`);
+              Logger.log(`  New time: ${eventStartTime}`);
+              handleCalendarEventRescheduled(task, eventStartTime);
+              rescheduledCount++;
+            } else {
+              // No changes
+              unchangedCount++;
+            }
+          } else {
+            // No stored time, update it now
+            updateTask(taskId, { Scheduled_Time: eventStartTime });
+            unchangedCount++;
+          }
+        }
+        
+      } catch (error) {
+        Logger.log(`Error checking task ${task.Task_ID}: ${error.toString()}`);
+      }
+    });
+    
+    Logger.log(`\n=== Sync Complete ===`);
+    Logger.log(`  Deleted: ${deletedCount}`);
+    Logger.log(`  Rescheduled: ${rescheduledCount}`);
+    Logger.log(`  Unchanged: ${unchangedCount}`);
+    
+    return {
+      success: true,
+      deleted: deletedCount,
+      rescheduled: rescheduledCount,
+      unchanged: unchangedCount
+    };
+    
+  } catch (error) {
+    Logger.log(`ERROR in syncCalendarChangesToTasks: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+    logError(ERROR_TYPE.API_ERROR, 'syncCalendarChangesToTasks', error.toString(), null, error.stack);
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle when a calendar event is deleted
+ * Reverts the task to its previous status
+ */
+function handleCalendarEventDeleted(task) {
+  try {
+    const taskId = task.Task_ID;
+    const previousStatus = task.Previous_Status || TASK_STATUS.AI_ASSIST;
+    
+    Logger.log(`Reverting task ${taskId} from SCHEDULED to ${previousStatus}`);
+    
+    // Update task - clear calendar fields and revert status
+    updateTask(taskId, {
+      Status: previousStatus,
+      Calendar_Event_ID: '',
+      Scheduled_Time: '',
+      Previous_Status: '',
+    });
+    
+    logInteraction(taskId, `Calendar event was deleted. Task reverted to status: ${previousStatus}`);
+    
+    // Notify boss about the deletion
+    notifyBossOfCalendarChange(task, 'deleted');
+    
+  } catch (error) {
+    Logger.log(`Error handling deleted event for task ${task.Task_ID}: ${error.toString()}`);
+  }
+}
+
+/**
+ * Handle when a calendar event is rescheduled
+ * Updates the task's scheduled time
+ */
+function handleCalendarEventRescheduled(task, newStartTime) {
+  try {
+    const taskId = task.Task_ID;
+    const tz = Session.getScriptTimeZone();
+    const oldTimeStr = task.Scheduled_Time 
+      ? Utilities.formatDate(new Date(task.Scheduled_Time), tz, 'yyyy-MM-dd HH:mm')
+      : 'Unknown';
+    const newTimeStr = Utilities.formatDate(newStartTime, tz, 'yyyy-MM-dd HH:mm');
+    
+    Logger.log(`Updating task ${taskId} scheduled time: ${oldTimeStr} → ${newTimeStr}`);
+    
+    // Update task with new scheduled time
+    updateTask(taskId, {
+      Scheduled_Time: newStartTime,
+    });
+    
+    logInteraction(taskId, `Calendar event rescheduled: ${oldTimeStr} → ${newTimeStr}`);
+    
+    // Notify boss about the reschedule
+    notifyBossOfCalendarChange(task, 'rescheduled', oldTimeStr, newTimeStr);
+    
+  } catch (error) {
+    Logger.log(`Error handling rescheduled event for task ${task.Task_ID}: ${error.toString()}`);
+  }
+}
+
+/**
+ * Notify boss about calendar changes
+ */
+function notifyBossOfCalendarChange(task, changeType, oldTime = null, newTime = null) {
+  try {
+    const bossEmail = CONFIG.BOSS_EMAIL();
+    if (!bossEmail) return;
+    
+    let subject = '';
+    let body = '';
+    
+    if (changeType === 'deleted') {
+      subject = `📅 Calendar Event Deleted: ${task.Task_Name}`;
+      body = `The calendar event for the following task was deleted:\n\n`;
+      body += `Task: ${task.Task_Name}\n`;
+      body += `Task ID: ${task.Task_ID}\n`;
+      body += `Assignee: ${task.Assignee_Email || 'Self'}\n\n`;
+      body += `The task status has been reverted to: ${task.Previous_Status || 'New'}\n\n`;
+      body += `If this was intentional, no action is needed.\n`;
+      body += `If you'd like to reschedule, please update the task in your dashboard.`;
+    } else if (changeType === 'rescheduled') {
+      subject = `📅 Meeting Rescheduled: ${task.Task_Name}`;
+      body = `A calendar event for the following task was rescheduled:\n\n`;
+      body += `Task: ${task.Task_Name}\n`;
+      body += `Task ID: ${task.Task_ID}\n`;
+      body += `Assignee: ${task.Assignee_Email || 'Self'}\n\n`;
+      body += `Previous Time: ${oldTime}\n`;
+      body += `New Time: ${newTime}\n\n`;
+      body += `The task has been updated with the new scheduled time.`;
+    }
+    
+    body += `\n\n---\nThis notification was sent by Chief of Staff AI`;
+    
+    GmailApp.sendEmail(
+      bossEmail,
+      subject,
+      body,
+      {
+        name: 'Chief of Staff AI',
+      }
+    );
+    
+    Logger.log(`Boss notified of calendar ${changeType} for task ${task.Task_ID}`);
+    
+  } catch (error) {
+    Logger.log(`Error notifying boss of calendar change: ${error.toString()}`);
+  }
+}
+
+/**
+ * Test function: Manually sync calendar changes
+ */
+function testSyncCalendarChanges() {
+  Logger.log('=== Testing Calendar Sync ===');
+  const result = syncCalendarChangesToTasks();
+  Logger.log(`Result: ${JSON.stringify(result)}`);
+}
+
+/**
+ * Test function: List tasks with calendar events
+ */
+function testListScheduledTasks() {
+  try {
+    Logger.log('=== Tasks with Calendar Events ===');
+    
+    const allTasks = getSheetData(SHEETS.TASKS_DB);
+    const scheduledTasks = allTasks.filter(task => 
+      task.Calendar_Event_ID && 
+      task.Calendar_Event_ID.trim() !== ''
+    );
+    
+    if (scheduledTasks.length === 0) {
+      Logger.log('No tasks with calendar events found');
+      return;
+    }
+    
+    Logger.log(`Found ${scheduledTasks.length} task(s):\n`);
+    
+    scheduledTasks.forEach((task, index) => {
+      Logger.log(`${index + 1}. ${task.Task_ID}: ${task.Task_Name}`);
+      Logger.log(`   Status: ${task.Status}`);
+      Logger.log(`   Event ID: ${task.Calendar_Event_ID}`);
+      Logger.log(`   Scheduled: ${task.Scheduled_Time || 'Not set'}`);
+      Logger.log(`   Previous Status: ${task.Previous_Status || 'Not set'}`);
+      Logger.log('');
+    });
+    
+  } catch (error) {
+    Logger.log(`ERROR: ${error.toString()}`);
   }
 }
 

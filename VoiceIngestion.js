@@ -185,33 +185,16 @@ function markFileAsUnclear(file, originalFileName) {
  */
 function createTaskFromVoice(parsedData) {
   try {
-    // Resolve assignee email and name if provided
-    let assigneeEmail = parsedData.assignee_email || '';
-    let assigneeName = parsedData.assignee_name || '';
+    // Resolve assignee email if name was provided
+    let assigneeEmail = parsedData.assignee_email;
     
-    Logger.log(`Voice input - name: "${assigneeName}", email: "${assigneeEmail}"`);
-    
-    // Case 1: We have a name but no email - find email from Staff_DB
-    if (!assigneeEmail && assigneeName) {
-      assigneeEmail = findStaffEmailByName(assigneeName);
+    if (!assigneeEmail && parsedData.assignee_name) {
+      // Try to find staff by name (improved matching)
+      assigneeEmail = findStaffEmailByName(parsedData.assignee_name);
       if (assigneeEmail) {
-        Logger.log(`Matched name "${assigneeName}" to email: ${assigneeEmail}`);
+        Logger.log(`Matched name "${parsedData.assignee_name}" to email: ${assigneeEmail}`);
       }
     }
-    
-    // Case 2: We have an email - always look up the official name from Staff_DB
-    if (assigneeEmail) {
-      const staff = getStaff(assigneeEmail);
-      if (staff && staff.Name) {
-        assigneeName = staff.Name;
-        Logger.log(`Using official name from Staff_DB: ${assigneeName}`);
-      } else {
-        Logger.log(`Staff not found for email: ${assigneeEmail}, keeping name: "${assigneeName}"`);
-      }
-    }
-    
-    Logger.log(`Final resolved - name: "${assigneeName}", email: "${assigneeEmail}"`);
-    
     
     // Resolve project tag if project name was provided
     let projectTag = parsedData.project_tag;
@@ -232,34 +215,25 @@ function createTaskFromVoice(parsedData) {
       }
     }
     
-    // Determine status based on confidence
-    let status = TASK_STATUS.DRAFT;
-    if (parsedData.confidence < CONFIG.AI_CONFIDENCE_THRESHOLD() || parsedData.ambiguities.length > 0) {
-      status = TASK_STATUS.REVIEW_AI_ASSIST;
-    } else if (assigneeEmail) {
-      status = TASK_STATUS.NEW;
+    // Determine status based on confidence - using new status system
+    let status = TASK_STATUS.AI_ASSIST;  // Default to AI assist for review
+    if (parsedData.confidence >= CONFIG.AI_CONFIDENCE_THRESHOLD() && 
+        (!parsedData.ambiguities || parsedData.ambiguities.length === 0)) {
+      // High confidence, no ambiguities - can proceed
+      status = assigneeEmail ? TASK_STATUS.NOT_ACTIVE : TASK_STATUS.AI_ASSIST;
     }
     
-    // Prepare task data
-    // Ensure due_date is in dd-MM-yyyy text format
-    let formattedDueDate = parsedData.due_date || '';
-    // Validate format - should be dd-MM-yyyy from Gemini
-    if (formattedDueDate && !/^\d{1,2}-\d{1,2}-\d{4}$/.test(formattedDueDate)) {
-      Logger.log(`Warning: Due date "${formattedDueDate}" is not in expected dd-MM-yyyy format`);
-    }
-    
+    // Prepare task data (no priority field - using status system)
     const taskData = {
       Task_Name: parsedData.task_name || 'Untitled Task',
       Status: status,
-      Assignee_Name: assigneeName || '',
       Assignee_Email: assigneeEmail || '',
-      Due_Date: formattedDueDate,
+      Due_Date: parsedData.due_date || '',
       Project_Tag: projectTag || '',
       AI_Confidence: parsedData.confidence || 0.5,
       Tone_Detected: parsedData.tone || 'normal',
       Context_Hidden: parsedData.context || '',
       Created_By: 'Voice',
-      Priority: parsedData.priority || (parsedData.tone === 'urgent' ? 'High' : 'Medium'),
       Voice_Transcript: parsedData.raw_transcript || '',
     };
     
@@ -292,10 +266,9 @@ function createTaskFromVoice(parsedData) {
     // Create task
     const taskId = createTask(taskData);
     
-    // If assignee is known and confidence is high, auto-assign
-    if (assigneeEmail && status === TASK_STATUS.NEW) {
-      updateTask(taskId, { Status: TASK_STATUS.ASSIGNED });
-      // Trigger email assignment (will be handled by email module)
+    // If assignee is known and status is not_active, send assignment email
+    if (assigneeEmail && status === TASK_STATUS.NOT_ACTIVE) {
+      // Task is already set to NOT_ACTIVE, trigger email assignment
       Utilities.sleep(1000); // Small delay to ensure task is saved
       try {
         sendTaskAssignmentEmail(taskId);

@@ -279,7 +279,7 @@ function executeActions(actions, context, workflowId) {
               updateTask(taskId, { 
                 Assignee_Email: params.assigneeEmail,
                 Assignee_Name: params.assigneeName || '',
-                Status: TASK_STATUS.ASSIGNED
+                Status: TASK_STATUS.NOT_ACTIVE
               });
               sendTaskAssignmentEmail(taskId);
               result.executed = true;
