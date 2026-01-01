@@ -750,7 +750,13 @@ function createAllSheets() {
     'Proposed_Date', 'Project_Tag', 'Meeting_Action', 'AI_Confidence', 
     'Tone_Detected', 'Context_Hidden', 'Interaction_Log', 'Boss_Reply_Draft',
     'Employee_Reply', 'Created_Date', 'Last_Updated', 'Priority',
-    'Calendar_Event_ID', 'Scheduled_Time', 'Previous_Status'
+    'Calendar_Event_ID', 'Scheduled_Time', 'Previous_Status',
+    'Conversation_History', 'Conversation_State', 'Pending_Changes', 'AI_Summary',
+    'Approval_State', 'Pending_Decision',
+    'Progress_Update', 'Progress_Percentage', 'Last_Progress_Update',
+    'Last_Boss_Message', 'Last_Employee_Message', 'Message_Count', 'Negotiation_History',
+    'Initial_Parameters',
+    'Primary_Thread_ID', 'Processed_Message_IDs', 'Last_Reply_Check'
   ];
   
   if (!tasksSheet) {
@@ -1584,6 +1590,98 @@ function addCalendarColumnsToTasksDB() {
   } catch (error) {
     Logger.log(`ERROR: ${error.toString()}`);
     Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+  }
+}
+
+/**
+ * Migration script: Migrate to simplified email tracking system
+ * Adds new fields and migrates existing thread IDs from Interaction_Log
+ * Run this once after deploying the new schema
+ */
+function migrateToSimplifiedEmailTracking() {
+  try {
+    Logger.log('=== Starting migration to simplified email tracking ===');
+    
+    // First, ensure schema is up to date (adds new columns if needed)
+    createAllSheets();
+    Logger.log('Schema updated');
+    
+    // Get all tasks
+    const tasks = getSheetData(SHEETS.TASKS_DB);
+    let migratedCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
+    
+    Logger.log(`Found ${tasks.length} task(s) to process`);
+    
+    tasks.forEach(task => {
+      if (!task.Task_ID) {
+        skippedCount++;
+        return;
+      }
+      
+      try {
+        const interactionLog = task.Interaction_Log || '';
+        const updates = {};
+        let hasUpdates = false;
+        
+        // Extract first Thread ID from log if Primary_Thread_ID not set
+        if (!task.Primary_Thread_ID) {
+          const threadIdMatch = interactionLog.match(/Thread ID:\s*([a-zA-Z0-9_-]+)/i);
+          if (threadIdMatch) {
+            const threadId = threadIdMatch[1];
+            
+            // Verify thread still exists
+            try {
+              const thread = GmailApp.getThreadById(threadId);
+              if (thread) {
+                updates.Primary_Thread_ID = threadId;
+                hasUpdates = true;
+                Logger.log(`Task ${task.Task_ID}: Extracted Primary_Thread_ID = ${threadId}`);
+              } else {
+                Logger.log(`Task ${task.Task_ID}: Thread ${threadId} not found, skipping`);
+              }
+            } catch (e) {
+              Logger.log(`Task ${task.Task_ID}: Could not access thread ${threadId}: ${e.toString()}`);
+            }
+          }
+        }
+        
+        // Initialize Processed_Message_IDs if not set
+        if (!task.Processed_Message_IDs) {
+          updates.Processed_Message_IDs = '[]';
+          hasUpdates = true;
+        }
+        
+        // Set Last_Reply_Check if not set
+        if (!task.Last_Reply_Check) {
+          updates.Last_Reply_Check = task.Last_Updated || task.Created_Date || new Date().toISOString();
+          hasUpdates = true;
+        }
+        
+        // Apply updates if any
+        if (hasUpdates) {
+          updateTask(task.Task_ID, updates);
+          migratedCount++;
+        } else {
+          skippedCount++;
+        }
+        
+      } catch (error) {
+        Logger.log(`Error migrating task ${task.Task_ID}: ${error.toString()}`);
+        errorCount++;
+      }
+    });
+    
+    Logger.log(`\n=== Migration complete ===`);
+    Logger.log(`Migrated: ${migratedCount} task(s)`);
+    Logger.log(`Skipped: ${skippedCount} task(s)`);
+    Logger.log(`Errors: ${errorCount} task(s)`);
+    
+  } catch (error) {
+    Logger.log(`ERROR in migration: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+    throw error;
   }
 }
 

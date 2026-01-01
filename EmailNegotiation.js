@@ -3,6 +3,411 @@
  * Handles task assignment emails and reply processing
  */
 
+/**
+ * Canonical inbound message ingestion pipeline.
+ * Correlates message -> task via Primary_Thread_ID (preferred) or strict "Task ID:" match.
+ * Ensures Processed_Message_IDs is used for idempotency.
+ */
+function ingestInboundMessage(message) {
+  try {
+    if (!message) return { success: false, error: 'No message provided' };
+
+    const messageId = message.getId();
+    const threadId = message.getThread ? message.getThread().getId() : null;
+    const fromEmail = extractEmailFromString(message.getFrom());
+    const bossEmail = CONFIG.BOSS_EMAIL();
+
+    // Try correlation by Primary_Thread_ID first
+    let taskId = null;
+    if (threadId) {
+      const matches = findRowsByCondition(SHEETS.TASKS_DB, t => (t.Primary_Thread_ID || '') === threadId);
+      if (matches && matches.length > 0) {
+        taskId = matches[0].Task_ID;
+      }
+    }
+
+    // Fallback: strict Task ID match in body
+    if (!taskId) {
+      const body = message.getPlainBody ? message.getPlainBody() : '';
+      const match = body.match(/Task ID:\s*([A-Za-z0-9_-]+)/i);
+      if (match && match[1]) {
+        taskId = match[1].trim();
+      }
+    }
+
+    if (!taskId) {
+      Logger.log(`ingestInboundMessage: Could not correlate message ${messageId} (threadId=${threadId}) to a task`);
+      return { success: false, error: 'Could not correlate message to task' };
+    }
+
+    // Idempotency via Processed_Message_IDs
+    const processedIds = getProcessedMessageIds(taskId);
+    if (processedIds.has(messageId)) {
+      Logger.log(`ingestInboundMessage: Message ${messageId} already processed for ${taskId}, skipping`);
+      return { success: true, skipped: true, taskId: taskId };
+    }
+
+    const task = getTask(taskId);
+    if (!task) return { success: false, error: `Task ${taskId} not found` };
+    const assigneeEmail = extractEmailFromString(task.Assignee_Email);
+
+    const isBoss = fromEmail && bossEmail && fromEmail.toLowerCase() === bossEmail.toLowerCase();
+    const isEmployee = fromEmail && assigneeEmail && fromEmail.toLowerCase() === assigneeEmail.toLowerCase();
+    if (!isBoss && !isEmployee) {
+      Logger.log(`ingestInboundMessage: Unknown sender ${fromEmail} for task ${taskId}, skipping`);
+      return { success: false, error: 'Unknown sender' };
+    }
+
+    // Process
+    if (isBoss) {
+      processBossMessage(taskId, message);
+    } else {
+      processReplyEmail(taskId, message);
+    }
+
+    // Mark processed and run deterministic post-step analysis
+    markMessageAsProcessed(taskId, messageId);
+    try {
+      analyzeConversationAndUpdateState(taskId);
+    } catch (e) {
+      Logger.log(`ingestInboundMessage: post-step analysis failed for ${taskId}: ${e.toString()}`);
+    }
+
+    return { success: true, taskId: taskId, messageId: messageId, threadId: threadId };
+  } catch (error) {
+    Logger.log(`ingestInboundMessage error: ${error.toString()}`);
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Process a message from the boss
+ * Analyzes for date changes, instructions, and automatically updates task
+ */
+function processBossMessage(taskId, message) {
+  try {
+    Logger.log(`=== Processing boss message for task: ${taskId} ===`);
+    
+    const task = getTask(taskId);
+    if (!task) {
+      Logger.log(`ERROR: Task ${taskId} not found`);
+      return;
+    }
+    
+    // Get email content
+    const rawEmailContent = message.getPlainBody();
+    const emailContent = cleanEmailContent(rawEmailContent);
+    const messageId = message.getId();
+    
+    Logger.log(`Boss message preview: ${emailContent.substring(0, 200)}...`);
+    
+    // Check if we've already processed this message
+    const log = task.Interaction_Log || '';
+    if (log.includes(`Message ID: ${messageId}`)) {
+      Logger.log(`Message ${messageId} already processed, skipping`);
+      return;
+    }
+    
+    // Analyze boss message for date changes and instructions
+    const analysis = analyzeBossMessageForDateChange(taskId, emailContent);
+    
+    Logger.log(`Boss message analysis:`);
+    Logger.log(`  Contains date change: ${analysis.hasDateChange}`);
+    Logger.log(`  New date: ${analysis.newDate || 'None'}`);
+    Logger.log(`  Requires employee approval: ${analysis.requiresApproval}`);
+    Logger.log(`  Reasoning: ${analysis.reasoning}`);
+    
+    // Store boss message in conversation history
+    appendToConversationHistory(taskId, {
+      id: messageId,
+      timestamp: new Date().toISOString(),
+      senderEmail: CONFIG.BOSS_EMAIL(),
+      senderName: 'Boss',
+      type: 'boss_message',
+      content: emailContent,
+      messageId: messageId,
+      metadata: {
+        hasDateChange: analysis.hasDateChange,
+        newDate: analysis.newDate,
+        messageType: analysis.messageType
+      }
+    });
+    
+    // Update Last_Boss_Message timestamp
+    updateTask(taskId, {
+      Last_Boss_Message: new Date().toISOString(),
+      Last_Updated: new Date()
+    });
+    
+    // If boss specified a new date, update task and request employee approval
+    if (analysis.hasDateChange && analysis.newDate) {
+      handleBossDateChange(taskId, analysis.newDate, emailContent, messageId);
+    } else {
+      // Just log the boss message
+      logInteraction(taskId, `Boss message received: ${emailContent.substring(0, 100)}... (Message ID: ${messageId})`);
+    }
+    
+  } catch (error) {
+    Logger.log(`ERROR processing boss message: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+    logError(ERROR_TYPE.API_ERROR, 'processBossMessage', error.toString(), taskId, error.stack);
+  }
+}
+
+/**
+ * Analyze boss message to detect date changes
+ * Uses AI to understand context and extract dates
+ */
+function analyzeBossMessageForDateChange(taskId, messageContent) {
+  try {
+    const task = getTask(taskId);
+    const bossEmail = CONFIG.BOSS_EMAIL();
+    
+    // Build context about the task
+    const currentDueDate = task.Due_Date ? 
+      Utilities.formatDate(new Date(task.Due_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
+      'Not set';
+    const proposedDate = task.Proposed_Date ? 
+      Utilities.formatDate(new Date(task.Proposed_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
+      'None';
+    
+    // Get conversation history to understand context
+    let conversationContext = '';
+    if (task.Conversation_History) {
+      try {
+        const history = JSON.parse(task.Conversation_History);
+        const recentMessages = history.slice(-3); // Last 3 messages for context
+        conversationContext = recentMessages.map(m => 
+          `${m.senderName || m.senderEmail}: ${m.content.substring(0, 200)}`
+        ).join('\n\n');
+      } catch (e) {
+        Logger.log('Could not parse conversation history');
+      }
+    }
+    
+    const prompt = `You are analyzing a message from a boss to an employee about a task deadline. The boss may be:
+1. Rejecting an employee's date change request
+2. Proposing a new date (possibly one the employee suggested earlier)
+3. Requesting an earlier deadline
+4. Just providing general feedback
+
+Task Details:
+- Task Name: "${task.Task_Name}"
+- Current Due Date: ${currentDueDate}
+- Employee Proposed Date: ${proposedDate}
+- Task Status: ${task.Status}
+
+${conversationContext ? `Recent Conversation Context:\n${conversationContext}\n\n` : ''}
+
+Boss's Message:
+"${messageContent}"
+
+Analyze this message and determine:
+1. Does the boss mention a specific new date/deadline?
+2. Is the boss requesting the employee to approve/confirm a date?
+3. Is this a date change instruction that should be applied to the task?
+
+IMPORTANT:
+- Extract the NEW date the boss wants (not the current date)
+- Look for phrases like: "I need it by [date]", "deadline is [date]", "by [date]", "earlier by [date]", "use [date]"
+- If boss mentions a date that was previously suggested by employee, that's the date to extract
+- Convert all date formats to YYYY-MM-DD
+
+Return ONLY a valid JSON object:
+{
+  "hasDateChange": true/false,
+  "newDate": "YYYY-MM-DD or null",
+  "requiresApproval": true/false,
+  "reasoning": "explanation of what the boss is requesting",
+  "messageType": "DATE_CHANGE|REJECTION|APPROVAL|GENERAL"
+}`;
+
+    const response = callGeminiPro(prompt, { temperature: 0.3 });
+    let jsonText = response.trim();
+    
+    // Clean JSON response
+    if (jsonText.startsWith('```')) {
+      jsonText = jsonText.replace(/^```json\n?/, '').replace(/```$/, '');
+      jsonText = jsonText.replace(/^```\n?/, '').replace(/```$/, '');
+    }
+    
+    const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      jsonText = jsonMatch[0];
+    }
+    
+    const analysis = JSON.parse(jsonText);
+    
+    // Fallback: Try manual date extraction if AI didn't find one
+    if (analysis.hasDateChange && !analysis.newDate) {
+      const extractedDate = extractDateFromText(messageContent);
+      if (extractedDate) {
+        Logger.log(`Manual date extraction found: ${extractedDate}`);
+        analysis.newDate = extractedDate;
+      }
+    }
+    
+    return analysis;
+    
+  } catch (error) {
+    Logger.log(`Error analyzing boss message: ${error.toString()}`);
+    // Fallback: Try simple date extraction
+    const extractedDate = extractDateFromText(messageContent);
+    return {
+      hasDateChange: !!extractedDate,
+      newDate: extractedDate,
+      requiresApproval: true,
+      reasoning: 'Date detected in message',
+      messageType: 'DATE_CHANGE'
+    };
+  }
+}
+
+/**
+ * Handle boss's date change instruction
+ * Updates task due date and sends approval request to employee
+ */
+function handleBossDateChange(taskId, newDate, bossMessage, messageId) {
+  try {
+    Logger.log(`=== Handling boss date change for task ${taskId} ===`);
+    Logger.log(`New date: ${newDate}`);
+    
+    const task = getTask(taskId);
+    if (!task || !task.Assignee_Email) {
+      Logger.log(`ERROR: Task or assignee not found`);
+      return;
+    }
+    
+    // Format dates for display
+    const tz = Session.getScriptTimeZone();
+    const oldDateFormatted = task.Due_Date ? 
+      Utilities.formatDate(new Date(task.Due_Date), tz, 'EEEE, MMMM d, yyyy') : 
+      'Not set';
+    const newDateFormatted = Utilities.formatDate(new Date(newDate), tz, 'EEEE, MMMM d, yyyy');
+    
+    // Boss-proposed date: NOT final until employee confirms.
+    // Record a structured Pending_Decision so employee "ACCEPTANCE" can deterministically confirm/apply.
+    const pendingDecision = {
+      type: 'date_change',
+      parameter: 'dueDate',
+      currentValue: task.Due_Date || null,
+      proposedValue: newDate,
+      requestedBy: 'boss',
+      awaitingFrom: 'employee',
+      messageId: messageId,
+      createdAt: new Date().toISOString()
+    };
+    
+    // Update task with new proposed date (not final until employee confirms)
+    updateTask(taskId, {
+      Proposed_Date: newDate,
+      // Keep lifecycle status as-is (unless this is first response)
+      Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
+      // Await explicit assignee confirmation; do NOT treat as resolved
+      Conversation_State: CONVERSATION_STATE.AWAITING_EMPLOYEE,
+      Pending_Decision: JSON.stringify(pendingDecision),
+      Pending_Changes: JSON.stringify([{
+        id: 'date_change_' + Date.now(),
+        parameter: 'dueDate',
+        currentValue: task.Due_Date,
+        proposedValue: newDate,
+        requestedBy: 'boss',
+        awaitingFrom: 'employee',
+        reasoning: bossMessage || 'Boss proposed new date'
+      }]),
+      Last_Updated: new Date()
+    });
+    
+    Logger.log(`Task ${taskId} proposed date updated to ${newDate}`);
+    logInteraction(taskId, `Boss changed proposed date from ${oldDateFormatted} to ${newDateFormatted} (Message ID: ${messageId})`);
+    
+    // Send approval request email to employee
+    sendEmployeeApprovalRequest(taskId, newDateFormatted, bossMessage);
+    
+  } catch (error) {
+    Logger.log(`ERROR in handleBossDateChange: ${error.toString()}`);
+    logError(ERROR_TYPE.API_ERROR, 'handleBossDateChange', error.toString(), taskId, error.stack);
+  }
+}
+
+/**
+ * Append message to conversation history
+ */
+function appendToConversationHistory(taskId, message) {
+  try {
+    const task = getTask(taskId);
+    let history = [];
+    
+    // Parse existing conversation history
+    if (task.Conversation_History) {
+      try {
+        history = JSON.parse(task.Conversation_History);
+      } catch (e) {
+        Logger.log('Error parsing conversation history: ' + e.toString());
+      }
+    }
+    
+    // Check for duplicates
+    const isDuplicate = history.some(m => 
+      m.messageId === message.messageId || 
+      (m.content === message.content && Math.abs(new Date(m.timestamp) - new Date(message.timestamp)) < 1000)
+    );
+    
+    if (!isDuplicate) {
+      history.push(message);
+      
+      // Keep only last 30 messages to avoid storage bloat AND cell size limits
+      if (history.length > 30) {
+        history = history.slice(-30);
+        Logger.log(`Conversation history truncated to last 30 messages`);
+      }
+      
+      // Check size before updating (Google Sheets limit is 50,000 characters)
+      let historyJson = JSON.stringify(history);
+      if (historyJson.length > 45000) { // Leave buffer
+        // Truncate further - keep only last 20 messages
+        history = history.slice(-20);
+        Logger.log(`Conversation history truncated to last 20 messages due to size limit`);
+        
+        historyJson = JSON.stringify(history);
+        
+        // Also truncate individual message content if still too large
+        if (historyJson.length > 45000) {
+          history.forEach(msg => {
+            if (msg.content && msg.content.length > 500) {
+              msg.content = msg.content.substring(0, 500) + '... [truncated]';
+            }
+          });
+          historyJson = JSON.stringify(history);
+        }
+      }
+      
+      // Update message count and timestamps
+      const updateData = {
+        Conversation_History: historyJson,
+        Message_Count: history.length,
+        Last_Updated: new Date()
+      };
+      
+      // Update appropriate timestamp
+      if (message.type === 'boss_message') {
+        updateData.Last_Boss_Message = message.timestamp;
+      } else if (message.type === 'email_reply' || message.type === 'employee_reply') {
+        updateData.Last_Employee_Message = message.timestamp;
+      }
+      
+      updateTask(taskId, updateData);
+      
+      Logger.log(`Message appended to conversation history for task ${taskId}`);
+    } else {
+      Logger.log(`Duplicate message detected, skipping: ${message.messageId}`);
+    }
+    
+  } catch (error) {
+    Logger.log(`Error appending to conversation history: ${error.toString()}`);
+  }
+}
+
 // ============================================
 // ⭐⭐ REPROCESS TASK REPLY - START HERE ⭐⭐
 // ============================================
@@ -64,38 +469,11 @@ function onTaskAssigned(taskId) {
 function onGmailReply(e) {
   try {
     const message = e.message;
-    const thread = message.getThread();
-    const subject = message.getSubject();
-    
-    // Check if this is a reply to a task assignment
-    if (!subject.includes('Task Assignment:')) {
-      return;
+    // Canonical ingestion (threadId/TaskId correlation + Processed_Message_IDs idempotency)
+    const result = ingestInboundMessage(message);
+    if (!result.success) {
+      Logger.log(`onGmailReply: ingest failed: ${result.error || 'unknown error'}`);
     }
-    
-    // Extract task name from subject
-    const taskNameMatch = subject.match(/Task Assignment: (.+)/);
-    if (!taskNameMatch) {
-      return;
-    }
-    
-    const taskName = taskNameMatch[1];
-    
-    // Find task by name - use new status system
-    const tasks = findRowsByCondition(SHEETS.TASKS_DB, task => 
-      task.Task_Name === taskName && 
-      (task.Status === TASK_STATUS.NOT_ACTIVE || task.Status === TASK_STATUS.ON_TIME || task.Status === TASK_STATUS.SLOW_PROGRESS)
-    );
-    
-    if (tasks.length === 0) {
-      Logger.log(`No task found for reply: ${taskName}`);
-      return;
-    }
-    
-    const task = tasks[0]; // Use first match
-    const taskId = task.Task_ID;
-    
-    // Process the reply
-    processReplyEmail(taskId, message);
     
   } catch (error) {
     logError(ERROR_TYPE.UNKNOWN_ERROR, 'onGmailReply', error.toString(), null, error.stack);
@@ -201,8 +579,40 @@ function processReplyEmail(taskId, message) {
       handleOtherReply(taskId, emailContent, messageId);
     }
     
+    // Append to conversation history
+    appendToConversationHistory(taskId, {
+      id: messageId,
+      timestamp: new Date().toISOString(),
+      senderEmail: senderEmail,
+      senderName: message.getFrom().match(/^(.+?)\s*</)?.[1] || senderEmail,
+      type: 'email_reply',
+      content: emailContent,
+      messageId: messageId,
+      metadata: {
+        classification: classification.type,
+        extractedDate: classification.extracted_date,
+        confidence: classification.confidence
+      }
+    });
+    
     // Log the interaction with message ID
     logInteraction(taskId, `Reply received from ${senderEmail}: ${classification.type} (Message ID: ${messageId})`);
+    
+    // IMPORTANT: Analyze conversation and update state (new unified model)
+    // This derives the conversation state from the full conversation history
+    try {
+      Logger.log(`Analyzing conversation to update state for task ${taskId}...`);
+      const analysisResult = analyzeConversationAndUpdateState(taskId);
+      if (analysisResult.success) {
+        Logger.log(`Conversation state updated to: ${analysisResult.data.conversationState}`);
+        Logger.log(`AI Summary: ${analysisResult.data.summary}`);
+      } else {
+        Logger.log(`Warning: Failed to analyze conversation: ${analysisResult.error}`);
+      }
+    } catch (analysisError) {
+      Logger.log(`Error analyzing conversation: ${analysisError.toString()}`);
+      // Don't fail the reply processing if analysis fails
+    }
     
     // Execute workflows for email_reply trigger
     try {
@@ -212,7 +622,8 @@ function processReplyEmail(taskId, message) {
         task: updatedTask,
         replyType: classification.type,
         senderEmail: senderEmail,
-        messageId: messageId
+        messageId: messageId,
+        conversationState: updatedTask.Conversation_State
       });
     } catch (error) {
       Logger.log(`Error executing workflow for email_reply: ${error.toString()}`);
@@ -339,15 +750,77 @@ function cleanEmailContent(emailContent) {
 function handleAcceptanceReply(taskId, emailContent, messageId) {
   Logger.log(`Handling ACCEPTANCE reply for task ${taskId}`);
   
+  const task = getTask(taskId);
+  
+  // If we are awaiting explicit employee confirmation (boss proposed or boss approved),
+  // treat an ACCEPTANCE reply as confirmation and APPLY the change.
+  let pendingDecision = null;
+  try {
+    pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
+  } catch (e) {
+    pendingDecision = null;
+  }
+  
+  if (pendingDecision && pendingDecision.type === 'date_change' && pendingDecision.awaitingFrom === 'employee') {
+    Logger.log(`Employee confirming pending date change`);
+    
+    // Apply the date change now
+    updateTask(taskId, {
+      Due_Date: pendingDecision.proposedValue,
+      Proposed_Date: '',
+      Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
+      Conversation_State: CONVERSATION_STATE.RESOLVED,
+      Pending_Decision: '',
+      Pending_Changes: '',
+      Employee_Reply: '',
+      Last_Updated: new Date()
+    });
+    
+    logInteraction(taskId, `Employee confirmed date change. Due date updated to ${pendingDecision.proposedValue} (Message ID: ${messageId})`);
+    
+    // Send confirmation to boss
+    try {
+      const bossEmail = CONFIG.BOSS_EMAIL();
+      const tz = Session.getScriptTimeZone();
+      const confirmedDateFormatted = Utilities.formatDate(
+        new Date(pendingDecision.proposedValue), 
+        tz, 
+        'EEEE, MMMM d, yyyy'
+      );
+      
+      const subject = `Date Change Confirmed: ${task.Task_Name}`;
+      const body = `The employee has confirmed the new due date:\n\n` +
+        `Task: ${task.Task_Name}\n` +
+        `Confirmed Due Date: ${confirmedDateFormatted}\n\n` +
+        `The task is now active with the updated deadline.`;
+      
+      GmailApp.sendEmail(
+        bossEmail,
+        subject,
+        body,
+        {
+          name: 'Chief of Staff AI',
+        }
+      );
+      
+      Logger.log(`Confirmation sent to boss`);
+    } catch (error) {
+      Logger.log(`Failed to send boss confirmation: ${error.toString()}`);
+    }
+    
+    return;
+  }
+  
+  // Regular acceptance - just update status
   updateTask(taskId, {
     Status: TASK_STATUS.ON_TIME,
+    Conversation_State: CONVERSATION_STATE.ACTIVE,
   });
   
   logInteraction(taskId, `Assignee accepted task (Message ID: ${messageId})`);
   
   // Optionally send confirmation to assignee
   try {
-    const task = getTask(taskId);
     if (task && task.Assignee_Email) {
       const subject = `Re: Task Assignment: ${task.Task_Name}`;
       const body = `Thank you for confirming. I've updated the task status to Active. Please let me know if you need any support.\n\nBest regards,\nChief of Staff AI`;
@@ -371,6 +844,7 @@ function handleAcceptanceReply(taskId, emailContent, messageId) {
 
 /**
  * Handle date change request
+ * Note: Status stays at ON_TIME (lifecycle = active), Conversation_State drives UI
  */
 function handleDateChangeReply(taskId, proposedDate, emailContent, messageId) {
   Logger.log(`Handling DATE_CHANGE reply for task ${taskId}`);
@@ -384,14 +858,46 @@ function handleDateChangeReply(taskId, proposedDate, emailContent, messageId) {
     Logger.log(`Manual extraction result: ${finalProposedDate || 'No date found'}`);
   }
   
-  // Update task status to REVIEW_DATE so it shows up in Lovable
+  const task = getTask(taskId);
+
+  // If we were awaiting employee confirmation on a boss-proposed date,
+  // and the employee replied with a (new) date change request, treat this as
+  // a counter-proposal: clear the pending decision and surface as boss action needed.
+  let pendingDecision = null;
+  try {
+    pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
+  } catch (e) {
+    pendingDecision = null;
+  }
+  
+  const isCounterProposal =
+    pendingDecision &&
+    pendingDecision.type === 'date_change' &&
+    pendingDecision.awaitingFrom === 'employee' &&
+    pendingDecision.requestedBy === 'boss';
+  
+  // Keep task active (ON_TIME) - Conversation_State will be set by analyzeConversationAndUpdateState()
+  // Legacy: Also set REVIEW_DATE for backward compatibility with old frontend
   updateTask(taskId, {
     Proposed_Date: finalProposedDate || '',
-    Status: TASK_STATUS.REVIEW_DATE,
-    Employee_Reply: emailContent, // Store full employee reply
+    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status, // Move to active if first response
+    Employee_Reply: emailContent,
+    Last_Employee_Message: new Date().toISOString(),
+    ...(isCounterProposal ? {
+      Pending_Decision: '',
+      Conversation_State: CONVERSATION_STATE.CHANGE_REQUESTED,
+      Pending_Changes: JSON.stringify([{
+        id: 'date_change_' + Date.now(),
+        parameter: 'dueDate',
+        currentValue: task.Due_Date,
+        proposedValue: finalProposedDate || '',
+        requestedBy: 'employee',
+        reasoning: emailContent.substring(0, 500)
+      }])
+    } : {})
   });
   
-  Logger.log(`Task ${taskId} status updated to REVIEW_DATE`);
+  Logger.log(`Task ${taskId} employee reply stored. Proposed date: ${finalProposedDate || 'none'}`);
   logInteraction(taskId, `Assignee requested date change to ${finalProposedDate || 'unspecified date'} (Message ID: ${messageId})`);
   
   // Notify boss about date change request
@@ -400,6 +906,7 @@ function handleDateChangeReply(taskId, proposedDate, emailContent, messageId) {
 
 /**
  * Handle scope question reply
+ * Note: Status stays at ON_TIME (lifecycle = active), Conversation_State drives UI
  */
 function handleScopeQuestionReply(taskId, emailContent, messageId) {
   Logger.log(`Handling SCOPE_QUESTION reply for task ${taskId}`);
@@ -408,10 +915,12 @@ function handleScopeQuestionReply(taskId, emailContent, messageId) {
   const currentLog = task.Interaction_Log || '';
   const newLog = currentLog + `\n\nScope question from assignee: ${emailContent.substring(0, 500)}`;
   
+  // Keep task active (ON_TIME) - Conversation_State will be set by analyzeConversationAndUpdateState()
   updateTask(taskId, {
-    Status: TASK_STATUS.REVIEW_SCOPE,
+    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
     Interaction_Log: newLog,
-    Employee_Reply: emailContent, // Store full employee reply
+    Employee_Reply: emailContent,
+    Last_Employee_Message: new Date().toISOString(),
   });
   
   logInteraction(taskId, `Assignee has scope questions (Message ID: ${messageId})`);
@@ -422,6 +931,7 @@ function handleScopeQuestionReply(taskId, emailContent, messageId) {
 
 /**
  * Handle role rejection reply
+ * Note: Status stays at ON_TIME (lifecycle = active), Conversation_State drives UI
  */
 function handleRoleRejectionReply(taskId, emailContent, messageId) {
   Logger.log(`Handling ROLE_REJECTION reply for task ${taskId}`);
@@ -430,10 +940,12 @@ function handleRoleRejectionReply(taskId, emailContent, messageId) {
   const currentLog = task.Interaction_Log || '';
   const newLog = currentLog + `\n\nRole rejection from assignee: ${emailContent.substring(0, 500)}`;
   
+  // Keep task active (ON_TIME) - Conversation_State will be set by analyzeConversationAndUpdateState()
   updateTask(taskId, {
-    Status: TASK_STATUS.REVIEW_ROLE,
+    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
     Interaction_Log: newLog,
-    Employee_Reply: emailContent, // Store full employee reply
+    Employee_Reply: emailContent,
+    Last_Employee_Message: new Date().toISOString(),
   });
   
   logInteraction(taskId, `Assignee claims task is not their responsibility (Message ID: ${messageId})`);
@@ -1094,44 +1606,52 @@ function checkForReplies() {
     const slowTasks = getTasksByStatus(TASK_STATUS.SLOW_PROGRESS);
     const allTasks = [...notActiveTasks, ...onTimeTasks, ...slowTasks];
     
-    Logger.log(`Found ${allTasks.length} tasks to check (${notActiveTasks.length} not_active, ${onTimeTasks.length} on_time, ${slowTasks.length} slow_progress)`);
-    
-    let processedCount = 0;
+    Logger.log(`Found ${allTasks.length} tasks to check`);
     
     allTasks.forEach(task => {
       try {
-        // Find email thread for this task
-        const thread = findTaskEmailThread(task.Task_ID);
-        if (!thread) {
-          Logger.log(`No email thread found for task ${task.Task_ID}`);
+        // Refresh task data
+        const freshTask = getTask(task.Task_ID);
+        if (!freshTask) {
+          Logger.log(`Task ${task.Task_ID} not found`);
           return;
         }
         
-        // Get replies
-        const replies = getTaskReplies(task.Task_ID);
+        // Find email thread
+        const thread = findTaskEmailThread(freshTask.Task_ID);
+        if (!thread) {
+          Logger.log(`No email thread for task ${freshTask.Task_ID}`);
+          return;
+        }
+        
+        // Get ALL messages in thread
+        const allMessages = thread.getMessages();
+        Logger.log(`Thread has ${allMessages.length} total message(s)`);
+        
+        // Get unprocessed replies
+        const replies = getTaskReplies(freshTask.Task_ID);
+        Logger.log(`Found ${replies.length} unprocessed reply(ies) for task ${freshTask.Task_ID}`);
         
         if (replies.length === 0) {
-          Logger.log(`No replies found for task ${task.Task_ID}`);
           return;
         }
         
-        Logger.log(`Found ${replies.length} reply(ies) for task ${task.Task_ID}`);
+        // Process each reply via canonical ingestion
+        replies.forEach((reply, index) => {
+          try {
+            Logger.log(`\n--- Reply ${index + 1}/${replies.length} ---`);
+            const ingestResult = ingestInboundMessage(reply);
+            if (ingestResult.success) {
+              Logger.log(`  ✓ Ingested message ${ingestResult.messageId} for task ${ingestResult.taskId}`);
+            } else {
+              Logger.log(`  ❌ Ingest failed: ${ingestResult.error || 'unknown error'}`);
+            }
+            
+          } catch (error) {
+            Logger.log(`  ❌ ERROR processing reply ${index + 1}: ${error.toString()}`);
+          }
+        });
         
-        // Process most recent reply
-        const latestReply = replies[replies.length - 1];
-        
-        // Check if we've already processed this message
-        const messageId = latestReply.getId();
-        const log = task.Interaction_Log || '';
-        
-        if (log.includes(`Message ID: ${messageId}`)) {
-          Logger.log(`Message ${messageId} already processed for task ${task.Task_ID}`);
-          return;
-        }
-        
-        // Process the reply
-        processReplyEmail(task.Task_ID, latestReply);
-        processedCount++;
         
       } catch (error) {
         Logger.log(`Error processing task ${task.Task_ID}: ${error.toString()}`);
@@ -1139,11 +1659,11 @@ function checkForReplies() {
       }
     });
     
-    Logger.log(`=== Check complete: Processed ${processedCount} new reply(ies) ===`);
+    Logger.log(`\n=== Check complete ===`);
     
   } catch (error) {
     Logger.log(`ERROR in checkForReplies: ${error.toString()}`);
-    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+    Logger.log(`Stack: ${error.stack}`);
     logError(ERROR_TYPE.UNKNOWN_ERROR, 'checkForReplies', error.toString(), null, error.stack);
   }
 }

@@ -200,6 +200,18 @@ function createTask(taskData) {
     taskData.Last_Updated = new Date();
   }
   
+  // Store initial parameters snapshot for change detection
+  const initialSnapshot = {
+    dueDate: taskData.Due_Date || null,
+    assignee: taskData.Assignee_Email || null,
+    assigneeName: taskData.Assignee_Name || null,
+    taskName: taskData.Task_Name || null,
+    scope: taskData.Context_Hidden || null,
+    projectTag: taskData.Project_Tag || null,
+    createdAt: new Date().toISOString()
+  };
+  taskData.Initial_Parameters = JSON.stringify(initialSnapshot);
+  
   const rowNum = addRow(SHEETS.TASKS_DB, taskData);
   logInteraction(taskData.Task_ID, `Task created: ${taskData.Task_Name}`);
   
@@ -803,8 +815,90 @@ function logInteraction(taskId, message) {
     const timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
     const logEntry = `${timestamp} - ${message}`;
     
-    const currentLog = task.Interaction_Log || '';
+    let currentLog = task.Interaction_Log || '';
+    
+    // Check size BEFORE adding new entry (Google Sheets limit is 50,000 characters)
+    const maxLogSize = 45000; // Leave buffer before 50k limit
+    const estimatedNewSize = currentLog.length + logEntry.length + 1; // +1 for newline
+    
+    // If adding this entry would exceed limit, truncate first
+    if (estimatedNewSize > maxLogSize) {
+      // Extract important data before truncating (Thread IDs, Message IDs)
+      const threadIds = [];
+      const messageIds = [];
+      
+      // Extract Thread IDs
+      const threadIdMatches = currentLog.match(/Thread ID:\s*([a-zA-Z0-9_-]+)/gi);
+      if (threadIdMatches) {
+        threadIdMatches.forEach(match => {
+          const threadId = match.replace(/Thread ID:\s*/i, '').trim();
+          if (threadId && !threadIds.includes(threadId)) {
+            threadIds.push(threadId);
+          }
+        });
+      }
+      
+      // Extract Message IDs
+      const messageIdMatches = currentLog.match(/Message ID:\s*([a-zA-Z0-9_-]+)/gi);
+      if (messageIdMatches) {
+        messageIdMatches.forEach(match => {
+          const messageId = match.replace(/Message ID:\s*/i, '').trim();
+          if (messageId && !messageIds.includes(messageId)) {
+            messageIds.push(messageId);
+          }
+        });
+      }
+      
+      // Split log into lines and keep only most recent entries
+      const logLines = currentLog.split('\n');
+      const maxLines = 150; // Keep last 150 entries
+      
+      // Keep most recent lines
+      let truncatedLines = logLines.slice(-maxLines);
+      
+      // Reconstruct log with preserved Thread IDs and Message IDs
+      let truncatedLog = truncatedLines.join('\n');
+      
+      // Add preserved Thread IDs if not already in truncated log
+      threadIds.forEach(threadId => {
+        if (!truncatedLog.includes(`Thread ID: ${threadId}`)) {
+          truncatedLog = `${truncatedLog}\n${timestamp} - Thread ID: ${threadId} [preserved from truncated log]`;
+        }
+      });
+      
+      // Add preserved Message IDs if not already in truncated log
+      messageIds.forEach(messageId => {
+        if (!truncatedLog.includes(`Message ID: ${messageId}`)) {
+          truncatedLog = `${truncatedLog}\n${timestamp} - Message ID: ${messageId} [preserved from truncated log]`;
+        }
+      });
+      
+      // Add truncation notice
+      const truncationNotice = `${timestamp} - [Log truncated: kept last ${truncatedLines.length} entries, preserved ${threadIds.length} thread ID(s) and ${messageIds.length} message ID(s)]`;
+      truncatedLog = `${truncatedLog}\n${truncationNotice}`;
+      
+      currentLog = truncatedLog;
+      Logger.log(`Interaction_Log truncated for task ${taskId}: kept last ${truncatedLines.length} entries`);
+    }
+    
     const newLog = currentLog ? `${currentLog}\n${logEntry}` : logEntry;
+    
+    // Final safety check
+    if (newLog.length > maxLogSize) {
+      // Emergency truncation - keep only last 100 lines
+      const logLines = newLog.split('\n');
+      const emergencyLog = logLines.slice(-100).join('\n');
+      const emergencyNotice = `${timestamp} - [Emergency truncation: kept last 100 entries]`;
+      const finalLog = `${emergencyLog}\n${emergencyNotice}\n${logEntry}`;
+      
+      const updates = {
+        Interaction_Log: finalLog,
+        Last_Updated: new Date()
+      };
+      updateRowByValue(SHEETS.TASKS_DB, 'Task_ID', taskId, updates);
+      Logger.log(`Emergency truncation applied for task ${taskId}`);
+      return;
+    }
     
     // Directly update the sheet without calling updateTask to avoid recursive loop
     const updates = {
@@ -816,6 +910,49 @@ function logInteraction(taskId, message) {
     Logger.log('Error in logInteraction: ' + error.toString());
     // Don't throw - logging failures shouldn't break the system
   }
+}
+
+/**
+ * Get processed message IDs from dedicated field
+ * Returns Set for O(1) lookup
+ */
+function getProcessedMessageIds(taskId) {
+  const task = getTask(taskId);
+  if (!task || !task.Processed_Message_IDs) {
+    return new Set();
+  }
+  
+  try {
+    const ids = JSON.parse(task.Processed_Message_IDs);
+    return new Set(ids);
+  } catch (e) {
+    Logger.log(`Error parsing Processed_Message_IDs for ${taskId}: ${e.toString()}`);
+    return new Set();
+  }
+}
+
+/**
+ * Mark message as processed
+ * Keeps only last 500 message IDs to prevent field bloat
+ */
+function markMessageAsProcessed(taskId, messageId) {
+  const processedIds = getProcessedMessageIds(taskId);
+  if (processedIds.has(messageId)) {
+    return false; // Already processed
+  }
+  
+  processedIds.add(messageId);
+  const idsArray = Array.from(processedIds);
+  
+  // Keep only last 500 message IDs (prevent field from getting too large)
+  const trimmedIds = idsArray.slice(-500);
+  
+  updateTask(taskId, {
+    Processed_Message_IDs: JSON.stringify(trimmedIds),
+    Last_Updated: new Date()
+  });
+  
+  return true; // Newly processed
 }
 
 /**

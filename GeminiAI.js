@@ -481,9 +481,6 @@ function callGeminiFlash(prompt, options = {}) {
 
 /**
  * Call Gemini Pro for complex reasoning
- */
-/**
- * Call Gemini Pro for complex reasoning
  * Falls back to GEMINI_PRO_FALLBACK_MODEL if primary model is not available
  */
 function callGeminiPro(prompt, options = {}) {
@@ -539,7 +536,7 @@ function transcribeAudioWithDiarization(audioFileId) {
     
     Logger.log(`Project ID: ${projectId}`);
     
-    // Speech-to-Text API endpoint
+    // Speech-to-Text API endpoint (standard Cloud Speech-to-Text)
     const url = `https://speech.googleapis.com/v1/speech:recognize`;
     Logger.log(`API URL: ${url}`);
     
@@ -1622,6 +1619,680 @@ Return ONLY a valid JSON object (no markdown, no code blocks):
       reasoning: 'Failed to classify reply - no patterns detected'
     };
   }
+}
+
+/**
+ * Analyze task context and suggest appropriate actions
+ * This replaces the simple "approve" button with context-aware actions
+ */
+function analyzeTaskContextForActions(taskId) {
+  try {
+    const task = getTask(taskId);
+    if (!task) {
+      Logger.log(`Task ${taskId} not found`);
+      return null;
+    }
+    
+    // Get conversation history
+    let conversationHistory = [];
+    
+    // Try to parse Conversation_History JSON field
+    if (task.Conversation_History) {
+      try {
+        conversationHistory = JSON.parse(task.Conversation_History);
+      } catch (e) {
+        Logger.log('Could not parse Conversation_History, trying Interaction_Log');
+      }
+    }
+    
+    // Fallback: Extract from Interaction_Log if Conversation_History not available
+    if (conversationHistory.length === 0 && task.Interaction_Log) {
+      conversationHistory = extractMessagesFromInteractionLog(task.Interaction_Log);
+    }
+    
+    // Also get latest employee reply if available
+    if (task.Employee_Reply && !conversationHistory.some(m => m.content === task.Employee_Reply)) {
+      conversationHistory.push({
+        timestamp: task.Last_Updated || new Date().toISOString(),
+        senderEmail: task.Assignee_Email,
+        senderName: task.Assignee_Name || task.Assignee_Email,
+        type: 'email_reply',
+        content: task.Employee_Reply
+      });
+    }
+    
+    if (conversationHistory.length === 0) {
+      Logger.log(`No conversation history found for task ${taskId}`);
+      return getDefaultActionsForStatus(task.Status);
+    }
+    
+    // Build conversation context
+    const conversationText = conversationHistory
+      .map((msg, idx) => {
+        const sender = msg.senderName || msg.senderEmail || (msg.type === 'boss_message' ? 'Boss' : 'Employee');
+        const timestamp = msg.timestamp ? new Date(msg.timestamp).toLocaleString() : `Message ${idx + 1}`;
+        return `[${timestamp}] ${sender}: ${msg.content}`;
+      })
+      .join('\n\n');
+    
+    // Get current state
+    const currentDueDate = task.Due_Date ? 
+      Utilities.formatDate(new Date(task.Due_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
+      'Not set';
+    const proposedDate = task.Proposed_Date ? 
+      Utilities.formatDate(new Date(task.Proposed_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
+      'None';
+    
+    const prompt = `You are analyzing a task that requires action from the boss. Based on the conversation history and current state, determine what actions should be available.
+
+Task Details:
+- Task Name: "${task.Task_Name}"
+- Current Status: "${task.Status}"
+- Current Due Date: ${currentDueDate}
+- Proposed Date: ${proposedDate}
+- Employee: ${task.Assignee_Email}
+- Approval State: ${task.Approval_State || 'none'}
+
+Conversation History:
+${conversationText || 'No conversation history yet'}
+
+Latest Employee Message:
+${task.Employee_Reply || 'None'}
+
+Based on this context, analyze:
+1. What is the employee asking for? (date change, clarification, etc.)
+2. What actions should the boss be able to take?
+3. Should the boss approve, reject, propose alternative, or message the employee?
+4. What is the current approval state? (awaiting_boss, boss_approved, negotiating, etc.)
+
+IMPORTANT: Look at the ENTIRE conversation, not just the latest message. Sometimes approval needs emerge across multiple messages.
+
+Return ONLY a valid JSON object:
+{
+  "primaryAction": {
+    "type": "APPROVE|REJECT|MESSAGE|PROPOSE_ALTERNATIVE|NONE",
+    "label": "Approve Date Change",
+    "description": "Approve the employee's requested date",
+    "icon": "check",
+    "confidence": 0.9,
+    "actionId": "approve_date_change"
+  },
+  "secondaryActions": [
+    {
+      "type": "MESSAGE",
+      "label": "Message Employee",
+      "description": "Send a message explaining why the date cannot be changed",
+      "icon": "message-square",
+      "actionId": "message_employee_reject"
+    },
+    {
+      "type": "PROPOSE_ALTERNATIVE",
+      "label": "Propose Different Date",
+      "description": "Suggest a compromise date",
+      "icon": "calendar",
+      "actionId": "propose_date"
+    }
+  ],
+  "approvalState": "awaiting_boss|boss_approved|boss_rejected|boss_proposed|negotiating",
+  "reasoning": "Employee requested date change to Jan 15. Boss should approve if feasible, or message to explain why not.",
+  "requiresEmployeeConfirmation": true/false,
+  "suggestedMessage": "Optional: Pre-filled message text if boss chooses to message"
+}`;
+
+    const response = callGeminiPro(prompt, { temperature: 0.3 });
+    let jsonText = response.trim();
+    
+    // Clean JSON response
+    if (jsonText.startsWith('```')) {
+      jsonText = jsonText.replace(/^```json\n?/, '').replace(/```$/, '');
+      jsonText = jsonText.replace(/^```\n?/, '').replace(/```$/, '');
+    }
+    
+    const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      jsonText = jsonMatch[0];
+    }
+    
+    const analysis = JSON.parse(jsonText);
+    
+    Logger.log(`Context analysis for ${taskId}:`);
+    Logger.log(`  Primary Action: ${analysis.primaryAction.type} - ${analysis.primaryAction.label}`);
+    Logger.log(`  Approval State: ${analysis.approvalState}`);
+    Logger.log(`  Requires Employee Confirmation: ${analysis.requiresEmployeeConfirmation}`);
+    
+    return analysis;
+    
+  } catch (error) {
+    Logger.log(`Error analyzing context: ${error.toString()}`);
+    // Fallback to default actions based on status
+    return getDefaultActionsForStatus(task.Status);
+  }
+}
+
+/**
+ * Analyze conversation history and update task state
+ * This is the main function that derives state from conversation
+ * Called after every email/message exchange
+ * 
+ * @param {string} taskId - The task ID
+ * @param {Object} newMessage - Optional new message to add before analysis
+ * @returns {Object} Analysis result with conversationState, pendingChanges, summary
+ */
+function analyzeConversationAndUpdateState(taskId, newMessage = null) {
+  try {
+    const task = getTask(taskId);
+    if (!task) {
+      Logger.log(`Task ${taskId} not found`);
+      return { success: false, error: 'Task not found' };
+    }
+    
+    // Parse initial parameters
+    let initialParams = {};
+    if (task.Initial_Parameters) {
+      try {
+        initialParams = JSON.parse(task.Initial_Parameters);
+      } catch (e) {
+        Logger.log('Could not parse Initial_Parameters');
+        initialParams = {
+          dueDate: task.Due_Date,
+          assignee: task.Assignee_Email,
+          taskName: task.Task_Name,
+          scope: task.Context_Hidden
+        };
+      }
+    }
+    
+    // Parse conversation history
+    let conversationHistory = [];
+    if (task.Conversation_History) {
+      try {
+        conversationHistory = JSON.parse(task.Conversation_History);
+      } catch (e) {
+        Logger.log('Could not parse Conversation_History');
+        conversationHistory = [];
+      }
+    }
+    
+    // Add new message if provided
+    if (newMessage) {
+      conversationHistory.push({
+        timestamp: newMessage.timestamp || new Date().toISOString(),
+        senderEmail: newMessage.senderEmail,
+        senderName: newMessage.senderName || newMessage.senderEmail,
+        type: newMessage.type || 'message',
+        content: newMessage.content
+      });
+    }
+    
+    // Also include Employee_Reply if not already in history
+    if (task.Employee_Reply && !conversationHistory.some(m => m.content === task.Employee_Reply)) {
+      conversationHistory.push({
+        timestamp: task.Last_Updated || new Date().toISOString(),
+        senderEmail: task.Assignee_Email,
+        senderName: task.Assignee_Name || task.Assignee_Email,
+        type: 'employee_reply',
+        content: task.Employee_Reply
+      });
+    }
+    
+    // If no conversation, default to active state
+    if (conversationHistory.length === 0) {
+      const result = {
+        conversationState: CONVERSATION_STATE.ACTIVE,
+        pendingChanges: [],
+        summary: 'No conversation history yet',
+        requiresAction: false
+      };
+      
+      // Update task with state
+      updateTask(taskId, {
+        Conversation_State: result.conversationState,
+        Pending_Changes: JSON.stringify(result.pendingChanges),
+        AI_Summary: result.summary,
+        Conversation_History: JSON.stringify(conversationHistory)
+      });
+      
+      return { success: true, data: result };
+    }
+    
+    // Build conversation text for AI analysis
+    const bossEmail = CONFIG.BOSS_EMAIL();
+    const conversationText = conversationHistory
+      .map((msg, idx) => {
+        const isBoss = msg.senderEmail && msg.senderEmail.toLowerCase() === bossEmail.toLowerCase();
+        const sender = isBoss ? 'Boss' : (msg.senderName || 'Employee');
+        const timestamp = msg.timestamp ? new Date(msg.timestamp).toLocaleString() : `Message ${idx + 1}`;
+        return `[${timestamp}] ${sender}: ${msg.content}`;
+      })
+      .join('\n\n');
+    
+    // Determine last sender
+    const lastMessage = conversationHistory[conversationHistory.length - 1];
+    const lastSenderIsBoss = lastMessage && lastMessage.senderEmail && 
+      lastMessage.senderEmail.toLowerCase() === bossEmail.toLowerCase();
+    
+    // Format current task state
+    const tz = Session.getScriptTimeZone();
+    const currentDueDate = task.Due_Date ? 
+      Utilities.formatDate(new Date(task.Due_Date), tz, 'yyyy-MM-dd') : 'Not set';
+    const initialDueDate = initialParams.dueDate ? 
+      Utilities.formatDate(new Date(initialParams.dueDate), tz, 'yyyy-MM-dd') : 'Not set';
+    
+    const prompt = `You are analyzing a conversation between a boss and employee about a task to determine the current state.
+
+TASK INFORMATION:
+- Task Name: "${task.Task_Name}"
+- Assignee: ${task.Assignee_Name || task.Assignee_Email}
+- Current Due Date: ${currentDueDate}
+- Initial Due Date: ${initialDueDate}
+- Current Status: ${task.Status}
+- Scope/Description: ${task.Context_Hidden || 'Not provided'}
+
+CONVERSATION HISTORY (chronological order):
+${conversationText}
+
+LAST MESSAGE WAS FROM: ${lastSenderIsBoss ? 'Boss' : 'Employee'}
+
+ANALYZE THE CONVERSATION AND DETERMINE:
+
+1. CONVERSATION STATE - What is the current state of this conversation?
+   - "active" - Normal operation, no pending items
+   - "update_received" - Employee sent progress update, FYI only (no action needed)
+   - "change_requested" - Employee is requesting a change (date, scope, role) that needs boss approval
+   - "completion_pending" - Employee claims task is done, needs boss verification
+   - "blocker_reported" - Employee reported a blocker or issue
+   - "awaiting_employee" - Boss sent message/question, waiting for employee response
+   - "awaiting_confirmation" - Boss approved a change, waiting for employee to confirm
+   - "boss_proposed" - Boss proposed an alternative (date, approach, etc.)
+   - "negotiating" - Active back-and-forth negotiation happening
+   - "resolved" - Issue/request was resolved
+   - "rejected" - Boss rejected a request (conversation may continue if employee replies)
+
+2. PENDING CHANGES - What changes is the employee requesting (if any)?
+   Only include ACTIVE requests that haven't been resolved yet.
+   For each change: parameter, currentValue, proposedValue, reasoning
+
+3. SUMMARY - One sentence summary of the current conversation state
+
+4. REQUIRES ACTION - Does the boss need to take action right now?
+
+IMPORTANT RULES:
+- If boss rejected something and employee hasn't replied since, state should be "awaiting_employee" or "rejected"
+- If employee sent an update (progress, FYI) without requesting anything, state is "update_received"
+- If employee explicitly requested a date/scope/role change, state is "change_requested"
+- If employee said the task is done/complete, state is "completion_pending"
+- Look at the FULL conversation, not just the last message
+
+Return ONLY valid JSON:
+{
+  "conversationState": "change_requested",
+  "pendingChanges": [
+    {
+      "id": "change_1",
+      "parameter": "dueDate",
+      "currentValue": "2025-01-15",
+      "proposedValue": "2025-01-25",
+      "reasoning": "Employee requested extension due to dependencies"
+    }
+  ],
+  "summary": "Employee requested 10-day extension due to upstream dependencies.",
+  "requiresAction": true,
+  "actionSuggestion": "Approve or reject the date change request"
+}`;
+
+    const response = callGeminiPro(prompt, { temperature: 0.2 });
+    let jsonText = response.trim();
+    
+    // Clean JSON response
+    if (jsonText.startsWith('```')) {
+      jsonText = jsonText.replace(/^```json\n?/, '').replace(/```$/, '');
+      jsonText = jsonText.replace(/^```\n?/, '').replace(/```$/, '');
+    }
+    
+    const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      jsonText = jsonMatch[0];
+    }
+    
+    const analysis = JSON.parse(jsonText);
+    
+    // Validate and normalize conversation state
+    const validStates = Object.values(CONVERSATION_STATE);
+    if (!validStates.includes(analysis.conversationState)) {
+      analysis.conversationState = CONVERSATION_STATE.ACTIVE;
+    }
+
+    // ------------------------------------------------------------------
+    // Guardrails: preserve system-tracked pending changes / confirmations
+    // ------------------------------------------------------------------
+    // The model prompt focuses on "employee requested" changes, but the system
+    // can also track boss-proposed changes that are awaiting employee confirmation.
+    // Never allow the model to wipe out those pending changes or mark them resolved.
+    let existingPendingChanges = [];
+    try {
+      existingPendingChanges = task.Pending_Changes ? JSON.parse(task.Pending_Changes) : [];
+    } catch (e) {
+      existingPendingChanges = [];
+    }
+
+    // Preserve existing pending changes if the model returned none.
+    if (existingPendingChanges.length > 0 && (!analysis.pendingChanges || analysis.pendingChanges.length === 0)) {
+      analysis.pendingChanges = existingPendingChanges;
+    }
+
+    // ------------------------------------------------------------------
+    // Normalize pending change schema so UI can reason about "who requested" and "who is awaiting"
+    // ------------------------------------------------------------------
+    if (analysis.pendingChanges && analysis.pendingChanges.length > 0) {
+      analysis.pendingChanges = analysis.pendingChanges.map((c, idx) => {
+        if (!c) return c;
+        // Ensure id
+        if (!c.id) c.id = `change_${idx + 1}`;
+        // Defaults for AI-produced changes (employee requests boss action)
+        if (!c.requestedBy) c.requestedBy = 'employee';
+        if (!c.awaitingFrom) c.awaitingFrom = (c.requestedBy === 'boss') ? 'employee' : 'boss';
+        if (!c.status) c.status = 'pending';
+        return c;
+      });
+    }
+
+    // If we have a Pending_Decision awaiting employee, force the appropriate state.
+    let pendingDecision = null;
+    try {
+      pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
+    } catch (e) {
+      pendingDecision = null;
+    }
+
+    const hasAwaitingEmployeePending =
+      (pendingDecision && pendingDecision.awaitingFrom === 'employee') ||
+      (analysis.pendingChanges || []).some(c => c && c.awaitingFrom === 'employee');
+
+    if (hasAwaitingEmployeePending && (analysis.conversationState === CONVERSATION_STATE.RESOLVED || analysis.conversationState === CONVERSATION_STATE.ACTIVE)) {
+      analysis.conversationState = CONVERSATION_STATE.AWAITING_EMPLOYEE;
+      analysis.requiresAction = false;
+      analysis.summary = analysis.summary || 'Awaiting employee confirmation on proposed change.';
+    }
+    
+    // Update task with analyzed state
+    updateTask(taskId, {
+      Conversation_State: analysis.conversationState,
+      Pending_Changes: JSON.stringify(analysis.pendingChanges || []),
+      AI_Summary: analysis.summary || '',
+      Conversation_History: JSON.stringify(conversationHistory),
+      Last_Updated: new Date()
+    });
+    
+    Logger.log(`Conversation analysis for ${taskId}:`);
+    Logger.log(`  State: ${analysis.conversationState}`);
+    Logger.log(`  Pending Changes: ${(analysis.pendingChanges || []).length}`);
+    Logger.log(`  Requires Action: ${analysis.requiresAction}`);
+    Logger.log(`  Summary: ${analysis.summary}`);
+    
+    return { 
+      success: true, 
+      data: {
+        conversationState: analysis.conversationState,
+        pendingChanges: analysis.pendingChanges || [],
+        summary: analysis.summary,
+        requiresAction: analysis.requiresAction,
+        actionSuggestion: analysis.actionSuggestion
+      }
+    };
+    
+  } catch (error) {
+    Logger.log(`Error analyzing conversation: ${error.toString()}`);
+    return { 
+      success: false, 
+      error: error.toString(),
+      data: {
+        conversationState: CONVERSATION_STATE.ACTIVE,
+        pendingChanges: [],
+        summary: 'Error analyzing conversation',
+        requiresAction: false
+      }
+    };
+  }
+}
+
+/**
+ * Detect parameter changes from conversation history
+ * Uses stored Conversation_State and Pending_Changes when available
+ * Falls back to analyzeConversationAndUpdateState() if needed
+ */
+function detectParameterChanges(taskId, forceReanalyze = false) {
+  try {
+    const task = getTask(taskId);
+    if (!task) {
+      Logger.log(`Task ${taskId} not found`);
+      return { pendingChanges: [], showApprovals: false, conversationState: 'active', bossRejectedLast: false };
+    }
+    
+    // Check if we have stored state and it's recent (less than 5 minutes old)
+    const hasStoredState = task.Conversation_State && task.Pending_Changes;
+    const lastUpdated = task.Last_Updated ? new Date(task.Last_Updated) : null;
+    const isRecent = lastUpdated && (new Date() - lastUpdated < 5 * 60 * 1000); // 5 minutes
+    
+    // Use stored state if available and recent (unless force reanalyze)
+    if (hasStoredState && isRecent && !forceReanalyze) {
+      let pendingChanges = [];
+      try {
+        pendingChanges = JSON.parse(task.Pending_Changes);
+      } catch (e) {
+        pendingChanges = [];
+      }
+      
+      const conversationState = task.Conversation_State;
+      
+      // Determine if approvals should be shown based on state
+      const showApprovals = [
+        CONVERSATION_STATE.CHANGE_REQUESTED,
+        CONVERSATION_STATE.COMPLETION_PENDING,
+        CONVERSATION_STATE.BLOCKER_REPORTED
+      ].includes(conversationState);
+      
+      // Check if boss rejected last (for hiding approvals)
+      const bossRejectedLast = conversationState === CONVERSATION_STATE.REJECTED || 
+                               conversationState === CONVERSATION_STATE.AWAITING_EMPLOYEE;
+      
+      return {
+        pendingChanges: pendingChanges,
+        showApprovals: showApprovals && pendingChanges.length > 0,
+        conversationState: conversationState,
+        bossRejectedLast: bossRejectedLast,
+        summary: task.AI_Summary || '',
+        draftMessage: null
+      };
+    }
+    
+    // Need to analyze - call the main analysis function
+    Logger.log(`Analyzing conversation for task ${taskId} (forceReanalyze: ${forceReanalyze})`);
+    const analysisResult = analyzeConversationAndUpdateState(taskId);
+    
+    if (!analysisResult.success) {
+      return { 
+        pendingChanges: [], 
+        showApprovals: false, 
+        conversationState: CONVERSATION_STATE.ACTIVE, 
+        bossRejectedLast: false,
+        error: analysisResult.error
+      };
+    }
+    
+    const analysis = analysisResult.data;
+    
+    // Determine if approvals should be shown based on state
+    const showApprovals = [
+      CONVERSATION_STATE.CHANGE_REQUESTED,
+      CONVERSATION_STATE.COMPLETION_PENDING,
+      CONVERSATION_STATE.BLOCKER_REPORTED
+    ].includes(analysis.conversationState);
+    
+    // Check if boss rejected last
+    const bossRejectedLast = analysis.conversationState === CONVERSATION_STATE.REJECTED || 
+                             analysis.conversationState === CONVERSATION_STATE.AWAITING_EMPLOYEE;
+    
+    return {
+      pendingChanges: analysis.pendingChanges || [],
+      showApprovals: showApprovals && (analysis.pendingChanges || []).length > 0,
+      conversationState: analysis.conversationState,
+      bossRejectedLast: bossRejectedLast,
+      summary: analysis.summary,
+      draftMessage: analysis.actionSuggestion || null
+    };
+    
+  } catch (error) {
+    Logger.log(`Error detecting parameter changes: ${error.toString()}`);
+    return { 
+      pendingChanges: [], 
+      showApprovals: false, 
+      conversationState: CONVERSATION_STATE.ACTIVE, 
+      bossRejectedLast: false,
+      error: error.toString()
+    };
+  }
+}
+
+/**
+ * Extract messages from Interaction_Log format
+ * Helper function to parse log entries into structured messages
+ */
+function extractMessagesFromInteractionLog(log) {
+  const messages = [];
+  const lines = log.split('\n');
+  let currentMessage = null;
+  
+  for (const line of lines) {
+    // Look for timestamp patterns: "2025-12-20 09:00 - ..."
+    const timestampMatch = line.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/);
+    if (timestampMatch) {
+      if (currentMessage) {
+        messages.push(currentMessage);
+      }
+      currentMessage = {
+        timestamp: timestampMatch[1],
+        content: line.substring(timestampMatch[0].length + 3).trim()
+      };
+    } else if (currentMessage && line.trim()) {
+      currentMessage.content += '\n' + line.trim();
+    }
+  }
+  
+  if (currentMessage) {
+    messages.push(currentMessage);
+  }
+  
+  return messages;
+}
+
+/**
+ * Fallback: Get default actions based on status
+ */
+function getDefaultActionsForStatus(status) {
+  const defaults = {
+    'review_date': {
+      primaryAction: {
+        type: 'APPROVE',
+        label: 'Approve Date Change',
+        description: 'Approve the employee\'s requested date change',
+        icon: 'check',
+        actionId: 'approve_date_change',
+        confidence: 0.8
+      },
+      secondaryActions: [
+        { 
+          type: 'MESSAGE', 
+          label: 'Message Employee', 
+          description: 'Send a message to the employee',
+          icon: 'message-square',
+          actionId: 'message_employee'
+        },
+        { 
+          type: 'REJECT', 
+          label: 'Reject Date Change', 
+          description: 'Reject the date change request',
+          icon: 'x',
+          actionId: 'reject_date_change'
+        }
+      ],
+      approvalState: 'awaiting_boss',
+      reasoning: 'Employee has requested a date change',
+      requiresEmployeeConfirmation: true
+    },
+    'review_scope': {
+      primaryAction: {
+        type: 'MESSAGE',
+        label: 'Provide Clarification',
+        description: 'Clarify the task scope for the employee',
+        icon: 'message-square',
+        actionId: 'provide_clarification',
+        confidence: 0.8
+      },
+      secondaryActions: [],
+      approvalState: 'awaiting_boss',
+      reasoning: 'Employee has questions about task scope',
+      requiresEmployeeConfirmation: false
+    },
+    'review_role': {
+      primaryAction: {
+        type: 'APPROVE',
+        label: 'Confirm Assignment',
+        description: 'Confirm the task is correctly assigned',
+        icon: 'check',
+        actionId: 'override_role',
+        confidence: 0.8
+      },
+      secondaryActions: [
+        {
+          type: 'MESSAGE',
+          label: 'Reassign Task',
+          description: 'Reassign the task to someone else',
+          icon: 'user',
+          actionId: 'reassign_task'
+        }
+      ],
+      approvalState: 'awaiting_boss',
+      reasoning: 'Employee has questioned task assignment',
+      requiresEmployeeConfirmation: false
+    },
+    'completed': {
+      primaryAction: {
+        type: 'APPROVE',
+        label: 'Approve Completion',
+        description: 'Approve the task as completed',
+        icon: 'check',
+        actionId: 'approve_done',
+        confidence: 0.8
+      },
+      secondaryActions: [
+        {
+          type: 'MESSAGE',
+          label: 'Request Proof',
+          description: 'Request proof of completion',
+          icon: 'file-text',
+          actionId: 'request_proof'
+        }
+      ],
+      approvalState: 'awaiting_boss',
+      reasoning: 'Employee has marked task as complete',
+      requiresEmployeeConfirmation: false
+    }
+  };
+  
+  return defaults[status] || {
+    primaryAction: { 
+      type: 'NONE', 
+      label: 'No action needed',
+      description: 'No action required at this time',
+      icon: 'info',
+      actionId: 'none',
+      confidence: 1.0
+    },
+    secondaryActions: [],
+    approvalState: 'none',
+    reasoning: 'No action needed for this status',
+    requiresEmployeeConfirmation: false
+  };
 }
 
 /**

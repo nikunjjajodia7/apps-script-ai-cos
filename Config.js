@@ -166,6 +166,7 @@ const CONFIG = {
   
   // Email
   EMAIL_SIGNATURE: () => getConfigValue('EMAIL_SIGNATURE', '[Boss\'s Chief of Staff AI]'),
+  BOSS_NAME: () => getConfigValue('BOSS_NAME', 'Boss'),
   
   // Vertex AI
   VERTEX_AI_PROJECT_ID: () => getConfigValue('VERTEX_AI_PROJECT_ID'),
@@ -200,37 +201,82 @@ const SHEETS = {
   WORKFLOWS: 'Workflows',
 };
 
-// Task statuses - Simplified unified status system
-// All statuses map directly to dashboard buckets for clarity
+// Task statuses - LIFECYCLE-only status system
+// Status tracks WHERE the task is in its lifecycle
+// Conversation_State (separate field) tracks conversation/approval state
 const TASK_STATUS = {
-  // AI Assist Bucket - Tasks needing clarification or AI help
-  AI_ASSIST: 'ai_assist',
-  
-  // Pending Action Bucket - Assigned but no response yet, or stagnant
+  // Pre-Active - Task not yet assigned or needs setup
+  AI_ASSIST: 'ai_assist',             // Needs clarification before assignment
   NOT_ACTIVE: 'not_active',           // Assigned, awaiting first response
-  PENDING_ACTION: 'pending_action',   // No response after X days, needs nudge
+  PENDING_ACTION: 'pending_action',   // Legacy/compat: needs attention (mapped to slow_progress in new buckets)
   
-  // Review Bucket - Employee requested changes
-  REVIEW_DATE: 'review_date',         // Date change request from employee
-  REVIEW_SCOPE: 'review_scope',       // Scope question from employee
-  REVIEW_ROLE: 'review_role',         // Role/ownership question from employee
-  
-  // Active Bucket - Tasks in progress
+  // Active - Task is in progress
   ON_TIME: 'on_time',                 // Active, on track
   SLOW_PROGRESS: 'slow_progress',     // Active, behind schedule
   
-  // Done Pending Bucket - Awaiting manager approval
-  COMPLETED: 'completed',             // Employee claims done, pending review
+  // Done States
+  COMPLETED: 'completed',             // Employee claims done, pending boss review
+  CLOSED: 'closed',                   // Verified complete or cancelled
   
-  // On Hold Bucket - Paused tasks
+  // Paused States
   ON_HOLD: 'on_hold',                 // Temporarily paused
   SOMEDAY: 'someday',                 // Deferred to future
-  
-  // Archived - No longer active
-  CLOSED: 'closed',                   // Manager approved or cancelled
+
+  // ------------------------------------------------------------------
+  // Legacy review statuses (backward compatibility)
+  // NOTE: New system uses lifecycle Status + Conversation_State.
+  // These are kept so older code paths and existing sheet rows don't break.
+  // ------------------------------------------------------------------
+  REVIEW_DATE: 'review_date',
+  REVIEW_DATE_BOSS_APPROVED: 'review_date_boss_approved',
+  REVIEW_DATE_BOSS_REJECTED: 'review_date_boss_rejected',
+  REVIEW_DATE_BOSS_PROPOSED: 'review_date_boss_proposed',
+  REVIEW_SCOPE: 'review_scope',
+  REVIEW_SCOPE_CLARIFIED: 'review_scope_clarified',
+  REVIEW_ROLE: 'review_role',
 };
 
+// Conversation State - Derived from analyzing conversation history
+// This determines what actions/UI to show, independent of lifecycle status
+const CONVERSATION_STATE = {
+  // Normal States
+  ACTIVE: 'active',                           // Normal operation, no pending items
+  UPDATE_RECEIVED: 'update_received',         // Employee sent update, FYI only
+  
+  // Approval Needed - Employee requested something
+  CHANGE_REQUESTED: 'change_requested',       // Employee requested parameter change (date/scope/role)
+  COMPLETION_PENDING: 'completion_pending',   // Employee claims done, needs verification
+  BLOCKER_REPORTED: 'blocker_reported',       // Employee reported a blocker
+  
+  // Awaiting Response States
+  AWAITING_EMPLOYEE: 'awaiting_employee',     // Boss sent message, waiting for employee
+  AWAITING_CONFIRMATION: 'awaiting_confirmation', // Boss approved change, employee needs to confirm
+  
+  // Negotiation States
+  BOSS_PROPOSED: 'boss_proposed',             // Boss proposed alternative (date, scope, etc.)
+  NEGOTIATING: 'negotiating',                 // Active back-and-forth discussion
+  
+  // Resolution States
+  RESOLVED: 'resolved',                       // Change was applied or issue resolved
+  REJECTED: 'rejected',                       // Boss rejected request, conversation may continue
+};
+
+// Conversation states that require boss attention (employee requested something)
+// Used by frontend "Needs Attention" bucket - cross-cutting filter
+const ATTENTION_STATES = [
+  CONVERSATION_STATE.CHANGE_REQUESTED,    // Employee requested date/scope/role change
+  CONVERSATION_STATE.COMPLETION_PENDING,  // Employee claims task is done
+  CONVERSATION_STATE.BLOCKER_REPORTED,    // Employee reported a blocker
+  CONVERSATION_STATE.NEGOTIATING,         // Active back-and-forth discussion
+];
+
+// Helper to check if a conversation state needs boss attention
+function taskNeedsAttention(conversationState) {
+  return conversationState && ATTENTION_STATES.includes(conversationState);
+}
+
 // Legacy status mapping for backward compatibility with existing data
+// Old review statuses now map to lifecycle statuses (conversation state handles the rest)
 const LEGACY_STATUS_MAP = {
   'Draft': TASK_STATUS.AI_ASSIST,
   'New': TASK_STATUS.AI_ASSIST,
@@ -239,15 +285,28 @@ const LEGACY_STATUS_MAP = {
   'Done Pending Review': TASK_STATUS.COMPLETED,
   'Done': TASK_STATUS.CLOSED,
   'Review_AI_Assist': TASK_STATUS.AI_ASSIST,
-  'Review_Date': TASK_STATUS.REVIEW_DATE,
-  'Review_Scope': TASK_STATUS.REVIEW_SCOPE,
-  'Review_Role': TASK_STATUS.REVIEW_ROLE,
-  'Review_Stagnation': TASK_STATUS.PENDING_ACTION,
+  'Review_Date': TASK_STATUS.ON_TIME,             // Conversation state handles the approval flow
+  'Review_Date_Boss_Approved': TASK_STATUS.ON_TIME,
+  'Review_Date_Boss_Rejected': TASK_STATUS.ON_TIME,
+  'Review_Date_Boss_Proposed': TASK_STATUS.ON_TIME,
+  'Review_Scope': TASK_STATUS.ON_TIME,
+  'Review_Scope_Clarified': TASK_STATUS.ON_TIME,
+  'Review_Role': TASK_STATUS.ON_TIME,
+  'Review_Stagnation': TASK_STATUS.SLOW_PROGRESS,
   'Review_Update': TASK_STATUS.ON_TIME,
   'Scheduled': TASK_STATUS.ON_TIME,
   'Scheduling_Conflict': TASK_STATUS.AI_ASSIST,
   'Cancelled': TASK_STATUS.CLOSED,
   'Reopened': TASK_STATUS.ON_TIME,
+  // Lowercase variants
+  'review_date': TASK_STATUS.ON_TIME,
+  'review_date_boss_approved': TASK_STATUS.ON_TIME,
+  'review_date_boss_rejected': TASK_STATUS.ON_TIME,
+  'review_date_boss_proposed': TASK_STATUS.ON_TIME,
+  'review_scope': TASK_STATUS.ON_TIME,
+  'review_scope_clarified': TASK_STATUS.ON_TIME,
+  'review_role': TASK_STATUS.ON_TIME,
+  'pending_action': TASK_STATUS.SLOW_PROGRESS,
 };
 
 // Helper function to normalize legacy statuses to new system
@@ -276,6 +335,17 @@ const SOURCE_TYPE = {
   EMAIL_THREAD: 'Email_Thread',
   DECISION_RECORD: 'Decision_Record',
   ACTION_PLAN: 'Action_Plan',
+};
+
+// Legacy APPROVAL_STATE - Maps to new CONVERSATION_STATE for backward compatibility
+const APPROVAL_STATE = {
+  NONE: CONVERSATION_STATE.ACTIVE,
+  AWAITING_BOSS: CONVERSATION_STATE.CHANGE_REQUESTED,
+  BOSS_APPROVED: CONVERSATION_STATE.AWAITING_CONFIRMATION,
+  BOSS_REJECTED: CONVERSATION_STATE.REJECTED,
+  BOSS_PROPOSED: CONVERSATION_STATE.BOSS_PROPOSED,
+  EMPLOYEE_CONFIRMED: CONVERSATION_STATE.RESOLVED,
+  NEGOTIATING: CONVERSATION_STATE.NEGOTIATING
 };
 
 // Error types

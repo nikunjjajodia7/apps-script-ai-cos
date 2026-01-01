@@ -83,13 +83,18 @@ function doPost(e) {
       
       // Category C1: Review_Date actions
       case 'approve_new_date':
-        result = handleApproveNewDate(taskId);
+      case 'boss_approve_date_change':
+        result = handleBossApproveDateChange(taskId, data);
+        break;
+      case 'employee_confirm_date':
+        result = handleEmployeeConfirmDate(taskId);
         break;
       case 'reject_date_change':
-        result = handleRejectDateChange(taskId);
+        result = handleRejectDateChange(taskId, data);
         break;
       case 'negotiate_date':
-        result = handleNegotiateDate(taskId, data);
+      case 'boss_propose_date':
+        result = handleBossProposeDate(taskId, data);
         break;
       case 'force_meeting_date':
         result = handleForceMeeting(taskId);
@@ -237,6 +242,25 @@ function doPost(e) {
         break;
       case 'send_assignment_email':
         result = handleSendAssignmentEmail(taskId);
+        break;
+      
+      // Granular approval actions (conversation-driven)
+      case 'approve_change':
+        result = handleApproveChange(taskId, data);
+        break;
+      case 'reject_change':
+        result = handleRejectChange(taskId, data);
+        break;
+      case 'send_mixed_response':
+        result = handleMixedResponse(taskId, data);
+        break;
+      
+      // Conversation state management
+      case 'reanalyze_conversation':
+        result = handleReanalyzeConversation(taskId);
+        break;
+      case 'send_message':
+        result = handleSendMessage(taskId, data);
         break;
       
       default:
@@ -428,71 +452,167 @@ function handleRejectTask(taskId) {
 }
 
 // Category C1: Review_Date handlers
+/**
+ * Handle boss approving date change (Phase 1)
+ * This does NOT immediately change the date - sends to employee for confirmation
+ */
 function handleApproveNewDate(taskId) {
-  const task = getTask(taskId);
-  if (!task || !task.Proposed_Date) {
-    return { success: false, message: 'No proposed date found' };
-  }
-  
-  updateTask(taskId, {
-    Due_Date: task.Proposed_Date,
-    Proposed_Date: '',
-    Status: TASK_STATUS.ON_TIME,
-    Employee_Reply: '', // Clear employee reply after review
-  });
-  
-  // Send confirmation email to assignee with context
-  const staff = getStaff(task.Assignee_Email);
-  const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  let emailBody = `Hello ${assigneeName},\n\nYour request for a new due date has been approved. The new due date is ${task.Proposed_Date}.\n\n`;
-  
-  // Reference their original message if available
-  if (task.Employee_Reply) {
-    emailBody += `Thank you for your message regarding the deadline. `;
-  }
-  
-  emailBody += `\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
-  
-  GmailApp.sendEmail(
-    task.Assignee_Email,
-    `Date Change Approved: ${task.Task_Name}`,
-    emailBody
-  );
-  
-  return { success: true, message: 'Date change approved' };
+  return handleBossApproveDateChange(taskId, {});
 }
 
-function handleRejectDateChange(taskId) {
+function handleBossApproveDateChange(taskId, data) {
   const task = getTask(taskId);
   if (!task) {
     return { success: false, message: 'Task not found' };
   }
   
-  updateTask(taskId, {
-    Proposed_Date: '',
-    Status: TASK_STATUS.ON_TIME,
-    Employee_Reply: '', // Clear employee reply after review
-  });
-  
-  // Send email to assignee with context
-  const staff = getStaff(task.Assignee_Email);
-  const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  let emailBody = `Hello ${assigneeName},\n\n`;
-  
-  // Acknowledge their request
-  if (task.Employee_Reply) {
-    emailBody += `Thank you for reaching out about the deadline. After reviewing your request, `;
+  if (!task.Proposed_Date) {
+    return { success: false, message: 'No proposed date to approve' };
   }
   
-  emailBody += `the original due date of ${task.Due_Date} stands. Please complete the task by this date.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
-  
-  GmailApp.sendEmail(
-    task.Assignee_Email,
-    `Date Change Request: ${task.Task_Name}`,
-    emailBody
+  // Format dates for display
+  const tz = Session.getScriptTimeZone();
+  const proposedDateFormatted = Utilities.formatDate(
+    new Date(task.Proposed_Date), 
+    tz, 
+    'EEEE, MMMM d, yyyy'
   );
   
-  return { success: true, message: 'Date change rejected' };
+  // Update approval state - boss approved, now waiting for employee
+  updateTask(taskId, {
+    Status: TASK_STATUS.ON_TIME,
+    Conversation_State: CONVERSATION_STATE.AWAITING_CONFIRMATION,
+    Pending_Changes: JSON.stringify([{
+      id: 'date_change_' + Date.now(),
+      parameter: 'dueDate',
+      currentValue: task.Due_Date,
+      proposedValue: task.Proposed_Date,
+      requestedBy: 'employee',
+      reasoning: 'Boss approved date change'
+    }]),
+    Last_Updated: new Date()
+  });
+  
+  // Send email to employee requesting confirmation
+  const staff = getStaff(task.Assignee_Email);
+  const assigneeName = staff ? staff.Name : task.Assignee_Email;
+  
+  let emailBody = `Hello ${assigneeName},\n\n` +
+    `Your request to change the due date has been approved.\n\n` +
+    `Task: ${task.Task_Name}\n` +
+    `New Due Date: ${proposedDateFormatted}\n\n` +
+    `Please confirm if this date works for you by replying to this email.\n\n` +
+    `If you have any concerns or need to discuss further, please let me know.\n\n` +
+    `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+  
+  const result = sendEmailToAssignee(
+    taskId,
+    task.Assignee_Email,
+    `Date Change Approved - Please Confirm: ${task.Task_Name}`,
+    emailBody,
+    {
+      htmlBody: emailBody.replace(/\n/g, '<br>')
+    }
+  );
+  
+  logInteraction(taskId, `Boss approved date change. Email sent${result.threadId ? ` in thread ${result.threadId}` : ''}. Awaiting employee confirmation.`);
+  
+  return { 
+    success: true, 
+    message: 'Date change approved. Employee will be notified to confirm.',
+    requiresEmployeeConfirmation: true,
+    threadId: result.threadId
+  };
+}
+
+/**
+ * Handle employee confirming boss-approved date (Phase 2)
+ * NOW the date actually changes
+ */
+function handleEmployeeConfirmDate(taskId) {
+  const task = getTask(taskId);
+  if (!task) {
+    return { success: false, message: 'Task not found' };
+  }
+  
+  const pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
+  
+  if (!pendingDecision || pendingDecision.type !== 'date_change' || pendingDecision.awaitingFrom !== 'employee') {
+    return { success: false, message: 'No pending date confirmation found' };
+  }
+  
+  // NOW update the actual due date
+  updateTask(taskId, {
+    Due_Date: pendingDecision.proposedValue,
+    Proposed_Date: '', // Clear proposal
+    Status: TASK_STATUS.ON_TIME,
+    Conversation_State: CONVERSATION_STATE.RESOLVED,
+    Pending_Changes: '', // Clear pending changes
+    Employee_Reply: '', // Clear employee reply
+    Last_Updated: new Date()
+  });
+  
+  logInteraction(taskId, `Employee confirmed date change. Due date updated to ${pendingDecision.proposedValue}`);
+  
+  return { 
+    success: true, 
+    message: 'Date change confirmed and applied.'
+  };
+}
+
+function handleRejectDateChange(taskId, data) {
+  const task = getTask(taskId);
+  if (!task) {
+    return { success: false, message: 'Task not found' };
+  }
+  
+  const rejectionMessage = data.message || 'The original deadline needs to be maintained.';
+  
+  // Format dates for display
+  const tz = Session.getScriptTimeZone();
+  const currentDateFormatted = task.Due_Date ? 
+    Utilities.formatDate(new Date(task.Due_Date), tz, 'EEEE, MMMM d, yyyy') : 
+    'Not set';
+  
+  // Update approval state - boss rejected, conversation continues
+  updateTask(taskId, {
+    Status: TASK_STATUS.ON_TIME,
+    Conversation_State: CONVERSATION_STATE.REJECTED,
+    Proposed_Date: '', // Clear proposal since rejected
+    Pending_Changes: '', // Clear pending changes
+    Employee_Reply: '', // Clear employee reply after resolution
+    Last_Updated: new Date()
+  });
+  
+  // Send rejection email to employee
+  const staff = getStaff(task.Assignee_Email);
+  const assigneeName = staff ? staff.Name : task.Assignee_Email;
+  
+  let emailBody = `Hello ${assigneeName},\n\n` +
+    `Thank you for your request to change the deadline.\n\n` +
+    `After reviewing your request, we need to maintain the original deadline:\n\n` +
+    `Task: ${task.Task_Name}\n` +
+    `Due Date: ${currentDateFormatted}\n\n` +
+    `${rejectionMessage}\n\n` +
+    `If you have concerns or need to discuss this further, please reply to this email.\n\n` +
+    `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+  
+  const result = sendEmailToAssignee(
+    taskId,
+    task.Assignee_Email,
+    `Date Change Request: ${task.Task_Name}`,
+    emailBody,
+    {
+      htmlBody: emailBody.replace(/\n/g, '<br>')
+    }
+  );
+  
+  logInteraction(taskId, `Boss rejected date change: ${rejectionMessage}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+  
+  return { 
+    success: true, 
+    message: 'Date change rejected. Employee has been notified.'
+  };
 }
 
 function handleNegotiateDate(taskId, data) {
@@ -500,23 +620,80 @@ function handleNegotiateDate(taskId, data) {
     return { success: false, message: 'New date required' };
   }
   
+  return handleBossProposeDate(taskId, data);
+}
+
+/**
+ * Handle boss proposing alternative date
+ */
+function handleBossProposeDate(taskId, data) {
+  if (!data.newDate) {
+    return { success: false, message: 'New date required' };
+  }
+  
   const task = getTask(taskId);
-  updateTask(taskId, {
-    Proposed_Date: data.newDate,
-  });
+  if (!task) {
+    return { success: false, message: 'Task not found' };
+  }
   
-  // Send negotiation email (could use AI to draft)
-  const staff = getStaff(task.Assignee_Email);
-  const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  const emailBody = `Hello ${assigneeName},\n\nWe'd like to propose a compromise due date: ${data.newDate}. Please let us know if this works for you.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
-  
-  GmailApp.sendEmail(
-    task.Assignee_Email,
-    `Date Negotiation: ${task.Task_Name}`,
-    emailBody
+  // Format dates for display
+  const tz = Session.getScriptTimeZone();
+  const proposedDateFormatted = Utilities.formatDate(
+    new Date(data.newDate), 
+    tz, 
+    'EEEE, MMMM d, yyyy'
   );
   
-  return { success: true, message: 'Negotiation email sent' };
+  // Update task with boss's proposal
+  updateTask(taskId, {
+    Proposed_Date: data.newDate,
+    Status: TASK_STATUS.ON_TIME,
+    Conversation_State: CONVERSATION_STATE.BOSS_PROPOSED,
+    Pending_Changes: JSON.stringify([{
+      id: 'date_change_' + Date.now(),
+      parameter: 'dueDate',
+      currentValue: task.Due_Date,
+      proposedValue: data.newDate,
+      requestedBy: 'boss',
+      reasoning: data.message || 'Boss proposed alternative date'
+    }]),
+    Last_Updated: new Date()
+  });
+  
+  // Send proposal email to employee
+  const staff = getStaff(task.Assignee_Email);
+  const assigneeName = staff ? staff.Name : task.Assignee_Email;
+  const bossMessage = data.message || '';
+  
+  let emailBody = `Hello ${assigneeName},\n\n` +
+    `I'd like to propose a different due date for this task:\n\n` +
+    `Task: ${task.Task_Name}\n` +
+    `Proposed Due Date: ${proposedDateFormatted}\n\n`;
+  
+  if (bossMessage) {
+    emailBody += `Message:\n"${bossMessage}"\n\n`;
+  }
+  
+  emailBody += `Please confirm if this date works for you by replying to this email.\n\n` +
+    `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+  
+  const result = sendEmailToAssignee(
+    taskId,
+    task.Assignee_Email,
+    `Date Proposal: ${task.Task_Name}`,
+    emailBody,
+    {
+      htmlBody: emailBody.replace(/\n/g, '<br>')
+    }
+  );
+  
+  logInteraction(taskId, `Boss proposed alternative date: ${data.newDate}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+  
+  return { 
+    success: true, 
+    message: 'Date proposal sent to employee. Awaiting confirmation.',
+    requiresEmployeeConfirmation: true
+  };
 }
 
 function handleForceMeeting(taskId) {
@@ -533,17 +710,27 @@ function handleForceMeeting(taskId) {
 
 // Category C2: Review_Scope handlers
 function handleProvideClarification(taskId, data) {
+  // #region agent log
+  Logger.log('[DEBUG] handleProvideClarification entry: ' + JSON.stringify({location:'DashboardActions.gs:712',message:'handleProvideClarification entry',data:{taskId:taskId,hasClarification:!!data.clarification},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'}));
+  // #endregion
+  
   if (!data.clarification) {
     return { success: false, message: 'Clarification text required' };
   }
   
   const task = getTask(taskId);
+  
+  // #region agent log
+  Logger.log('[DEBUG] handleProvideClarification task loaded: ' + JSON.stringify({location:'DashboardActions.gs:720',message:'handleProvideClarification task loaded',data:{taskId:taskId,primaryThreadId:task.Primary_Thread_ID,assigneeEmail:task.Assignee_Email},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'}));
+  // #endregion
+  
   const currentContext = task.Context_Hidden || '';
   const newContext = currentContext + '\n\nClarification: ' + data.clarification;
   
   updateTask(taskId, {
     Context_Hidden: newContext,
     Status: TASK_STATUS.ON_TIME,
+    Conversation_State: CONVERSATION_STATE.RESOLVED, // Issue resolved after clarification
     Employee_Reply: '', // Clear employee reply after review
   });
   
@@ -559,11 +746,25 @@ function handleProvideClarification(taskId, data) {
   
   emailBody += `Here's additional clarification:\n\n${data.clarification}\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
-  GmailApp.sendEmail(
+  // #region agent log
+  Logger.log('[DEBUG] handleProvideClarification before sendEmailToAssignee: ' + JSON.stringify({location:'DashboardActions.gs:738',message:'handleProvideClarification before sendEmailToAssignee',data:{taskId:taskId,emailBodyLength:emailBody.length,hasTaskIdInBody:emailBody.includes('Task ID: ' + taskId)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'}));
+  // #endregion
+  
+  const result = sendEmailToAssignee(
+    taskId,
     task.Assignee_Email,
     `Clarification: ${task.Task_Name}`,
-    emailBody
+    emailBody,
+    {
+      htmlBody: emailBody.replace(/\n/g, '<br>')
+    }
   );
+  
+  // #region agent log
+  Logger.log('[DEBUG] handleProvideClarification after sendEmailToAssignee: ' + JSON.stringify({location:'DashboardActions.gs:750',message:'handleProvideClarification after sendEmailToAssignee',data:{taskId:taskId,resultSuccess:result.success,resultThreadId:result.threadId,resultMessageId:result.messageId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
+  // #endregion
+  
+  logInteraction(taskId, `Clarification sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
   
   return { success: true, message: 'Clarification sent' };
 }
@@ -733,16 +934,23 @@ function handleOverrideRole(taskId, data) {
   
   emailBody += `this task is indeed your responsibility. We expect you to proceed with it as assigned. If you have specific concerns, please let us know.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
-  GmailApp.sendEmail(
+  const result = sendEmailToAssignee(
+    taskId,
     task.Assignee_Email,
     `Task Assignment: ${task.Task_Name}`,
-    emailBody
+    emailBody,
+    {
+      htmlBody: emailBody.replace(/\n/g, '<br>')
+    }
   );
   
   updateTask(taskId, { 
     Status: TASK_STATUS.ON_TIME,
+    Conversation_State: CONVERSATION_STATE.RESOLVED, // Issue resolved after override
     Employee_Reply: '', // Clear employee reply after review
   });
+  
+  logInteraction(taskId, `Override email sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
   
   return { success: true, message: 'Override email sent' };
 }
@@ -773,7 +981,11 @@ function handleAssignToSelf(taskId) {
 
 // Category A1: Completion Review handlers
 function handleApproveDone(taskId) {
-  updateTask(taskId, { Status: TASK_STATUS.CLOSED });
+  updateTask(taskId, { 
+    Status: TASK_STATUS.CLOSED,
+    Conversation_State: CONVERSATION_STATE.RESOLVED, // Completion approved, issue resolved
+    Employee_Reply: '', // Clear employee reply after approval
+  });
   return { success: true, message: 'Task marked as done' };
 }
 
@@ -794,13 +1006,19 @@ function handleRequestProof(taskId, data) {
   
   const staff = getStaff(task.Assignee_Email);
   const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  const emailBody = `Hello ${assigneeName},\n\nBefore we can mark this task as complete, we need evidence or a demo of the result. Please provide the requested proof.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+  let emailBody = `Hello ${assigneeName},\n\nBefore we can mark this task as complete, we need evidence or a demo of the result. Please provide the requested proof.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
-  GmailApp.sendEmail(
+  const result = sendEmailToAssignee(
+    taskId,
     task.Assignee_Email,
     `Proof Requested: ${task.Task_Name}`,
-    emailBody
+    emailBody,
+    {
+      htmlBody: emailBody.replace(/\n/g, '<br>')
+    }
   );
+  
+  logInteraction(taskId, `Proof request sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
   
   return { success: true, message: 'Proof request sent' };
 }
@@ -827,7 +1045,11 @@ function handleReassign(taskId, data) {
 
 // Category A3: Significant Update handlers
 function handleAcknowledgeUpdate(taskId) {
-  updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
+  updateTask(taskId, { 
+    Status: TASK_STATUS.ON_TIME,
+    Conversation_State: CONVERSATION_STATE.RESOLVED, // Update acknowledged, issue resolved
+    Employee_Reply: '', // Clear employee reply after acknowledgment
+  });
   return { success: true, message: 'Update acknowledged' };
 }
 
@@ -1209,23 +1431,142 @@ function doGet(e) {
         filteredTasks = filteredTasks.filter(t => t.Status === status);
       }
       
-      // Format tasks to match expected frontend format (no priority)
-      const formattedTasks = filteredTasks.map(task => ({
-        taskId: task.Task_ID || '',
-        taskName: task.Task_Name || '',
-        assigneeName: task.Assignee_Name || '',
-        assigneeEmail: task.Assignee_Email || '',
-        status: task.Status || TASK_STATUS.AI_ASSIST,
-        dueDate: task.Due_Date || '',
-        description: task.Context_Hidden || '',
-        projectId: task.Project_Tag || '',
-        createdAt: task.Created_Date || ''
-      }));
+      // Format tasks to match expected frontend format with conversation state
+      const formattedTasks = filteredTasks.map(task => {
+        // Parse conversation history if available
+        let conversationHistory = [];
+        if (task.Conversation_History) {
+          try {
+            conversationHistory = JSON.parse(task.Conversation_History);
+          } catch (e) {
+            conversationHistory = [];
+          }
+        }
+        // Trim list payload: keep only last 3 messages to avoid large responses
+        if (conversationHistory && conversationHistory.length > 3) {
+          conversationHistory = conversationHistory.slice(-3);
+        }
+        
+        // Parse pending changes if available
+        let pendingChanges = [];
+        if (task.Pending_Changes) {
+          try {
+            pendingChanges = JSON.parse(task.Pending_Changes);
+          } catch (e) {
+            pendingChanges = [];
+          }
+        }
+        
+        const conversationState = task.Conversation_State || CONVERSATION_STATE.ACTIVE;
+        
+        return {
+          taskId: task.Task_ID || '',
+          taskName: task.Task_Name || '',
+          assigneeName: task.Assignee_Name || '',
+          assigneeEmail: task.Assignee_Email || '',
+          status: task.Status || TASK_STATUS.AI_ASSIST,
+          dueDate: task.Due_Date || '',
+          proposedDate: task.Proposed_Date || '',
+          description: task.Context_Hidden || '',
+          projectName: task.Project_Tag || '',
+          createdAt: task.Created_Date || '',
+          updatedAt: task.Last_Updated || '',
+          
+          // Conversation-driven state fields
+          conversationState: conversationState,
+          needsAttention: taskNeedsAttention(conversationState),  // Convenience flag for "Needs Attention" bucket
+          conversationHistory: conversationHistory,
+          aiSummary: task.AI_Summary || '',
+          pendingChanges: pendingChanges,
+          
+          // AI metadata
+          aiConfidence: task.AI_Confidence || null,
+          toneDetected: task.Tone_Detected || '',
+          
+          // Legacy fields for compatibility
+          employeeReply: task.Employee_Reply || '',
+          interactionLog: task.Interaction_Log || ''
+        };
+      });
       
       return ContentService.createTextOutput(JSON.stringify({
         success: true,
         data: formattedTasks
       })).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    // Detect parameter changes from conversation (primary endpoint for change detection)
+    if (action === 'detect_changes') {
+      const taskId = e.parameter.taskId;
+      const forceReanalyze = e.parameter.force === 'true';
+      if (!taskId) {
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: 'taskId parameter required'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      
+      try {
+        const changes = detectParameterChanges(taskId, forceReanalyze);
+        
+        return ContentService.createTextOutput(JSON.stringify({
+          success: true,
+          data: changes
+        })).setMimeType(ContentService.MimeType.JSON);
+      } catch (error) {
+        Logger.log('Error in detect_changes: ' + error.toString());
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: 'Error detecting changes: ' + error.toString()
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+    
+    // Get conversation state (uses stored state or analyzes if needed)
+    if (action === 'get_conversation_state') {
+      const taskId = e.parameter.taskId;
+      if (!taskId) {
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: 'taskId parameter required'
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      
+      try {
+        const task = getTask(taskId);
+        if (!task) {
+          return ContentService.createTextOutput(JSON.stringify({
+            success: false,
+            error: 'Task not found'
+          })).setMimeType(ContentService.MimeType.JSON);
+        }
+        
+        // Return stored state
+        let pendingChanges = [];
+        try {
+          if (task.Pending_Changes) {
+            pendingChanges = JSON.parse(task.Pending_Changes);
+          }
+        } catch (e) {
+          pendingChanges = [];
+        }
+        
+        return ContentService.createTextOutput(JSON.stringify({
+          success: true,
+          data: {
+            conversationState: task.Conversation_State || CONVERSATION_STATE.ACTIVE,
+            pendingChanges: pendingChanges,
+            summary: task.AI_Summary || '',
+            lastUpdated: task.Last_Updated
+          }
+        })).setMimeType(ContentService.MimeType.JSON);
+      } catch (error) {
+        Logger.log('Error in get_conversation_state: ' + error.toString());
+        return ContentService.createTextOutput(JSON.stringify({
+          success: false,
+          error: 'Error getting conversation state: ' + error.toString()
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
     }
     
     // Data reading endpoints (legacy support)
@@ -2233,6 +2574,490 @@ function handleSendAssignmentEmail(taskId) {
     return { success: true, message: 'Assignment email sent' };
   } catch (error) {
     Logger.log('Error in handleSendAssignmentEmail: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+// ============================================
+// GRANULAR APPROVAL HANDLERS (Conversation-Driven)
+// ============================================
+
+/**
+ * Handle approving a single detected change
+ * @param {string} taskId - The task ID
+ * @param {Object} data - Contains changeId and optional draftMessage
+ */
+function handleApproveChange(taskId, data) {
+  try {
+    const task = getTask(taskId);
+    if (!task) {
+      return { success: false, error: 'Task not found' };
+    }
+    
+    const changeId = data.changeId;
+    const parameter = data.parameter; // 'dueDate', 'assignee', 'scope', 'taskName'
+    const proposedValue = data.proposedValue;
+    const draftMessage = data.draftMessage || '';
+    
+    if (!parameter || !proposedValue) {
+      return { success: false, error: 'parameter and proposedValue are required' };
+    }
+    
+    const tz = Session.getScriptTimeZone();
+    const staff = getStaff(task.Assignee_Email);
+    const assigneeName = staff ? staff.Name : task.Assignee_Email;
+    
+    // Apply the change based on parameter type
+    const updates = { Last_Updated: new Date() };
+    let emailSubject = '';
+    let emailBody = '';
+    
+    switch (parameter) {
+      case 'dueDate':
+        updates.Due_Date = new Date(proposedValue);
+        updates.Proposed_Date = ''; // Clear any pending proposal
+        updates.Status = TASK_STATUS.ON_TIME;
+        
+        const formattedDate = Utilities.formatDate(new Date(proposedValue), tz, 'EEEE, MMMM d, yyyy');
+        emailSubject = `Date Change Approved: ${task.Task_Name}`;
+        emailBody = `Hello ${assigneeName},\n\nYour request to change the due date has been approved.\n\n` +
+          `Task: ${task.Task_Name}\n` +
+          `New Due Date: ${formattedDate}\n\n`;
+        break;
+        
+      case 'scope':
+        updates.Context_Hidden = (task.Context_Hidden || '') + '\n\nScope Update: ' + proposedValue;
+        updates.Status = TASK_STATUS.ON_TIME;
+        
+        emailSubject = `Scope Clarification: ${task.Task_Name}`;
+        emailBody = `Hello ${assigneeName},\n\nRegarding your question about the task scope:\n\n` +
+          `Task: ${task.Task_Name}\n\n` +
+          `Response: ${proposedValue}\n\n`;
+        break;
+        
+      case 'assignee':
+        updates.Assignee_Email = proposedValue;
+        updates.Status = TASK_STATUS.NOT_ACTIVE;
+        
+        emailSubject = `Task Reassigned: ${task.Task_Name}`;
+        emailBody = `Hello,\n\nThis task has been reassigned as requested.\n\n` +
+          `Task: ${task.Task_Name}\n\n`;
+        break;
+        
+      case 'taskName':
+        updates.Task_Name = proposedValue;
+        
+        emailSubject = `Task Updated: ${task.Task_Name}`;
+        emailBody = `Hello ${assigneeName},\n\nThe task has been updated as discussed.\n\n` +
+          `New Task Name: ${proposedValue}\n\n`;
+        break;
+        
+      default:
+        return { success: false, error: 'Unknown parameter type: ' + parameter };
+    }
+    
+    // Add boss message if provided
+    if (draftMessage) {
+      emailBody += `Message from ${CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss'}:\n"${draftMessage}"\n\n`;
+    }
+    
+    emailBody += `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+    
+    // Add Task ID to email body for correlation
+    emailBody = `${emailBody}\n\n---\nTask ID: ${taskId}`;
+    
+    // Clear employee reply since issue is resolved
+    updates.Employee_Reply = '';
+    
+    // Update task
+    updateTask(taskId, updates);
+    
+    // Send confirmation email
+    let result = { success: false, threadId: null };
+    if (task.Assignee_Email) {
+      result = sendEmailToAssignee(
+        taskId,
+        task.Assignee_Email,
+        emailSubject,
+        emailBody,
+        {
+          htmlBody: emailBody.replace(/\n/g, '<br>')
+        }
+      );
+    }
+    
+    // Log the approval
+    logInteraction(taskId, `Boss approved ${parameter} change to: ${proposedValue}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+    
+    // Append to conversation history
+    appendToConversationHistory(taskId, {
+      timestamp: new Date().toISOString(),
+      senderEmail: CONFIG.BOSS_EMAIL(),
+      senderName: CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss',
+      type: 'boss_approval',
+      content: `Approved ${parameter} change. ${draftMessage}`
+    });
+    
+    // Re-analyze conversation to update state
+    const analysisResult = analyzeConversationAndUpdateState(taskId);
+    
+    return { 
+      success: true, 
+      message: `${parameter} change approved and applied`,
+      appliedChange: { parameter, proposedValue },
+      conversationState: analysisResult.success ? analysisResult.data.conversationState : null
+    };
+    
+  } catch (error) {
+    Logger.log('Error in handleApproveChange: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle rejecting a single detected change
+ * @param {string} taskId - The task ID
+ * @param {Object} data - Contains changeId and rejectionMessage
+ */
+function handleRejectChange(taskId, data) {
+  try {
+    const task = getTask(taskId);
+    if (!task) {
+      return { success: false, error: 'Task not found' };
+    }
+    
+    const parameter = data.parameter; // 'dueDate', 'assignee', 'scope', 'taskName'
+    const rejectionMessage = data.rejectionMessage || 'The requested change cannot be accommodated at this time.';
+    
+    if (!parameter) {
+      return { success: false, error: 'parameter is required' };
+    }
+    
+    const staff = getStaff(task.Assignee_Email);
+    const assigneeName = staff ? staff.Name : task.Assignee_Email;
+    
+    // Update task - clear any pending proposal but don't change the value
+    const updates = { 
+      Last_Updated: new Date(),
+      Status: TASK_STATUS.ON_TIME, // Reset to normal status
+      Employee_Reply: '' // Clear employee reply after rejection
+    };
+    
+    if (parameter === 'dueDate') {
+      updates.Proposed_Date = ''; // Clear proposal
+    }
+    
+    updateTask(taskId, updates);
+    
+    // Send rejection email
+    const emailSubject = `Request Update: ${task.Task_Name}`;
+    let emailBody = `Hello ${assigneeName},\n\n` +
+      `Thank you for your request regarding the ${parameter}.\n\n` +
+      `After consideration, we are unable to accommodate this change at this time.\n\n` +
+      `${rejectionMessage}\n\n` +
+      `If you have concerns or would like to discuss this further, please reply to this email.\n\n` +
+      `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+    
+    // Add Task ID to email body for correlation
+    emailBody = `${emailBody}\n\n---\nTask ID: ${taskId}`;
+    
+    let result = { success: false, threadId: null };
+    if (task.Assignee_Email) {
+      result = sendEmailToAssignee(
+        taskId,
+        task.Assignee_Email,
+        emailSubject,
+        emailBody,
+        {
+          htmlBody: emailBody.replace(/\n/g, '<br>')
+        }
+      );
+    }
+    
+    // Log the rejection
+    logInteraction(taskId, `Boss rejected ${parameter} change: ${rejectionMessage}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+    
+    // Append to conversation history
+    appendToConversationHistory(taskId, {
+      timestamp: new Date().toISOString(),
+      senderEmail: CONFIG.BOSS_EMAIL(),
+      senderName: CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss',
+      type: 'boss_rejection',
+      content: `Rejected ${parameter} change. ${rejectionMessage}`
+    });
+    
+    // Re-analyze conversation to update state
+    const analysisResult = analyzeConversationAndUpdateState(taskId);
+    
+    return { 
+      success: true, 
+      message: `${parameter} change rejected. Employee notified.`,
+      conversationState: analysisResult.success ? analysisResult.data.conversationState : null
+    };
+    
+  } catch (error) {
+    Logger.log('Error in handleRejectChange: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Handle mixed response - approve some changes, reject others
+ * @param {string} taskId - The task ID
+ * @param {Object} data - Contains approvedChanges, rejectedChanges, and message
+ */
+function handleMixedResponse(taskId, data) {
+  try {
+    const task = getTask(taskId);
+    if (!task) {
+      return { success: false, error: 'Task not found' };
+    }
+    
+    const approvedChanges = data.approvedChanges || []; // Array of { parameter, proposedValue }
+    const rejectedChanges = data.rejectedChanges || []; // Array of { parameter }
+    const message = data.message || '';
+    
+    if (approvedChanges.length === 0 && rejectedChanges.length === 0) {
+      return { success: false, error: 'At least one approved or rejected change is required' };
+    }
+    
+    const tz = Session.getScriptTimeZone();
+    const staff = getStaff(task.Assignee_Email);
+    const assigneeName = staff ? staff.Name : task.Assignee_Email;
+    
+    // Apply approved changes
+    const updates = { Last_Updated: new Date() };
+    const appliedChanges = [];
+    
+    for (const change of approvedChanges) {
+      switch (change.parameter) {
+        case 'dueDate':
+          updates.Due_Date = new Date(change.proposedValue);
+          updates.Proposed_Date = '';
+          appliedChanges.push(`Due date changed to ${Utilities.formatDate(new Date(change.proposedValue), tz, 'MMMM d, yyyy')}`);
+          break;
+        case 'scope':
+          updates.Context_Hidden = (task.Context_Hidden || '') + '\n\nScope Update: ' + change.proposedValue;
+          appliedChanges.push(`Scope clarification added`);
+          break;
+        case 'assignee':
+          updates.Assignee_Email = change.proposedValue;
+          updates.Status = TASK_STATUS.NOT_ACTIVE;
+          appliedChanges.push(`Task reassigned`);
+          break;
+        case 'taskName':
+          updates.Task_Name = change.proposedValue;
+          appliedChanges.push(`Task name updated`);
+          break;
+      }
+    }
+    
+    // Clear proposals for rejected changes
+    for (const change of rejectedChanges) {
+      if (change.parameter === 'dueDate') {
+        updates.Proposed_Date = '';
+      }
+    }
+    
+    // Update task
+    updateTask(taskId, updates);
+    
+    // Build email
+    let emailBody = `Hello ${assigneeName},\n\n` +
+      `Thank you for your requests. Here is my response:\n\n`;
+    
+    if (appliedChanges.length > 0) {
+      emailBody += `✓ Approved:\n`;
+      appliedChanges.forEach(c => emailBody += `  - ${c}\n`);
+      emailBody += '\n';
+    }
+    
+    if (rejectedChanges.length > 0) {
+      emailBody += `✗ Not approved:\n`;
+      rejectedChanges.forEach(c => emailBody += `  - ${c.parameter} change\n`);
+      emailBody += '\n';
+    }
+    
+    if (message) {
+      emailBody += `Message:\n"${message}"\n\n`;
+    }
+    
+    emailBody += `If you have any questions or concerns, please reply to this email.\n\n` +
+      `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+    
+    // Add Task ID to email body for correlation
+    emailBody = `${emailBody}\n\n---\nTask ID: ${taskId}`;
+    
+    // Send email
+    let result = { success: false, threadId: null };
+    if (task.Assignee_Email) {
+      result = sendEmailToAssignee(
+        taskId,
+        task.Assignee_Email,
+        `Response to Your Requests: ${task.Task_Name}`,
+        emailBody,
+        {
+          htmlBody: emailBody.replace(/\n/g, '<br>').replace(/✓/g, '✓').replace(/✗/g, '✗')
+        }
+      );
+    }
+    
+    // Log the mixed response
+    logInteraction(taskId, `Boss responded with mixed approvals: ${appliedChanges.length} approved, ${rejectedChanges.length} rejected${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+    
+    // Append to conversation history
+    appendToConversationHistory(taskId, {
+      timestamp: new Date().toISOString(),
+      senderEmail: CONFIG.BOSS_EMAIL(),
+      senderName: CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss',
+      type: 'boss_mixed_response',
+      content: `Approved: ${appliedChanges.join(', ')}. Rejected: ${rejectedChanges.map(c => c.parameter).join(', ')}. ${message}`
+    });
+    
+    // Re-analyze conversation to update state
+    const analysisResult = analyzeConversationAndUpdateState(taskId);
+    
+    return { 
+      success: true, 
+      message: `Response sent. ${appliedChanges.length} changes approved, ${rejectedChanges.length} rejected.`,
+      appliedChanges,
+      rejectedChanges,
+      conversationState: analysisResult.success ? analysisResult.data.conversationState : null
+    };
+    
+  } catch (error) {
+    Logger.log('Error in handleMixedResponse: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Helper to append message to conversation history
+ */
+function appendToConversationHistory(taskId, message) {
+  try {
+    const task = getTask(taskId);
+    if (!task) return false;
+    
+    let history = [];
+    if (task.Conversation_History) {
+      try {
+        history = JSON.parse(task.Conversation_History);
+      } catch (e) {
+        history = [];
+      }
+    }
+    
+    // Add new message
+    history.push(message);
+    
+    // Limit history to last 50 messages to prevent sheet cell limits
+    if (history.length > 50) {
+      history = history.slice(-50);
+    }
+    
+    updateTask(taskId, { 
+      Conversation_History: JSON.stringify(history),
+      Last_Updated: new Date()
+    });
+    
+    return true;
+  } catch (error) {
+    Logger.log('Error appending to conversation history: ' + error.toString());
+    return false;
+  }
+}
+
+// ============================================
+// CONVERSATION STATE MANAGEMENT HANDLERS
+// ============================================
+
+/**
+ * Re-analyze conversation and update state
+ * Useful when state seems out of sync
+ */
+function handleReanalyzeConversation(taskId) {
+  try {
+    const result = analyzeConversationAndUpdateState(taskId);
+    
+    if (result.success) {
+      return {
+        success: true,
+        message: 'Conversation re-analyzed',
+        data: result.data
+      };
+    } else {
+      return {
+        success: false,
+        error: result.error || 'Failed to analyze conversation'
+      };
+    }
+  } catch (error) {
+    Logger.log('Error in handleReanalyzeConversation: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
+/**
+ * Send a message to employee and update conversation state
+ * @param {string} taskId - The task ID
+ * @param {Object} data - Contains message, optional subject
+ */
+function handleSendMessage(taskId, data) {
+  try {
+    const task = getTask(taskId);
+    if (!task) {
+      return { success: false, error: 'Task not found' };
+    }
+    
+    const message = data.message;
+    if (!message) {
+      return { success: false, error: 'Message is required' };
+    }
+    
+    const staff = getStaff(task.Assignee_Email);
+    const assigneeName = staff ? staff.Name : task.Assignee_Email;
+    const subject = data.subject || `Re: ${task.Task_Name}`;
+    
+    // Build email body
+    let emailBody = `Hello ${assigneeName},\n\n${message}\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+    
+    // Send email
+    let result = { success: false, threadId: null };
+    if (task.Assignee_Email) {
+      result = sendEmailToAssignee(
+        taskId,
+        task.Assignee_Email,
+        subject,
+        emailBody,
+        {
+          htmlBody: emailBody.replace(/\n/g, '<br>')
+        }
+      );
+    }
+    
+    // Append to conversation history
+    appendToConversationHistory(taskId, {
+      timestamp: new Date().toISOString(),
+      senderEmail: CONFIG.BOSS_EMAIL(),
+      senderName: CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss',
+      type: 'boss_message',
+      content: message
+    });
+    
+    // Re-analyze conversation to update state
+    const analysisResult = analyzeConversationAndUpdateState(taskId);
+    
+    logInteraction(taskId, `Boss sent message to employee${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+    
+    return {
+      success: true,
+      message: 'Message sent successfully',
+      conversationState: analysisResult.success ? analysisResult.data.conversationState : null
+    };
+    
+  } catch (error) {
+    Logger.log('Error in handleSendMessage: ' + error.toString());
     return { success: false, error: error.toString() };
   }
 }
