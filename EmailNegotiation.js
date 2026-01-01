@@ -145,6 +145,21 @@ function processBossMessage(taskId, message) {
     } else {
       // Just log the boss message
       logInteraction(taskId, `Boss message received: ${emailContent.substring(0, 100)}... (Message ID: ${messageId})`);
+
+      // Ensure Conversation_State/Pending_Changes stay in sync for dashboard task cards.
+      // Boss messages can change scope/plan without a date change; those should still reflect on the card.
+      try {
+        Logger.log(`Analyzing conversation to update state after boss message for task ${taskId}...`);
+        const analysisResult = analyzeConversationAndUpdateState(taskId);
+        if (analysisResult && analysisResult.success) {
+          Logger.log(`Conversation state updated to: ${analysisResult.data.conversationState}`);
+        } else {
+          Logger.log(`Warning: Failed to analyze conversation after boss message: ${(analysisResult && analysisResult.error) || 'unknown error'}`);
+        }
+      } catch (analysisError) {
+        Logger.log(`Error analyzing conversation after boss message: ${analysisError.toString()}`);
+        // Don't fail boss message processing if analysis fails
+      }
     }
     
   } catch (error) {
