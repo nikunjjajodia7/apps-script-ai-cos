@@ -1834,6 +1834,38 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
         content: task.Employee_Reply
       });
     }
+
+    // ------------------------------------------------------------------
+    // Guardrail: keep Conversation_History safely under Google Sheets cell limits
+    // (50,000 characters). This function runs frequently; never allow it to fail
+    // state updates due to oversized conversation history.
+    // ------------------------------------------------------------------
+    const MAX_CELL_CHARS = 45000; // leave buffer under 50k hard limit
+    const MAX_MSGS = 30;
+    const MAX_MSG_CONTENT = 500;
+
+    // Keep only last N messages by default
+    if (conversationHistory.length > MAX_MSGS) {
+      conversationHistory = conversationHistory.slice(-MAX_MSGS);
+    }
+
+    // If still too large, truncate message contents and reduce message count further
+    let historyJson = JSON.stringify(conversationHistory);
+    if (historyJson.length > MAX_CELL_CHARS) {
+      // First pass: truncate long message bodies
+      conversationHistory.forEach(msg => {
+        if (msg && msg.content && msg.content.length > MAX_MSG_CONTENT) {
+          msg.content = msg.content.substring(0, MAX_MSG_CONTENT) + '... [truncated]';
+        }
+      });
+      historyJson = JSON.stringify(conversationHistory);
+
+      // Second pass: reduce message count
+      if (historyJson.length > MAX_CELL_CHARS && conversationHistory.length > 20) {
+        conversationHistory = conversationHistory.slice(-20);
+        historyJson = JSON.stringify(conversationHistory);
+      }
+    }
     
     // If no conversation, default to active state
     if (conversationHistory.length === 0) {
@@ -1978,22 +2010,6 @@ Return ONLY valid JSON:
     // Preserve existing pending changes if the model returned none.
     if (existingPendingChanges.length > 0 && (!analysis.pendingChanges || analysis.pendingChanges.length === 0)) {
       analysis.pendingChanges = existingPendingChanges;
-    }
-
-    // ------------------------------------------------------------------
-    // Normalize pending change schema so UI can reason about "who requested" and "who is awaiting"
-    // ------------------------------------------------------------------
-    if (analysis.pendingChanges && analysis.pendingChanges.length > 0) {
-      analysis.pendingChanges = analysis.pendingChanges.map((c, idx) => {
-        if (!c) return c;
-        // Ensure id
-        if (!c.id) c.id = `change_${idx + 1}`;
-        // Defaults for AI-produced changes (employee requests boss action)
-        if (!c.requestedBy) c.requestedBy = 'employee';
-        if (!c.awaitingFrom) c.awaitingFrom = (c.requestedBy === 'boss') ? 'employee' : 'boss';
-        if (!c.status) c.status = 'pending';
-        return c;
-      });
     }
 
     // If we have a Pending_Decision awaiting employee, force the appropriate state.

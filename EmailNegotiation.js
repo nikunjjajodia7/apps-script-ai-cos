@@ -4,83 +4,6 @@
  */
 
 /**
- * Canonical inbound message ingestion pipeline.
- * Correlates message -> task via Primary_Thread_ID (preferred) or strict "Task ID:" match.
- * Ensures Processed_Message_IDs is used for idempotency.
- */
-function ingestInboundMessage(message) {
-  try {
-    if (!message) return { success: false, error: 'No message provided' };
-
-    const messageId = message.getId();
-    const threadId = message.getThread ? message.getThread().getId() : null;
-    const fromEmail = extractEmailFromString(message.getFrom());
-    const bossEmail = CONFIG.BOSS_EMAIL();
-
-    // Try correlation by Primary_Thread_ID first
-    let taskId = null;
-    if (threadId) {
-      const matches = findRowsByCondition(SHEETS.TASKS_DB, t => (t.Primary_Thread_ID || '') === threadId);
-      if (matches && matches.length > 0) {
-        taskId = matches[0].Task_ID;
-      }
-    }
-
-    // Fallback: strict Task ID match in body
-    if (!taskId) {
-      const body = message.getPlainBody ? message.getPlainBody() : '';
-      const match = body.match(/Task ID:\s*([A-Za-z0-9_-]+)/i);
-      if (match && match[1]) {
-        taskId = match[1].trim();
-      }
-    }
-
-    if (!taskId) {
-      Logger.log(`ingestInboundMessage: Could not correlate message ${messageId} (threadId=${threadId}) to a task`);
-      return { success: false, error: 'Could not correlate message to task' };
-    }
-
-    // Idempotency via Processed_Message_IDs
-    const processedIds = getProcessedMessageIds(taskId);
-    if (processedIds.has(messageId)) {
-      Logger.log(`ingestInboundMessage: Message ${messageId} already processed for ${taskId}, skipping`);
-      return { success: true, skipped: true, taskId: taskId };
-    }
-
-    const task = getTask(taskId);
-    if (!task) return { success: false, error: `Task ${taskId} not found` };
-    const assigneeEmail = extractEmailFromString(task.Assignee_Email);
-
-    const isBoss = fromEmail && bossEmail && fromEmail.toLowerCase() === bossEmail.toLowerCase();
-    const isEmployee = fromEmail && assigneeEmail && fromEmail.toLowerCase() === assigneeEmail.toLowerCase();
-    if (!isBoss && !isEmployee) {
-      Logger.log(`ingestInboundMessage: Unknown sender ${fromEmail} for task ${taskId}, skipping`);
-      return { success: false, error: 'Unknown sender' };
-    }
-
-    // Process
-    if (isBoss) {
-      processBossMessage(taskId, message);
-    } else {
-      processReplyEmail(taskId, message);
-    }
-
-    // Mark processed and run deterministic post-step analysis
-    markMessageAsProcessed(taskId, messageId);
-    try {
-      analyzeConversationAndUpdateState(taskId);
-    } catch (e) {
-      Logger.log(`ingestInboundMessage: post-step analysis failed for ${taskId}: ${e.toString()}`);
-    }
-
-    return { success: true, taskId: taskId, messageId: messageId, threadId: threadId };
-  } catch (error) {
-    Logger.log(`ingestInboundMessage error: ${error.toString()}`);
-    return { success: false, error: error.toString() };
-  }
-}
-
-/**
  * Process a message from the boss
  * Analyzes for date changes, instructions, and automatically updates task
  */
@@ -484,10 +407,61 @@ function onTaskAssigned(taskId) {
 function onGmailReply(e) {
   try {
     const message = e.message;
-    // Canonical ingestion (threadId/TaskId correlation + Processed_Message_IDs idempotency)
-    const result = ingestInboundMessage(message);
-    if (!result.success) {
-      Logger.log(`onGmailReply: ingest failed: ${result.error || 'unknown error'}`);
+    const thread = message.getThread();
+    const subject = message.getSubject();
+    
+    // Check if this is a reply to a task assignment
+    if (!subject.includes('Task Assignment:')) {
+      return;
+    }
+    
+    // Extract task name from subject
+    const taskNameMatch = subject.match(/Task Assignment: (.+)/);
+    if (!taskNameMatch) {
+      return;
+    }
+    
+    const taskName = taskNameMatch[1];
+    
+    // Find task by name - expanded to include review statuses
+    const tasks = findRowsByCondition(SHEETS.TASKS_DB, task => 
+      task.Task_Name === taskName && 
+      (task.Status === TASK_STATUS.NOT_ACTIVE || 
+       task.Status === TASK_STATUS.ON_TIME || 
+       task.Status === TASK_STATUS.SLOW_PROGRESS ||
+       task.Status === TASK_STATUS.REVIEW_DATE ||
+       task.Status === TASK_STATUS.REVIEW_DATE_BOSS_APPROVED ||
+       task.Status === TASK_STATUS.REVIEW_DATE_BOSS_REJECTED ||
+       task.Status === TASK_STATUS.REVIEW_DATE_BOSS_PROPOSED ||
+       task.Status === TASK_STATUS.REVIEW_SCOPE ||
+       task.Status === TASK_STATUS.REVIEW_SCOPE_CLARIFIED ||
+       task.Status === TASK_STATUS.REVIEW_ROLE)
+    );
+    
+    if (tasks.length === 0) {
+      Logger.log(`No task found for reply: ${taskName}`);
+      return;
+    }
+    
+    const task = tasks[0]; // Use first match
+    const taskId = task.Task_ID;
+    
+    // Determine if message is from boss or employee
+    const senderEmail = extractEmailFromString(message.getFrom());
+    const bossEmail = CONFIG.BOSS_EMAIL();
+    const assigneeEmail = extractEmailFromString(task.Assignee_Email);
+    
+    const isBossMessage = senderEmail.toLowerCase() === bossEmail.toLowerCase();
+    const isEmployeeMessage = senderEmail.toLowerCase() === assigneeEmail.toLowerCase();
+    
+    if (isBossMessage) {
+      // Process boss message - may contain date changes or instructions
+      processBossMessage(taskId, message);
+    } else if (isEmployeeMessage) {
+      // Process employee reply (existing logic)
+      processReplyEmail(taskId, message);
+    } else {
+      Logger.log(`Message from unknown sender: ${senderEmail}. Skipping.`);
     }
     
   } catch (error) {
@@ -1615,11 +1589,21 @@ function checkForReplies() {
   try {
     Logger.log('=== Checking for email replies ===');
     
-    // Get all tasks that need reply checking - new status system
-    const notActiveTasks = getTasksByStatus(TASK_STATUS.NOT_ACTIVE);
-    const onTimeTasks = getTasksByStatus(TASK_STATUS.ON_TIME);
-    const slowTasks = getTasksByStatus(TASK_STATUS.SLOW_PROGRESS);
-    const allTasks = [...notActiveTasks, ...onTimeTasks, ...slowTasks];
+    // Scan tasks across ALL lifecycle statuses (including closed/on_hold/someday),
+    // because boss messages may be sent at any time and should still be ingested.
+    // Keep it efficient by only scanning tasks that have an assignee email.
+    //
+    // NOTE: We prefer tasks with a Primary_Thread_ID (fast direct access) but we do
+    // not require it, because fallback search can still find the thread by Task ID.
+    const allRows = getSheetData(SHEETS.TASKS_DB);
+    const allTasks = allRows
+      .filter(t => t && t.Task_ID && t.Assignee_Email)
+      // Prefer tasks with Primary_Thread_ID first (faster + more reliable)
+      .sort((a, b) => {
+        const aHas = a.Primary_Thread_ID ? 1 : 0;
+        const bHas = b.Primary_Thread_ID ? 1 : 0;
+        return bHas - aHas;
+      });
     
     Logger.log(`Found ${allTasks.length} tasks to check`);
     
@@ -1651,16 +1635,43 @@ function checkForReplies() {
           return;
         }
         
-        // Process each reply via canonical ingestion
+        // Process each reply
         replies.forEach((reply, index) => {
           try {
+            const messageId = reply.getId();
+            const senderEmail = extractEmailFromString(reply.getFrom());
+            const assigneeEmail = extractEmailFromString(freshTask.Assignee_Email);
+            const bossEmail = CONFIG.BOSS_EMAIL();
+            
             Logger.log(`\n--- Reply ${index + 1}/${replies.length} ---`);
-            const ingestResult = ingestInboundMessage(reply);
-            if (ingestResult.success) {
-              Logger.log(`  ✓ Ingested message ${ingestResult.messageId} for task ${ingestResult.taskId}`);
-            } else {
-              Logger.log(`  ❌ Ingest failed: ${ingestResult.error || 'unknown error'}`);
+            Logger.log(`  Message ID: ${messageId}`);
+            Logger.log(`  Sender: ${senderEmail}`);
+            
+            // Check if already processed (double-check)
+            const processedIds = getProcessedMessageIds(freshTask.Task_ID);
+            if (processedIds.has(messageId)) {
+              Logger.log(`  Already processed, skipping`);
+              return;
             }
+            
+            const isBoss = senderEmail.toLowerCase() === bossEmail.toLowerCase();
+            const isEmployee = senderEmail.toLowerCase() === assigneeEmail.toLowerCase();
+            
+            if (!isBoss && !isEmployee) {
+              Logger.log(`  Unknown sender, skipping`);
+              return;
+            }
+            
+            // Process the reply
+            if (isBoss) {
+              processBossMessage(freshTask.Task_ID, reply);
+            } else {
+              processReplyEmail(freshTask.Task_ID, reply);
+            }
+            
+            // Mark as processed IMMEDIATELY after processing
+            markMessageAsProcessed(freshTask.Task_ID, messageId);
+            Logger.log(`  ✓ Marked message ${messageId} as processed`);
             
           } catch (error) {
             Logger.log(`  ❌ ERROR processing reply ${index + 1}: ${error.toString()}`);

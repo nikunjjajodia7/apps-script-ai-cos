@@ -765,6 +765,37 @@ function handleProvideClarification(taskId, data) {
   // #endregion
   
   logInteraction(taskId, `Clarification sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+
+  // Immediately record this outgoing boss message in conversation history so it shows up
+  // in the dashboard without waiting for email polling/indexing.
+  try {
+    appendToConversationHistory(taskId, {
+      id: result.messageId || ('sent_' + Date.now()),
+      timestamp: new Date().toISOString(),
+      senderEmail: CONFIG.BOSS_EMAIL(),
+      senderName: CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss',
+      type: 'boss_message',
+      content: data.clarification,
+      messageId: result.messageId || null,
+      metadata: {
+        source: 'dashboard_action',
+        action: 'provide_clarification',
+        threadId: result.threadId || null
+      }
+    });
+  } catch (e) {
+    Logger.log(`Warning: Failed to append clarification to conversation history: ${e.toString()}`);
+  }
+
+  // Re-analyze conversation so Conversation_State/Pending_Changes/AI_Summary stay in sync.
+  try {
+    const analysisResult = analyzeConversationAndUpdateState(taskId);
+    if (!analysisResult || !analysisResult.success) {
+      Logger.log(`Warning: Failed to analyze conversation after clarification: ${(analysisResult && analysisResult.error) || 'unknown error'}`);
+    }
+  } catch (e) {
+    Logger.log(`Warning: Error analyzing conversation after clarification: ${e.toString()}`);
+  }
   
   return { success: true, message: 'Clarification sent' };
 }
@@ -1441,10 +1472,6 @@ function doGet(e) {
           } catch (e) {
             conversationHistory = [];
           }
-        }
-        // Trim list payload: keep only last 3 messages to avoid large responses
-        if (conversationHistory && conversationHistory.length > 3) {
-          conversationHistory = conversationHistory.slice(-3);
         }
         
         // Parse pending changes if available
@@ -2948,16 +2975,48 @@ function appendToConversationHistory(taskId, message) {
       }
     }
     
+    // Normalize message shape and ensure stable IDs for UI + dedupe
+    const safeMessage = {
+      id: message.id || message.messageId || ('msg_' + Date.now()),
+      messageId: message.messageId || null,
+      timestamp: message.timestamp || new Date().toISOString(),
+      senderEmail: message.senderEmail,
+      senderName: message.senderName,
+      type: message.type || 'message',
+      content: message.content || '',
+      metadata: message.metadata || {}
+    };
+
     // Add new message
-    history.push(message);
-    
-    // Limit history to last 50 messages to prevent sheet cell limits
-    if (history.length > 50) {
-      history = history.slice(-50);
+    history.push(safeMessage);
+
+    // Enforce size limits for Google Sheets cell (50k hard limit)
+    const MAX_CELL_CHARS = 45000; // buffer
+    const MAX_MSGS = 30;
+    const MAX_MSG_CONTENT = 500;
+
+    if (history.length > MAX_MSGS) {
+      history = history.slice(-MAX_MSGS);
+    }
+
+    let historyJson = JSON.stringify(history);
+    if (historyJson.length > MAX_CELL_CHARS) {
+      // Truncate message content, then reduce message count if still too large
+      history.forEach(m => {
+        if (m && m.content && m.content.length > MAX_MSG_CONTENT) {
+          m.content = m.content.substring(0, MAX_MSG_CONTENT) + '... [truncated]';
+        }
+      });
+      historyJson = JSON.stringify(history);
+
+      if (historyJson.length > MAX_CELL_CHARS && history.length > 20) {
+        history = history.slice(-20);
+        historyJson = JSON.stringify(history);
+      }
     }
     
     updateTask(taskId, { 
-      Conversation_History: JSON.stringify(history),
+      Conversation_History: historyJson,
       Last_Updated: new Date()
     });
     
@@ -3023,7 +3082,7 @@ function handleSendMessage(taskId, data) {
     let emailBody = `Hello ${assigneeName},\n\n${message}\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
     
     // Send email
-    let result = { success: false, threadId: null };
+    let result = { success: false, threadId: null, messageId: null };
     if (task.Assignee_Email) {
       result = sendEmailToAssignee(
         taskId,
@@ -3038,11 +3097,18 @@ function handleSendMessage(taskId, data) {
     
     // Append to conversation history
     appendToConversationHistory(taskId, {
+      id: result.messageId || ('sent_' + Date.now()),
       timestamp: new Date().toISOString(),
       senderEmail: CONFIG.BOSS_EMAIL(),
       senderName: CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss',
       type: 'boss_message',
-      content: message
+      content: message,
+      messageId: result.messageId || null,
+      metadata: {
+        source: 'dashboard_action',
+        action: 'send_message',
+        threadId: result.threadId || null
+      }
     });
     
     // Re-analyze conversation to update state

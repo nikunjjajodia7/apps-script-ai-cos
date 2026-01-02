@@ -326,15 +326,11 @@ function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
       // Get the last message in thread for In-Reply-To header
       const messages = thread.getMessages();
       const lastMessage = messages[messages.length - 1];
-      const lastMessageId = lastMessage.getId();
       
       try {
-        // Get raw message to extract Message-ID header
-        const rawMessage = Gmail.Users.Messages.get('me', lastMessageId, { format: 'raw' });
-        const messageIdHeader = rawMessage.payload.headers.find(
-          h => h.name.toLowerCase() === 'message-id'
-        );
-        const inReplyTo = messageIdHeader ? messageIdHeader.value : null;
+        // Extract Message-ID header directly from GmailMessage (more reliable than parsing
+        // Gmail API response payload shapes, which can vary and sometimes omit payload.headers).
+        const inReplyTo = lastMessage.getHeader('Message-ID') || null;
         
         // Build email with proper headers for threading
         const emailLines = [
