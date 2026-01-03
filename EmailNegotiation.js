@@ -22,7 +22,15 @@ function processBossMessage(taskId, message) {
     const emailContent = cleanEmailContent(rawEmailContent);
     const messageId = message.getId();
     
-    Logger.log(`Boss message preview: ${emailContent.substring(0, 200)}...`);
+    // Log cleaning results for debugging
+    const cleaningPercent = Math.round((1 - emailContent.length / rawEmailContent.length) * 100);
+    Logger.log(`Raw boss message length: ${rawEmailContent.length} chars`);
+    Logger.log(`Cleaned boss message length: ${emailContent.length} chars (removed ${cleaningPercent}%)`);
+    if (cleaningPercent > 50) {
+      Logger.log(`⚠️ WARNING: More than 50% of boss message was removed during cleaning!`);
+      Logger.log(`Raw content (first 500 chars): ${rawEmailContent.substring(0, 500)}`);
+    }
+    Logger.log(`Boss message preview: ${emailContent.substring(0, 300)}...`);
     
     // Check if we've already processed this message
     const log = task.Interaction_Log || '';
@@ -40,7 +48,7 @@ function processBossMessage(taskId, message) {
     Logger.log(`  Requires employee approval: ${analysis.requiresApproval}`);
     Logger.log(`  Reasoning: ${analysis.reasoning}`);
     
-    // Store boss message in conversation history
+    // Store boss message in conversation history (include raw content for debugging)
     appendToConversationHistory(taskId, {
       id: messageId,
       timestamp: new Date().toISOString(),
@@ -48,6 +56,7 @@ function processBossMessage(taskId, message) {
       senderName: 'Boss',
       type: 'boss_message',
       content: emailContent,
+      rawContent: rawEmailContent, // Store original for debugging if truncation is suspected
       messageId: messageId,
       metadata: {
         hasDateChange: analysis.hasDateChange,
@@ -422,11 +431,21 @@ function processReplyEmail(taskId, message) {
     
     Logger.log(`Sender: ${senderEmail}`);
     Logger.log(`Message ID: ${messageId}`);
-    Logger.log(`Raw email preview: ${rawEmailContent.substring(0, 200)}...`);
+    Logger.log(`Raw email length: ${rawEmailContent.length} chars`);
+    Logger.log(`Raw email preview: ${rawEmailContent.substring(0, 300)}...`);
     
     // Clean email content - remove quoted replies and signatures
     const emailContent = cleanEmailContent(rawEmailContent);
-    Logger.log(`Cleaned email content: ${emailContent.substring(0, 200)}...`);
+    
+    // Log cleaning results for debugging
+    const cleaningPercent = Math.round((1 - emailContent.length / rawEmailContent.length) * 100);
+    Logger.log(`Cleaned email length: ${emailContent.length} chars (removed ${cleaningPercent}%)`);
+    if (cleaningPercent > 50) {
+      Logger.log(`⚠️ WARNING: More than 50% of email content was removed during cleaning!`);
+      Logger.log(`Raw content (first 500 chars): ${rawEmailContent.substring(0, 500)}`);
+      Logger.log(`Cleaned content (first 500 chars): ${emailContent.substring(0, 500)}`);
+    }
+    Logger.log(`Cleaned email preview: ${emailContent.substring(0, 300)}...`);
     
     // Verify sender is the assignee (allow for email variations)
     const assigneeEmail = extractEmailFromString(task.Assignee_Email);
@@ -501,7 +520,7 @@ function processReplyEmail(taskId, message) {
       handleOtherReply(taskId, emailContent, messageId);
     }
     
-    // Append to conversation history
+    // Append to conversation history (include raw content for debugging truncation issues)
     appendToConversationHistory(taskId, {
       id: messageId,
       timestamp: new Date().toISOString(),
@@ -509,6 +528,7 @@ function processReplyEmail(taskId, message) {
       senderName: message.getFrom().match(/^(.+?)\s*</)?.[1] || senderEmail,
       type: 'email_reply',
       content: emailContent,
+      rawContent: rawEmailContent, // Store original for debugging if truncation is suspected
       messageId: messageId,
       metadata: {
         classification: classification.type,
@@ -580,22 +600,53 @@ function extractEmailFromString(emailString) {
 /**
  * Clean email content by removing quoted replies and signatures
  * This ensures we only process the actual reply, not quoted text
+ * 
+ * CONSERVATIVE APPROACH: We prefer to keep too much content rather than lose
+ * important information. Truncation issues are worse than including some quoted text.
  */
 function cleanEmailContent(emailContent) {
   if (!emailContent) return '';
   
+  const originalLength = emailContent.length;
   let cleaned = emailContent;
   
-  // Gmail-style quote patterns (can span multiple lines)
-  // Pattern: "On [date] at [time], [name] <email@domain.com>\nwrote:" or similar
-  // These patterns match the START of a quoted section
+  // MINIMUM CONTENT THRESHOLD: Don't over-truncate
+  // If we would remove more than 80% of content, something is wrong - keep more
+  const MIN_CONTENT_RATIO = 0.2; // Keep at least 20% of original
+  const MIN_CHARS = 50; // Absolute minimum characters to keep
+  
+  // Helper function to check if truncation is too aggressive
+  function isTooAggressive(newContent) {
+    if (newContent.length < MIN_CHARS) return true;
+    if (newContent.length < originalLength * MIN_CONTENT_RATIO) return true;
+    return false;
+  }
+  
+  // Helper function to safely truncate - won't truncate if too aggressive
+  function safeTruncate(content, index) {
+    if (index <= 0) return content;
+    const truncated = content.substring(0, index).trim();
+    if (isTooAggressive(truncated)) {
+      Logger.log(`WARNING: Truncation at index ${index} would be too aggressive (${truncated.length}/${content.length} chars). Keeping original.`);
+      return content;
+    }
+    return truncated;
+  }
+  
+  // ========================================
+  // PHASE 1: Gmail/Email quote detection (STRICT patterns only)
+  // ========================================
+  // These patterns MUST include email address in angle brackets to be reliable
   const gmailQuotePatterns = [
-    // Gmail: "On Sun, 28 Dec 2025 at 12:17 AM, Name <email@domain.com>\nwrote:"
-    /On\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[,\s]+\d{1,2}\s+\w+\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)?[,\s]+[^<]*<[^>]+>[\s\S]*?wrote:/gi,
-    // Gmail variant: "On Dec 28, 2025, at 12:17 AM, Name wrote:"
-    /On\s+\w+\s+\d{1,2},?\s+\d{4},?\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)?[,\s]+[^w]*wrote:/gi,
-    // Generic: "On [any date format] ... wrote:"
-    /On\s+[^]*?wrote:/gi,
+    // Gmail standard: "On Sun, 28 Dec 2025 at 12:17 AM, Name <email@domain.com> wrote:"
+    // Requires: day name, date, time, name, email in <>, "wrote:"
+    /\n\s*On\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*[,\s]+\d{1,2}\s+\w{3,9}\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)?[,\s]+[^<\n]{1,50}<[^>\n]+@[^>\n]+>[^\n]*wrote:/gi,
+    
+    // Gmail variant with different date format: "On 28 Dec 2025, at 12:17, Name <email@domain.com> wrote:"
+    /\n\s*On\s+\d{1,2}\s+\w{3,9}\s+\d{4}[,\s]+at\s+\d{1,2}:\d{2}[,\s]+[^<\n]{1,50}<[^>\n]+@[^>\n]+>[^\n]*wrote:/gi,
+    
+    // Apple Mail: "On Dec 28, 2025, at 12:17 AM, Name <email@domain.com> wrote:"
+    /\n\s*On\s+\w{3,9}\s+\d{1,2},?\s+\d{4},?\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM)?[,\s]+[^<\n]{1,50}<[^>\n]+@[^>\n]+>[^\n]*wrote:/gi,
   ];
   
   // Try each Gmail pattern and cut off at the first match
@@ -604,23 +655,27 @@ function cleanEmailContent(emailContent) {
     if (match) {
       const index = cleaned.indexOf(match[0]);
       if (index > 0) {
-        cleaned = cleaned.substring(0, index).trim();
-        break; // Stop after first successful cut
+        const truncated = safeTruncate(cleaned, index);
+        if (truncated !== cleaned) {
+          Logger.log(`Gmail quote detected at index ${index}, truncating. Pattern: ${match[0].substring(0, 60)}...`);
+          cleaned = truncated;
+          break; // Stop after first successful cut
+        }
       }
     }
   }
   
-  // Additional single-line quote markers
+  // ========================================
+  // PHASE 2: Standard email reply markers (STRICT - must be at line start)
+  // ========================================
   const singleLineMarkers = [
-    /^From:\s*.*$/m,                    // "From: ..."
-    /^-----Original Message-----.*$/m,  // Outlook style
-    /^________________________________.*$/m, // Outlook separator
-    /^_{10,}.*$/m,                      // Multiple underscores
-    /^={10,}.*$/m,                      // Multiple equals signs
-    /^-{10,}.*$/m,                      // Multiple dashes
-    /^Forwarded message.*$/mi,          // Forwarded message header
-    /^Begin forwarded message.*$/mi,    // Apple Mail forward
-    /^\*From:\*.*$/m,                   // Bold From (some clients)
+    /^\s*From:\s+[^\n]+\nSent:\s+[^\n]+\nTo:/m,  // Outlook full header block
+    /^\s*-----\s*Original Message\s*-----/mi,    // Outlook style (with word boundaries)
+    /^\s*_{20,}/m,                               // 20+ underscores (separator line)
+    /^\s*={20,}/m,                               // 20+ equals signs
+    /^\s*-{20,}/m,                               // 20+ dashes (more than a simple dash)
+    /^\s*-+\s*Forwarded message\s*-+/mi,         // Forwarded message header
+    /^\s*Begin forwarded message:/mi,            // Apple Mail forward
   ];
   
   for (const marker of singleLineMarkers) {
@@ -628,40 +683,99 @@ function cleanEmailContent(emailContent) {
     if (match) {
       const index = cleaned.indexOf(match[0]);
       if (index > 0) {
-        cleaned = cleaned.substring(0, index).trim();
+        const truncated = safeTruncate(cleaned, index);
+        if (truncated !== cleaned) {
+          Logger.log(`Email marker detected at index ${index}: ${match[0].substring(0, 30)}...`);
+          cleaned = truncated;
+        }
       }
     }
   }
   
-  // Remove lines starting with ">" (standard email quote)
-  cleaned = cleaned.split('\n')
-    .filter(line => !line.trim().startsWith('>'))
-    .join('\n');
+  // ========================================
+  // PHASE 3: Remove lines starting with ">" (standard email quote)
+  // But only remove if there are multiple consecutive quoted lines
+  // ========================================
+  const lines = cleaned.split('\n');
+  const cleanedLines = [];
+  let consecutiveQuotedLines = 0;
   
-  // Remove email signatures (common patterns)
-  // These patterns match from the signature start to the end of the content
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const isQuoted = line.trim().startsWith('>');
+    
+    if (isQuoted) {
+      consecutiveQuotedLines++;
+      // Only skip if we have 2+ consecutive quoted lines (indicates real quoting)
+      if (consecutiveQuotedLines >= 2) {
+        continue; // Skip this quoted line
+      }
+      // For single quoted lines, check if it's really a quote or just someone using ">"
+      // If next line is also quoted, skip this one too
+      if (i + 1 < lines.length && lines[i + 1].trim().startsWith('>')) {
+        continue;
+      }
+    } else {
+      consecutiveQuotedLines = 0;
+    }
+    
+    cleanedLines.push(line);
+  }
+  cleaned = cleanedLines.join('\n');
+  
+  // ========================================
+  // PHASE 4: Signature detection (CONSERVATIVE)
+  // Only match signatures that:
+  // 1. Are preceded by a blank line (paragraph break)
+  // 2. Are near the end of the email (last 30% of content)
+  // ========================================
   const signaturePatterns = [
-    /\n\n--\s*\n[\s\S]*$/,              // Standard signature delimiter "--"
-    /\nBest regards,[\s\S]*$/i,
-    /\nKind regards,[\s\S]*$/i,
-    /\nRegards,[\s\S]*$/i,
-    /\nThanks,[\s\S]*$/i,
-    /\nThank you,[\s\S]*$/i,
-    /\nSincerely,[\s\S]*$/i,
-    /\nCheers,[\s\S]*$/i,
-    /\nSent from my [\s\S]*$/i,         // Mobile signatures
-    /\nGet Outlook[\s\S]*$/i,           // Outlook mobile
-    /\nSent from Mail[\s\S]*$/i,        // Apple Mail
+    // Standard signature delimiter: blank line + "--" + blank line + signature
+    { pattern: /\n\n--\s*\n[\s\S]{0,500}$/, name: 'standard --' },
+    
+    // Common closings - must be preceded by blank line AND be short (closing only)
+    // These should only match if followed by a name/signature, not more content
+    { pattern: /\n\n(?:Best regards|Kind regards|Warm regards),?\s*\n[^\n]{0,50}\n?[\s\S]{0,200}$/i, name: 'regards' },
+    { pattern: /\n\n(?:Sincerely|Yours sincerely),?\s*\n[^\n]{0,50}\n?[\s\S]{0,200}$/i, name: 'sincerely' },
+    { pattern: /\n\nCheers,?\s*\n[^\n]{0,50}\n?[\s\S]{0,200}$/i, name: 'cheers' },
+    
+    // Mobile signatures - these are reliable indicators
+    { pattern: /\n\nSent from my (?:iPhone|iPad|Android|Galaxy|Pixel|Mobile)[^\n]*$/i, name: 'mobile' },
+    { pattern: /\n\nGet Outlook for (?:iOS|Android)[^\n]*$/i, name: 'outlook mobile' },
+    { pattern: /\n\nSent from Mail for Windows[^\n]*$/i, name: 'mail windows' },
   ];
   
-  for (const pattern of signaturePatterns) {
-    cleaned = cleaned.replace(pattern, '');
+  for (const { pattern, name } of signaturePatterns) {
+    const match = cleaned.match(pattern);
+    if (match) {
+      // Check if match is in the last 30% of the content
+      const matchIndex = cleaned.indexOf(match[0]);
+      const isNearEnd = matchIndex > cleaned.length * 0.7;
+      
+      if (isNearEnd) {
+        const truncated = cleaned.replace(pattern, '');
+        if (!isTooAggressive(truncated)) {
+          Logger.log(`Signature detected (${name}) at ${matchIndex}/${cleaned.length} chars`);
+          cleaned = truncated;
+        }
+      }
+    }
   }
   
-  // Clean up excessive whitespace
+  // ========================================
+  // PHASE 5: Clean up whitespace
+  // ========================================
   cleaned = cleaned
-    .replace(/\n{3,}/g, '\n\n')  // Replace 3+ newlines with 2
+    .replace(/\n{4,}/g, '\n\n\n')  // Replace 4+ newlines with 3 (preserve some structure)
     .trim();
+  
+  // ========================================
+  // FINAL CHECK: Log if we removed significant content
+  // ========================================
+  const removedPercent = Math.round((1 - cleaned.length / originalLength) * 100);
+  if (removedPercent > 30) {
+    Logger.log(`NOTE: cleanEmailContent removed ${removedPercent}% of content (${originalLength} → ${cleaned.length} chars)`);
+  }
   
   return cleaned;
 }
@@ -1630,6 +1744,178 @@ function checkForReplies() {
     Logger.log(`ERROR in checkForReplies: ${error.toString()}`);
     Logger.log(`Stack: ${error.stack}`);
     logError(ERROR_TYPE.UNKNOWN_ERROR, 'checkForReplies', error.toString(), null, error.stack);
+  }
+}
+
+// ============================================
+// DEBUG FUNCTIONS
+// ============================================
+
+/**
+ * Debug function: Compare raw vs cleaned content in conversation history
+ * Helps identify if truncation is causing issues
+ * Usage: debugConversationContent('TASK-20251222235746')
+ */
+function debugConversationContent(taskId) {
+  try {
+    Logger.log(`=== Debug Conversation Content for Task: ${taskId} ===\n`);
+    
+    if (!taskId) {
+      Logger.log('ERROR: No task ID provided');
+      Logger.log('Usage: debugConversationContent("TASK-20251222235746")');
+      return;
+    }
+    
+    const task = getTask(taskId);
+    if (!task) {
+      Logger.log(`ERROR: Task ${taskId} not found`);
+      return;
+    }
+    
+    Logger.log(`Task: ${task.Task_Name}`);
+    Logger.log(`Assignee: ${task.Assignee_Email}`);
+    Logger.log(`Status: ${task.Status}\n`);
+    
+    // Parse conversation history
+    let history = [];
+    if (task.Conversation_History) {
+      try {
+        history = JSON.parse(task.Conversation_History);
+      } catch (e) {
+        Logger.log(`ERROR: Could not parse Conversation_History`);
+        return;
+      }
+    }
+    
+    if (history.length === 0) {
+      Logger.log('No conversation history found');
+      return;
+    }
+    
+    Logger.log(`Found ${history.length} messages in conversation history:\n`);
+    Logger.log('═══════════════════════════════════════════════════════════════\n');
+    
+    history.forEach((msg, idx) => {
+      Logger.log(`--- Message ${idx + 1} ---`);
+      Logger.log(`Type: ${msg.type || 'unknown'}`);
+      Logger.log(`Sender: ${msg.senderName || msg.senderEmail || 'unknown'}`);
+      Logger.log(`Timestamp: ${msg.timestamp || 'unknown'}`);
+      Logger.log(`Message ID: ${msg.messageId || 'none'}`);
+      
+      const cleanedLength = (msg.content || '').length;
+      const rawLength = (msg.rawContent || msg.content || '').length;
+      
+      Logger.log(`Content length: ${cleanedLength} chars`);
+      
+      if (msg.rawContent && msg.rawContent !== msg.content) {
+        const removedPercent = Math.round((1 - cleanedLength / rawLength) * 100);
+        Logger.log(`⚠️ RAW content available: ${rawLength} chars (${removedPercent}% was cleaned)`);
+        
+        if (msg.metadata && msg.metadata.wasContentCleaned) {
+          Logger.log(`   Original: ${msg.metadata.originalLength} chars`);
+          Logger.log(`   Cleaned: ${msg.metadata.cleanedLength} chars`);
+        }
+        
+        Logger.log(`\n--- CLEANED CONTENT ---`);
+        Logger.log(msg.content);
+        
+        Logger.log(`\n--- RAW CONTENT ---`);
+        Logger.log(msg.rawContent);
+        
+        Logger.log(`\n--- DIFFERENCE (what was removed) ---`);
+        // Show a simple diff by finding what's in raw but not in cleaned
+        const cleanedLower = (msg.content || '').toLowerCase();
+        const rawLines = (msg.rawContent || '').split('\n');
+        const removedLines = rawLines.filter(line => 
+          line.trim() && !cleanedLower.includes(line.toLowerCase().trim().substring(0, 20))
+        );
+        if (removedLines.length > 0) {
+          Logger.log(removedLines.join('\n'));
+        } else {
+          Logger.log('[Content was cleaned but individual removed lines not identifiable]');
+        }
+      } else {
+        Logger.log(`\n--- CONTENT ---`);
+        Logger.log(msg.content || '[empty]');
+      }
+      
+      Logger.log('\n═══════════════════════════════════════════════════════════════\n');
+    });
+    
+    Logger.log('=== Debug Complete ===');
+    
+  } catch (error) {
+    Logger.log(`ERROR: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
+  }
+}
+
+/**
+ * Debug function: Re-analyze the raw content of a specific message
+ * If truncation caused issues, this lets you manually view the raw email
+ * Usage: debugRawEmailForTask('TASK-20251222235746')
+ */
+function debugRawEmailForTask(taskId) {
+  try {
+    Logger.log(`=== Debug Raw Email for Task: ${taskId} ===\n`);
+    
+    if (!taskId) {
+      Logger.log('ERROR: No task ID provided');
+      return;
+    }
+    
+    const task = getTask(taskId);
+    if (!task) {
+      Logger.log(`ERROR: Task ${taskId} not found`);
+      return;
+    }
+    
+    // Find email thread
+    const thread = findTaskEmailThread(taskId);
+    if (!thread) {
+      Logger.log('ERROR: No email thread found for this task');
+      return;
+    }
+    
+    Logger.log(`Thread: ${thread.getFirstMessageSubject()}`);
+    
+    const messages = thread.getMessages();
+    Logger.log(`Total messages in thread: ${messages.length}\n`);
+    
+    messages.forEach((msg, idx) => {
+      const senderEmail = extractEmailFromString(msg.getFrom());
+      const rawBody = msg.getPlainBody();
+      const cleanedBody = cleanEmailContent(rawBody);
+      const removedPercent = Math.round((1 - cleanedBody.length / rawBody.length) * 100);
+      
+      Logger.log(`\n--- Email ${idx + 1} ---`);
+      Logger.log(`From: ${msg.getFrom()}`);
+      Logger.log(`Date: ${msg.getDate()}`);
+      Logger.log(`Subject: ${msg.getSubject()}`);
+      Logger.log(`Message ID: ${msg.getId()}`);
+      Logger.log(`Raw length: ${rawBody.length} chars`);
+      Logger.log(`Cleaned length: ${cleanedBody.length} chars`);
+      Logger.log(`Removed: ${removedPercent}%`);
+      
+      if (removedPercent > 30) {
+        Logger.log(`\n⚠️ SIGNIFICANT CONTENT REMOVED (${removedPercent}%)\n`);
+        Logger.log(`--- RAW BODY ---`);
+        Logger.log(rawBody);
+        Logger.log(`\n--- CLEANED BODY ---`);
+        Logger.log(cleanedBody);
+      } else {
+        Logger.log(`\n--- CLEANED BODY (preview) ---`);
+        Logger.log(cleanedBody.substring(0, 500) + (cleanedBody.length > 500 ? '...' : ''));
+      }
+      
+      Logger.log('\n─────────────────────────────────────────────────');
+    });
+    
+    Logger.log('\n=== Debug Complete ===');
+    
+  } catch (error) {
+    Logger.log(`ERROR: ${error.toString()}`);
+    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
   }
 }
 

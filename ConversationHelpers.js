@@ -120,7 +120,7 @@ function _normalizeConversationEvent_(message) {
   const messageId = msg.messageId || msg.id || `local_${Date.now()}`;
   const timestamp = msg.timestamp || nowIso;
 
-  return {
+  const normalized = {
     id: msg.id || messageId,
     messageId: messageId,
     timestamp: timestamp,
@@ -130,6 +130,19 @@ function _normalizeConversationEvent_(message) {
     content: msg.content || '',
     metadata: msg.metadata || {}
   };
+  
+  // Store raw content separately if provided (for debugging truncation issues)
+  // This allows us to compare what was received vs what was cleaned
+  if (msg.rawContent && msg.rawContent !== msg.content) {
+    normalized.rawContent = msg.rawContent;
+    // Add flag indicating content was cleaned
+    normalized.metadata = normalized.metadata || {};
+    normalized.metadata.wasContentCleaned = true;
+    normalized.metadata.originalLength = msg.rawContent.length;
+    normalized.metadata.cleanedLength = (msg.content || '').length;
+  }
+  
+  return normalized;
 }
 
 function _makeSnippet_(text) {

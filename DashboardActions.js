@@ -2996,6 +2996,81 @@ function handleSendMessage(taskId, data) {
         subject: subject
       }
     });
+
+    // -------------------------------------------------------------
+    // Deterministic canonical apply: employee-requested due date
+    // When the boss uses the generic "send_message" pathway to approve a
+    // requested due date, we should update Due_Date immediately so the
+    // task card reflects the new effective due date (even if AI parsing
+    // is uncertain).
+    // Guard: do NOT auto-apply if we are in a boss-proposed flow awaiting
+    // employee confirmation.
+    // -------------------------------------------------------------
+    try {
+      // Parse existing pending changes
+      let pending = [];
+      try {
+        pending = task.Pending_Changes ? JSON.parse(task.Pending_Changes) : [];
+      } catch (e) {
+        pending = [];
+      }
+
+      const pendingDue = (pending || []).find(c =>
+        c && c.parameter === 'dueDate' && c.requestedBy === 'employee'
+      );
+
+      // Simple approval intent detection
+      const lower = String(message || '').toLowerCase();
+      const looksApproved =
+        (/\b(approved|approve|ok|okay|agreed|yes|sounds good|confirmed)\b/.test(lower)) &&
+        !(/\b(not approved|don'?t approve|cannot|can't|no)\b/.test(lower));
+
+      // Boss-proposed pending decision guard
+      let pendingDecision = null;
+      try {
+        pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
+      } catch (e) {
+        pendingDecision = null;
+      }
+      const isBossProposedAwaitingEmployee =
+        pendingDecision &&
+        pendingDecision.awaitingFrom === 'employee' &&
+        pendingDecision.requestedBy === 'boss' &&
+        pendingDecision.type === 'date_change';
+
+      if (pendingDue && looksApproved && !isBossProposedAwaitingEmployee) {
+        // Prefer an explicit date in the boss message; otherwise use pending proposed value
+        let newDueDate = null;
+        try {
+          const extracted = extractDateFromText(message);
+          if (extracted && /^\d{4}-\d{2}-\d{2}$/.test(extracted)) newDueDate = extracted;
+        } catch (e) {
+          newDueDate = null;
+        }
+
+        if (!newDueDate) {
+          const pv = (pendingDue.proposedValue || task.Proposed_Date || '').toString().trim();
+          if (/^\d{4}-\d{2}-\d{2}$/.test(pv)) newDueDate = pv;
+        }
+
+        if (newDueDate) {
+          updateTask(taskId, {
+            Due_Date: newDueDate,
+            Proposed_Date: '',
+            Pending_Changes: '',
+            Pending_Decision: '',
+            Conversation_State: CONVERSATION_STATE.RESOLVED,
+            // Ensure task card updates immediately (it prefers derived effective due date)
+            Derived_Due_Date_Effective: newDueDate,
+            Derived_Due_Date_Proposed: '',
+            Last_Updated: new Date()
+          });
+          logInteraction(taskId, `Auto-applied employee-requested due date approval via send_message. Due date updated to ${newDueDate}`);
+        }
+      }
+    } catch (e) {
+      Logger.log('Warning: send_message auto-apply failed: ' + e.toString());
+    }
     
     // Re-analyze conversation to update state
     const analysisResult = analyzeConversationAndUpdateState(taskId);
