@@ -756,7 +756,12 @@ function createAllSheets() {
     'Progress_Update', 'Progress_Percentage', 'Last_Progress_Update',
     'Last_Boss_Message', 'Last_Employee_Message', 'Message_Count', 'Negotiation_History',
     'Initial_Parameters',
-    'Primary_Thread_ID', 'Processed_Message_IDs', 'Last_Reply_Check'
+    'Primary_Thread_ID', 'Processed_Message_IDs', 'Last_Reply_Check',
+    // AI-derived truth snapshot (conversation-as-truth)
+    'Derived_Task_Name', 'Derived_Due_Date_Effective', 'Derived_Due_Date_Proposed',
+    'Derived_Scope_Summary', 'Derived_Field_Provenance', 'Derived_Last_Analyzed_At',
+    // Cheap last-message summary fields (for Task Card snippet)
+    'Last_Message_Timestamp', 'Last_Message_Sender', 'Last_Message_Snippet'
   ];
   
   if (!tasksSheet) {

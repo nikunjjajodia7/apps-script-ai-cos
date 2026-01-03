@@ -268,84 +268,6 @@ function handleBossDateChange(taskId, newDate, bossMessage, messageId) {
   }
 }
 
-/**
- * Append message to conversation history
- */
-function appendToConversationHistory(taskId, message) {
-  try {
-    const task = getTask(taskId);
-    let history = [];
-    
-    // Parse existing conversation history
-    if (task.Conversation_History) {
-      try {
-        history = JSON.parse(task.Conversation_History);
-      } catch (e) {
-        Logger.log('Error parsing conversation history: ' + e.toString());
-      }
-    }
-    
-    // Check for duplicates
-    const isDuplicate = history.some(m => 
-      m.messageId === message.messageId || 
-      (m.content === message.content && Math.abs(new Date(m.timestamp) - new Date(message.timestamp)) < 1000)
-    );
-    
-    if (!isDuplicate) {
-      history.push(message);
-      
-      // Keep only last 30 messages to avoid storage bloat AND cell size limits
-      if (history.length > 30) {
-        history = history.slice(-30);
-        Logger.log(`Conversation history truncated to last 30 messages`);
-      }
-      
-      // Check size before updating (Google Sheets limit is 50,000 characters)
-      let historyJson = JSON.stringify(history);
-      if (historyJson.length > 45000) { // Leave buffer
-        // Truncate further - keep only last 20 messages
-        history = history.slice(-20);
-        Logger.log(`Conversation history truncated to last 20 messages due to size limit`);
-        
-        historyJson = JSON.stringify(history);
-        
-        // Also truncate individual message content if still too large
-        if (historyJson.length > 45000) {
-          history.forEach(msg => {
-            if (msg.content && msg.content.length > 500) {
-              msg.content = msg.content.substring(0, 500) + '... [truncated]';
-            }
-          });
-          historyJson = JSON.stringify(history);
-        }
-      }
-      
-      // Update message count and timestamps
-      const updateData = {
-        Conversation_History: historyJson,
-        Message_Count: history.length,
-        Last_Updated: new Date()
-      };
-      
-      // Update appropriate timestamp
-      if (message.type === 'boss_message') {
-        updateData.Last_Boss_Message = message.timestamp;
-      } else if (message.type === 'email_reply' || message.type === 'employee_reply') {
-        updateData.Last_Employee_Message = message.timestamp;
-      }
-      
-      updateTask(taskId, updateData);
-      
-      Logger.log(`Message appended to conversation history for task ${taskId}`);
-    } else {
-      Logger.log(`Duplicate message detected, skipping: ${message.messageId}`);
-    }
-    
-  } catch (error) {
-    Logger.log(`Error appending to conversation history: ${error.toString()}`);
-  }
-}
-
 // ============================================
 // ⭐⭐ REPROCESS TASK REPLY - START HERE ⭐⭐
 // ============================================
@@ -409,42 +331,47 @@ function onGmailReply(e) {
     const message = e.message;
     const thread = message.getThread();
     const subject = message.getSubject();
-    
-    // Check if this is a reply to a task assignment
-    if (!subject.includes('Task Assignment:')) {
-      return;
+    const body = message.getPlainBody ? message.getPlainBody() : '';
+
+    // Prefer strict correlation via Task ID marker in body (more reliable than subject matching)
+    let taskId = extractTaskIdFromEmailBody_(body);
+    let task = taskId ? getTask(taskId) : null;
+
+    // Fallback: correlate by Primary_Thread_ID (thread id)
+    if (!task && thread) {
+      const threadId = thread.getId();
+      const matches = findRowsByCondition(SHEETS.TASKS_DB, t => t.Primary_Thread_ID && String(t.Primary_Thread_ID) === String(threadId));
+      if (matches && matches.length) {
+        task = matches[0];
+        taskId = task.Task_ID;
+      }
     }
     
-    // Extract task name from subject
-    const taskNameMatch = subject.match(/Task Assignment: (.+)/);
-    if (!taskNameMatch) {
+    // Legacy fallback: subject-based correlation (deprecated, kept for backwards compatibility)
+    if (!task) {
+      if (!subject.includes('Task Assignment:')) {
+        return;
+      }
+      const taskNameMatch = subject.match(/Task Assignment: (.+)/);
+      if (!taskNameMatch) {
+        return;
+      }
+      const taskName = taskNameMatch[1];
+      const tasks = findRowsByCondition(SHEETS.TASKS_DB, t => t.Task_Name === taskName);
+      if (!tasks.length) {
+        Logger.log(`No task found for reply (legacy subject match): ${taskName}`);
+        return;
+      }
+      task = tasks[0];
+      taskId = task.Task_ID;
+    }
+
+    // Dedupe using Processed_Message_IDs (canonical)
+    const messageId = message.getId();
+    if (!markMessageAsProcessed(taskId, messageId)) {
+      Logger.log(`Message ${messageId} already processed for task ${taskId}, skipping`);
       return;
     }
-    
-    const taskName = taskNameMatch[1];
-    
-    // Find task by name - expanded to include review statuses
-    const tasks = findRowsByCondition(SHEETS.TASKS_DB, task => 
-      task.Task_Name === taskName && 
-      (task.Status === TASK_STATUS.NOT_ACTIVE || 
-       task.Status === TASK_STATUS.ON_TIME || 
-       task.Status === TASK_STATUS.SLOW_PROGRESS ||
-       task.Status === TASK_STATUS.REVIEW_DATE ||
-       task.Status === TASK_STATUS.REVIEW_DATE_BOSS_APPROVED ||
-       task.Status === TASK_STATUS.REVIEW_DATE_BOSS_REJECTED ||
-       task.Status === TASK_STATUS.REVIEW_DATE_BOSS_PROPOSED ||
-       task.Status === TASK_STATUS.REVIEW_SCOPE ||
-       task.Status === TASK_STATUS.REVIEW_SCOPE_CLARIFIED ||
-       task.Status === TASK_STATUS.REVIEW_ROLE)
-    );
-    
-    if (tasks.length === 0) {
-      Logger.log(`No task found for reply: ${taskName}`);
-      return;
-    }
-    
-    const task = tasks[0]; // Use first match
-    const taskId = task.Task_ID;
     
     // Determine if message is from boss or employee
     const senderEmail = extractEmailFromString(message.getFrom());
@@ -467,6 +394,12 @@ function onGmailReply(e) {
   } catch (error) {
     logError(ERROR_TYPE.UNKNOWN_ERROR, 'onGmailReply', error.toString(), null, error.stack);
   }
+}
+
+function extractTaskIdFromEmailBody_(body) {
+  if (!body) return null;
+  const match = String(body).match(/Task ID:\s*(TASK-\d{8,})/i);
+  return match ? match[1].trim() : null;
 }
 
 /**

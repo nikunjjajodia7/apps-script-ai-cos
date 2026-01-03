@@ -10,6 +10,7 @@ cp ../apps-script/SheetsHelper.gs ./SheetsHelper.js
 cp ../apps-script/VoiceIngestion.gs ./VoiceIngestion.js
 cp ../apps-script/EmailNegotiation.gs ./EmailNegotiation.js
 cp ../apps-script/DashboardActions.gs ./DashboardActions.js
+cp ../apps-script/ConversationHelpers.gs ./ConversationHelpers.js
 cp ../apps-script/Code.gs ./Code.js
 cp ../apps-script/MeetingIntelligence.gs ./MeetingIntelligence.js
 cp ../apps-script/CalendarHelper.gs ./CalendarHelper.js

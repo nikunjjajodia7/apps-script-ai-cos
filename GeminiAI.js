@@ -1816,11 +1816,14 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
     // Add new message if provided
     if (newMessage) {
       conversationHistory.push({
+        id: newMessage.id || newMessage.messageId || `local_${Date.now()}`,
+        messageId: newMessage.messageId || newMessage.id || `local_${Date.now()}`,
         timestamp: newMessage.timestamp || new Date().toISOString(),
         senderEmail: newMessage.senderEmail,
         senderName: newMessage.senderName || newMessage.senderEmail,
         type: newMessage.type || 'message',
-        content: newMessage.content
+        content: newMessage.content,
+        metadata: newMessage.metadata || {}
       });
     }
     
@@ -1833,38 +1836,6 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
         type: 'employee_reply',
         content: task.Employee_Reply
       });
-    }
-
-    // ------------------------------------------------------------------
-    // Guardrail: keep Conversation_History safely under Google Sheets cell limits
-    // (50,000 characters). This function runs frequently; never allow it to fail
-    // state updates due to oversized conversation history.
-    // ------------------------------------------------------------------
-    const MAX_CELL_CHARS = 45000; // leave buffer under 50k hard limit
-    const MAX_MSGS = 30;
-    const MAX_MSG_CONTENT = 500;
-
-    // Keep only last N messages by default
-    if (conversationHistory.length > MAX_MSGS) {
-      conversationHistory = conversationHistory.slice(-MAX_MSGS);
-    }
-
-    // If still too large, truncate message contents and reduce message count further
-    let historyJson = JSON.stringify(conversationHistory);
-    if (historyJson.length > MAX_CELL_CHARS) {
-      // First pass: truncate long message bodies
-      conversationHistory.forEach(msg => {
-        if (msg && msg.content && msg.content.length > MAX_MSG_CONTENT) {
-          msg.content = msg.content.substring(0, MAX_MSG_CONTENT) + '... [truncated]';
-        }
-      });
-      historyJson = JSON.stringify(conversationHistory);
-
-      // Second pass: reduce message count
-      if (historyJson.length > MAX_CELL_CHARS && conversationHistory.length > 20) {
-        conversationHistory = conversationHistory.slice(-20);
-        historyJson = JSON.stringify(conversationHistory);
-      }
     }
     
     // If no conversation, default to active state
@@ -1881,7 +1852,13 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
         Conversation_State: result.conversationState,
         Pending_Changes: JSON.stringify(result.pendingChanges),
         AI_Summary: result.summary,
-        Conversation_History: JSON.stringify(conversationHistory)
+        Conversation_History: JSON.stringify(conversationHistory),
+        Derived_Task_Name: task.Task_Name || '',
+        Derived_Due_Date_Effective: task.Due_Date || '',
+        Derived_Due_Date_Proposed: task.Proposed_Date || '',
+        Derived_Scope_Summary: task.Context_Hidden || '',
+        Derived_Field_Provenance: JSON.stringify({}),
+        Derived_Last_Analyzed_At: new Date().toISOString()
       });
       
       return { success: true, data: result };
@@ -1894,7 +1871,8 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
         const isBoss = msg.senderEmail && msg.senderEmail.toLowerCase() === bossEmail.toLowerCase();
         const sender = isBoss ? 'Boss' : (msg.senderName || 'Employee');
         const timestamp = msg.timestamp ? new Date(msg.timestamp).toLocaleString() : `Message ${idx + 1}`;
-        return `[${timestamp}] ${sender}: ${msg.content}`;
+        const msgId = msg.messageId || msg.id || '';
+        return `[${timestamp}]${msgId ? ` [id:${msgId}]` : ''} ${sender}: ${msg.content}`;
       })
       .join('\n\n');
     
@@ -1910,7 +1888,17 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
     const initialDueDate = initialParams.dueDate ? 
       Utilities.formatDate(new Date(initialParams.dueDate), tz, 'yyyy-MM-dd') : 'Not set';
     
-    const prompt = `You are analyzing a conversation between a boss and employee about a task to determine the current state.
+    // Relationship context (minimal): helps AI label requestedBy/awaitingFrom deterministically
+    const staff = task.Assignee_Email ? getStaff(task.Assignee_Email) : null;
+    const project = task.Project_Tag ? getProject(task.Project_Tag) : null;
+    const relationshipContext = `RELATIONSHIP CONTEXT (use this to set requestedBy/awaitingFrom):
+- Boss email: ${bossEmail || 'unknown'}
+- Assignee email: ${task.Assignee_Email || 'unknown'}
+- Assignee manager email (from Staff_DB): ${(staff && staff.Manager_Email) || 'unknown'}
+- Project tag: ${task.Project_Tag || 'none'}
+- Project team lead email (from Projects_DB): ${(project && project.Team_Lead_Email) || 'unknown'}`;
+
+    const prompt = `You are analyzing a conversation between a boss and employee about a task. Your job is to produce an AI-derived "truth snapshot" of the task plus a typed list of pending items.
 
 TASK INFORMATION:
 - Task Name: "${task.Task_Name}"
@@ -1919,6 +1907,8 @@ TASK INFORMATION:
 - Initial Due Date: ${initialDueDate}
 - Current Status: ${task.Status}
 - Scope/Description: ${task.Context_Hidden || 'Not provided'}
+
+${relationshipContext}
 
 CONVERSATION HISTORY (chronological order):
 ${conversationText}
@@ -1940,13 +1930,30 @@ ANALYZE THE CONVERSATION AND DETERMINE:
    - "resolved" - Issue/request was resolved
    - "rejected" - Boss rejected a request (conversation may continue if employee replies)
 
-2. PENDING CHANGES - What changes is the employee requesting (if any)?
-   Only include ACTIVE requests that haven't been resolved yet.
-   For each change: parameter, currentValue, proposedValue, reasoning
+2. PENDING ITEMS (typed) - What changes/decisions are pending (date/scope/task name/etc.)?
+   Only include ACTIVE items that haven't been resolved yet.
+   Each item MUST include:
+   - parameter (dueDate/scope/taskName/assignee/etc.)
+   - changeType (date_change/scope_change/scope_addition/etc.)
+   - currentValue, proposedValue
+   - requestedBy (boss/employee)
+   - awaitingFrom (boss/employee/none)
+   - requiresApproval (true/false)
+   - status (pending/approved/rejected/confirmed) [minimal subset ok]
+   - reasoning (short)
 
 3. SUMMARY - One sentence summary of the current conversation state
 
 4. REQUIRES ACTION - Does the boss need to take action right now?
+
+5. TASK SNAPSHOT (derived truth)
+   - taskName
+   - dueDateEffective (nullable; ISO yyyy-MM-dd)
+   - dueDateProposed (nullable; ISO yyyy-MM-dd)
+   - scopeSummary (short)
+
+6. PROVENANCE (per derived field)
+   For each: sourceMessageId (use [id:...] from conversation), sourceSnippet, confidence (0-1), extractedAt (ISO)
 
 IMPORTANT RULES:
 - If boss rejected something and employee hasn't replied since, state should be "awaiting_employee" or "rejected"
@@ -1954,6 +1961,7 @@ IMPORTANT RULES:
 - If employee explicitly requested a date/scope/role change, state is "change_requested"
 - If employee said the task is done/complete, state is "completion_pending"
 - Look at the FULL conversation, not just the last message
+- If a message is ambiguous (e.g., "push it by a bit") and you cannot extract an explicit date with high confidence, DO NOT change dueDateEffective; instead add a pending item that requests clarification.
 
 Return ONLY valid JSON:
 {
@@ -1962,14 +1970,31 @@ Return ONLY valid JSON:
     {
       "id": "change_1",
       "parameter": "dueDate",
+      "changeType": "date_change",
       "currentValue": "2025-01-15",
       "proposedValue": "2025-01-25",
+      "requestedBy": "employee",
+      "awaitingFrom": "boss",
+      "requiresApproval": true,
+      "status": "pending",
       "reasoning": "Employee requested extension due to dependencies"
     }
   ],
   "summary": "Employee requested 10-day extension due to upstream dependencies.",
   "requiresAction": true,
-  "actionSuggestion": "Approve or reject the date change request"
+  "actionSuggestion": "Approve or reject the date change request",
+  "taskSnapshot": {
+    "taskName": "Q1 Metrics Summary Deck",
+    "dueDateEffective": "2026-01-10",
+    "dueDateProposed": "2026-01-15",
+    "scopeSummary": "Create a concise metrics summary deck and include a summary slide."
+  },
+  "provenance": {
+    "taskName": { "sourceMessageId": "abc123", "sourceSnippet": "Rename this to: Q1 Metrics Summary Deck", "confidence": 0.8, "extractedAt": "2026-01-03T00:00:00.000Z" },
+    "dueDateEffective": { "sourceMessageId": "def456", "sourceSnippet": "Approved. New due date is Jan 15.", "confidence": 0.8, "extractedAt": "2026-01-03T00:00:00.000Z" },
+    "dueDateProposed": { "sourceMessageId": "ghi789", "sourceSnippet": "Can we move it to Jan 15?", "confidence": 0.8, "extractedAt": "2026-01-03T00:00:00.000Z" },
+    "scopeSummary": { "sourceMessageId": "jkl012", "sourceSnippet": "Also add a summary slide with key metrics.", "confidence": 0.8, "extractedAt": "2026-01-03T00:00:00.000Z" }
+  }
 }`;
 
     const response = callGeminiPro(prompt, { temperature: 0.2 });
@@ -2030,12 +2055,53 @@ Return ONLY valid JSON:
       analysis.summary = analysis.summary || 'Awaiting employee confirmation on proposed change.';
     }
     
-    // Update task with analyzed state
+    // -----------------------------
+    // Derived truth snapshot write
+    // -----------------------------
+    const nowIso = new Date().toISOString();
+    const prevSnapshot = {
+      taskName: task.Derived_Task_Name || task.Task_Name || '',
+      dueDateEffective: task.Derived_Due_Date_Effective || task.Due_Date || null,
+      dueDateProposed: task.Derived_Due_Date_Proposed || task.Proposed_Date || null,
+      scopeSummary: task.Derived_Scope_Summary || task.Context_Hidden || ''
+    };
+
+    const extractedSnapshot = (analysis && analysis.taskSnapshot) ? analysis.taskSnapshot : {};
+    const extractedProv = (analysis && analysis.provenance) ? analysis.provenance : {};
+    let existingProv = {};
+    try {
+      existingProv = task.Derived_Field_Provenance ? JSON.parse(task.Derived_Field_Provenance) : {};
+    } catch (e) {
+      existingProv = {};
+    }
+    const mergedProv = Object.assign({}, existingProv || {}, extractedProv || {});
+
+    // No-silent-overwrite guardrail: keep prior value if confidence is low/unknown
+    function chooseField(fieldName, extractedValue, prevValue) {
+      const prov = extractedProv && extractedProv[fieldName] ? extractedProv[fieldName] : null;
+      const conf = prov && typeof prov.confidence === 'number' ? prov.confidence : null;
+      if (extractedValue === undefined || extractedValue === null || extractedValue === '') return prevValue;
+      if (conf !== null && conf < 0.6) return prevValue;
+      return extractedValue;
+    }
+
+    const derivedTaskName = chooseField('taskName', extractedSnapshot.taskName, prevSnapshot.taskName);
+    const derivedDueDateEffective = chooseField('dueDateEffective', extractedSnapshot.dueDateEffective, prevSnapshot.dueDateEffective);
+    const derivedDueDateProposed = chooseField('dueDateProposed', extractedSnapshot.dueDateProposed, prevSnapshot.dueDateProposed);
+    const derivedScopeSummary = chooseField('scopeSummary', extractedSnapshot.scopeSummary, prevSnapshot.scopeSummary);
+
+    // Update task with analyzed state + derived snapshot
     updateTask(taskId, {
       Conversation_State: analysis.conversationState,
       Pending_Changes: JSON.stringify(analysis.pendingChanges || []),
       AI_Summary: analysis.summary || '',
       Conversation_History: JSON.stringify(conversationHistory),
+      Derived_Task_Name: derivedTaskName,
+      Derived_Due_Date_Effective: derivedDueDateEffective || '',
+      Derived_Due_Date_Proposed: derivedDueDateProposed || '',
+      Derived_Scope_Summary: derivedScopeSummary,
+      Derived_Field_Provenance: JSON.stringify(mergedProv || {}),
+      Derived_Last_Analyzed_At: nowIso,
       Last_Updated: new Date()
     });
     
@@ -2052,7 +2118,14 @@ Return ONLY valid JSON:
         pendingChanges: analysis.pendingChanges || [],
         summary: analysis.summary,
         requiresAction: analysis.requiresAction,
-        actionSuggestion: analysis.actionSuggestion
+        actionSuggestion: analysis.actionSuggestion,
+        taskSnapshot: {
+          taskName: derivedTaskName,
+          dueDateEffective: derivedDueDateEffective || null,
+          dueDateProposed: derivedDueDateProposed || null,
+          scopeSummary: derivedScopeSummary
+        },
+        provenance: mergedProv || {}
       }
     };
     
@@ -2082,6 +2155,20 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
     if (!task) {
       Logger.log(`Task ${taskId} not found`);
       return { pendingChanges: [], showApprovals: false, conversationState: 'active', bossRejectedLast: false };
+    }
+
+    // Derived snapshot + provenance (for UI rendering consistency)
+    const taskSnapshot = {
+      taskName: task.Derived_Task_Name || task.Task_Name || '',
+      dueDateEffective: task.Derived_Due_Date_Effective || task.Due_Date || '',
+      dueDateProposed: task.Derived_Due_Date_Proposed || task.Proposed_Date || '',
+      scopeSummary: task.Derived_Scope_Summary || task.Context_Hidden || ''
+    };
+    let provenance = {};
+    try {
+      provenance = task.Derived_Field_Provenance ? JSON.parse(task.Derived_Field_Provenance) : {};
+    } catch (e) {
+      provenance = {};
     }
     
     // Check if we have stored state and it's recent (less than 5 minutes old)
@@ -2117,7 +2204,12 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
         conversationState: conversationState,
         bossRejectedLast: bossRejectedLast,
         summary: task.AI_Summary || '',
-        draftMessage: null
+        draftMessage: null,
+        taskSnapshot: taskSnapshot,
+        provenance: provenance,
+        lastMessageTimestamp: task.Last_Message_Timestamp || '',
+        lastMessageSender: task.Last_Message_Sender || '',
+        lastMessageSnippet: task.Last_Message_Snippet || ''
       };
     }
     
@@ -2154,7 +2246,12 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
       conversationState: analysis.conversationState,
       bossRejectedLast: bossRejectedLast,
       summary: analysis.summary,
-      draftMessage: analysis.actionSuggestion || null
+      draftMessage: analysis.actionSuggestion || null,
+      taskSnapshot: analysis.taskSnapshot || taskSnapshot,
+      provenance: analysis.provenance || provenance,
+      lastMessageTimestamp: task.Last_Message_Timestamp || '',
+      lastMessageSender: task.Last_Message_Sender || '',
+      lastMessageSnippet: task.Last_Message_Snippet || ''
     };
     
   } catch (error) {
