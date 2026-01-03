@@ -14,7 +14,8 @@ cat > "$HOOK_PATH" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# NOTE: This hook lives in .git/hooks/, so repo root is two levels up.
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_DIR"
 
 echo "==> [pre-push] Syncing .gs -> .js"
