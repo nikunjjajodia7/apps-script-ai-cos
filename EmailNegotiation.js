@@ -904,6 +904,12 @@ function handleOtherReply(taskId, emailContent, messageId) {
  */
 function notifyBossOfReviewRequest(taskId, reviewType, emailContent, proposedDate = null) {
   try {
+    // Optional: suppress DATE_CHANGE notification emails (still store Proposed_Date / conversation state).
+    if (reviewType === 'DATE_CHANGE' && !CONFIG.NOTIFY_BOSS_ON_DATE_CHANGE()) {
+      Logger.log(`Boss notification suppressed for DATE_CHANGE (task ${taskId})`);
+      return;
+    }
+
     const task = getTask(taskId);
     if (!task) return;
     

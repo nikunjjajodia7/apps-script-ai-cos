@@ -168,6 +168,10 @@ const CONFIG = {
   EMAIL_SIGNATURE: () => getConfigValue('EMAIL_SIGNATURE', '[Boss\'s Chief of Staff AI]'),
   BOSS_NAME: () => getConfigValue('BOSS_NAME', 'Boss'),
   
+  // Notifications
+  // If false, the system will still record DATE_CHANGE requests but will not email the boss about them.
+  NOTIFY_BOSS_ON_DATE_CHANGE: () => getConfigValue('NOTIFY_BOSS_ON_DATE_CHANGE', 'false') === 'true',
+  
   // Vertex AI
   VERTEX_AI_PROJECT_ID: () => getConfigValue('VERTEX_AI_PROJECT_ID'),
   VERTEX_AI_LOCATION: () => getConfigValue('VERTEX_AI_LOCATION', 'us-central1'),

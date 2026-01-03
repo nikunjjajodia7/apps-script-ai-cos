@@ -457,8 +457,8 @@ function handleRejectTask(taskId) {
 
 // Category C1: Review_Date handlers
 /**
- * Handle boss approving date change (Phase 1)
- * This does NOT immediately change the date - sends to employee for confirmation
+ * Handle boss approving employee-requested date change
+ * This SHOULD immediately change the date (no employee confirmation required)
  */
 function handleApproveNewDate(taskId) {
   return handleBossApproveDateChange(taskId, {});
@@ -481,50 +481,46 @@ function handleBossApproveDateChange(taskId, data) {
     tz, 
     'EEEE, MMMM d, yyyy'
   );
-  
-  // Update approval state - boss approved, now waiting for employee
+
+  // Apply immediately (employee requested; boss approved)
   updateTask(taskId, {
+    Due_Date: task.Proposed_Date,
+    Proposed_Date: '', // Clear proposal (now canonical)
     Status: TASK_STATUS.ON_TIME,
-    Conversation_State: CONVERSATION_STATE.AWAITING_CONFIRMATION,
-    Pending_Changes: JSON.stringify([{
-      id: 'date_change_' + Date.now(),
-      parameter: 'dueDate',
-      currentValue: task.Due_Date,
-      proposedValue: task.Proposed_Date,
-      requestedBy: 'employee',
-      reasoning: 'Boss approved date change'
-    }]),
+    Conversation_State: CONVERSATION_STATE.RESOLVED,
+    Pending_Changes: '', // Clear pending changes (date is now applied)
+    Pending_Decision: '', // Defensive cleanup
+    Employee_Reply: '', // Clear employee reply after resolution
     Last_Updated: new Date()
   });
-  
-  // Send email to employee requesting confirmation
+
+  // FYI email to employee (no confirmation required)
   const staff = getStaff(task.Assignee_Email);
   const assigneeName = staff ? staff.Name : task.Assignee_Email;
   
   let emailBody = `Hello ${assigneeName},\n\n` +
-    `Your request to change the due date has been approved.\n\n` +
+    `Approved — your due date has been updated.\n\n` +
     `Task: ${task.Task_Name}\n` +
     `New Due Date: ${proposedDateFormatted}\n\n` +
-    `Please confirm if this date works for you by replying to this email.\n\n` +
-    `If you have any concerns or need to discuss further, please let me know.\n\n` +
+    `If you have any concerns, please let me know.\n\n` +
     `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
   const result = sendEmailToAssignee(
     taskId,
     task.Assignee_Email,
-    `Date Change Approved - Please Confirm: ${task.Task_Name}`,
+    `Due Date Updated: ${task.Task_Name}`,
     emailBody,
     {
       htmlBody: emailBody.replace(/\n/g, '<br>')
     }
   );
   
-  logInteraction(taskId, `Boss approved date change. Email sent${result.threadId ? ` in thread ${result.threadId}` : ''}. Awaiting employee confirmation.`);
+  logInteraction(taskId, `Boss approved employee-requested date change. Due date updated to ${task.Proposed_Date}.${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
   
   return { 
     success: true, 
-    message: 'Date change approved. Employee will be notified to confirm.',
-    requiresEmployeeConfirmation: true,
+    message: 'Date change approved and applied.',
+    requiresEmployeeConfirmation: false,
     threadId: result.threadId
   };
 }
@@ -2652,6 +2648,45 @@ function handleApproveChange(taskId, data) {
     if (!parameter || !proposedValue) {
       return { success: false, error: 'parameter and proposedValue are required' };
     }
+
+    // If boss is approving an employee-requested due date, apply it immediately (canonical Due_Date).
+    // Guard: do NOT auto-apply if we are in a boss-proposed flow awaiting employee confirmation.
+    if (parameter === 'dueDate') {
+      const proposedText = String(proposedValue).trim();
+      let newDueDate = null;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(proposedText)) {
+        newDueDate = proposedText;
+      } else {
+        try {
+          const extracted = extractDateFromText(proposedText);
+          if (extracted && /^\d{4}-\d{2}-\d{2}$/.test(extracted)) newDueDate = extracted;
+        } catch (e) {
+          newDueDate = null;
+        }
+      }
+
+      let pendingDecision = null;
+      try {
+        pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
+      } catch (e) {
+        pendingDecision = null;
+      }
+      const isBossProposedAwaitingEmployee =
+        pendingDecision &&
+        pendingDecision.awaitingFrom === 'employee' &&
+        pendingDecision.requestedBy === 'boss' &&
+        pendingDecision.type === 'date_change';
+
+      if (newDueDate && !isBossProposedAwaitingEmployee) {
+        updateTask(taskId, {
+          Due_Date: newDueDate,
+          Proposed_Date: '', // Clear proposal (now canonical)
+          Pending_Decision: '', // Defensive cleanup
+          Status: TASK_STATUS.ON_TIME,
+          Last_Updated: new Date()
+        });
+      }
+    }
     
     const bossName = CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss';
     const message = buildApprovalMessage_(parameter, proposedValue, draftMessage);
@@ -2716,6 +2751,47 @@ function handleMixedResponse(taskId, data) {
     
     if (approvedChanges.length === 0 && rejectedChanges.length === 0) {
       return { success: false, error: 'At least one approved or rejected change is required' };
+    }
+
+    // If the mixed response approves an employee-requested due date, apply it immediately.
+    // Guard: do NOT auto-apply if we are in a boss-proposed flow awaiting employee confirmation.
+    try {
+      const dueApproval = (approvedChanges || []).find(c => c && c.parameter === 'dueDate' && c.proposedValue);
+      if (dueApproval) {
+        const proposedText = String(dueApproval.proposedValue).trim();
+        let newDueDate = null;
+        if (/^\d{4}-\d{2}-\d{2}$/.test(proposedText)) {
+          newDueDate = proposedText;
+        } else {
+          const extracted = extractDateFromText(proposedText);
+          if (extracted && /^\d{4}-\d{2}-\d{2}$/.test(extracted)) newDueDate = extracted;
+        }
+
+        let pendingDecision = null;
+        try {
+          pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
+        } catch (e) {
+          pendingDecision = null;
+        }
+        const isBossProposedAwaitingEmployee =
+          pendingDecision &&
+          pendingDecision.awaitingFrom === 'employee' &&
+          pendingDecision.requestedBy === 'boss' &&
+          pendingDecision.type === 'date_change';
+
+        if (newDueDate && !isBossProposedAwaitingEmployee) {
+          updateTask(taskId, {
+            Due_Date: newDueDate,
+            Proposed_Date: '',
+            Pending_Decision: '',
+            Status: TASK_STATUS.ON_TIME,
+            Last_Updated: new Date()
+          });
+        }
+      }
+    } catch (e) {
+      // Best-effort; mixed response should still send even if date parsing fails.
+      Logger.log(`Warning: Failed to auto-apply approved due date: ${e.toString()}`);
     }
     
     const composed = buildMixedResponseMessage_(approvedChanges, rejectedChanges, message);

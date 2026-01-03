@@ -930,7 +930,8 @@ function createAllSheets() {
       ['AI_CONFIDENCE_THRESHOLD', '0.6', 'Minimum confidence for auto-processing', 'AI'],
       ['RELIABILITY_UPDATE_INTERVAL_HOURS', '24', 'Reliability score update interval', 'Scoring'],
       ['EMAIL_SIGNATURE', '[Boss\'s Chief of Staff AI]', 'Email signature', 'Email'],
-      ['WEEKLY_MEETING_TITLE', 'Weekly Ops', 'Recurring weekly meeting title', 'Scheduling']
+      ['WEEKLY_MEETING_TITLE', 'Weekly Ops', 'Recurring weekly meeting title', 'Scheduling'],
+      ['NOTIFY_BOSS_ON_DATE_CHANGE', 'false', 'If true, email boss when employee requests a due date change', 'Notifications']
     ];
     configSheet.getRange(2, 1, defaultConfig.length, 4).setValues(defaultConfig);
     Logger.log('Created Config sheet with default values');

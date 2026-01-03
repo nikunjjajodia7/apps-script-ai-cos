@@ -2090,20 +2090,48 @@ Return ONLY valid JSON:
     const derivedDueDateProposed = chooseField('dueDateProposed', extractedSnapshot.dueDateProposed, prevSnapshot.dueDateProposed);
     const derivedScopeSummary = chooseField('scopeSummary', extractedSnapshot.scopeSummary, prevSnapshot.scopeSummary);
 
-    // Update task with analyzed state + derived snapshot
-    updateTask(taskId, {
+    // If resolved and not awaiting employee confirmation, we can safely write back the effective due date
+    // into canonical Due_Date (so sheets + dashboard are consistent even for message-driven approvals).
+    const existingDueDate = (task.Due_Date || '').toString().trim();
+    const effectiveDueDate = (derivedDueDateEffective || '').toString().trim();
+    const shouldWriteBackCanonicalDueDate =
+      analysis.conversationState === CONVERSATION_STATE.RESOLVED &&
+      !hasAwaitingEmployeePending &&
+      !!effectiveDueDate &&
+      effectiveDueDate !== existingDueDate;
+
+    // If the proposed due date equals the effective due date in a resolved state, suppress the proposed display.
+    const finalDerivedDueDateProposed =
+      analysis.conversationState === CONVERSATION_STATE.RESOLVED &&
+      effectiveDueDate &&
+      derivedDueDateProposed &&
+      String(derivedDueDateProposed).trim() === effectiveDueDate
+        ? ''
+        : (derivedDueDateProposed || '');
+
+    const updates = {
       Conversation_State: analysis.conversationState,
       Pending_Changes: JSON.stringify(analysis.pendingChanges || []),
       AI_Summary: analysis.summary || '',
       Conversation_History: JSON.stringify(conversationHistory),
       Derived_Task_Name: derivedTaskName,
-      Derived_Due_Date_Effective: derivedDueDateEffective || '',
-      Derived_Due_Date_Proposed: derivedDueDateProposed || '',
+      Derived_Due_Date_Effective: effectiveDueDate || '',
+      Derived_Due_Date_Proposed: finalDerivedDueDateProposed,
       Derived_Scope_Summary: derivedScopeSummary,
       Derived_Field_Provenance: JSON.stringify(mergedProv || {}),
       Derived_Last_Analyzed_At: nowIso,
       Last_Updated: new Date()
-    });
+    };
+
+    if (shouldWriteBackCanonicalDueDate) {
+      updates.Due_Date = effectiveDueDate;
+      updates.Proposed_Date = '';
+      // Defensive cleanup; boss-proposed flows are protected by hasAwaitingEmployeePending above.
+      updates.Pending_Decision = '';
+    }
+
+    // Update task with analyzed state + derived snapshot
+    updateTask(taskId, updates);
     
     Logger.log(`Conversation analysis for ${taskId}:`);
     Logger.log(`  State: ${analysis.conversationState}`);
