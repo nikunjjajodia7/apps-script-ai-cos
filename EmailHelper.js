@@ -163,10 +163,7 @@ function sendTaskAssignmentEmail(taskId) {
       Logger.log(`Warning: Failed to analyze conversation after assignment email: ${e.toString()}`);
     }
 
-    logInteraction(
-      taskId,
-      `Assignment email sent to ${task.Assignee_Email}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}${result.messageId ? ` (Message ID: ${result.messageId})` : ''}`
-    );
+    // Assignment email is already captured as a canonical conversation event (assignment_email_sent).
     
     return true;
   } catch (error) {
@@ -206,7 +203,12 @@ function sendFollowUpEmail(taskId) {
       }
     );
     
-    logInteraction(taskId, `Follow-up email sent to ${task.Assignee_Email}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+    appendSystemEvent(
+      taskId,
+      'system_email_followup_sent',
+      `Follow-up email sent to ${task.Assignee_Email}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+      { source: 'email', to: task.Assignee_Email, threadId: result.threadId || null, messageId: result.messageId || null }
+    );
     return result.success;
   } catch (error) {
     logError(ERROR_TYPE.API_ERROR, 'sendFollowUpEmail', error.toString(), taskId);
@@ -245,7 +247,12 @@ function sendEscalationEmail(taskId) {
       }
     );
     
-    logInteraction(taskId, `Escalation email sent to ${task.Assignee_Email}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+    appendSystemEvent(
+      taskId,
+      'system_email_escalation_sent',
+      `Escalation email sent to ${task.Assignee_Email}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+      { source: 'email', to: task.Assignee_Email, threadId: result.threadId || null, messageId: result.messageId || null }
+    );
     return result.success;
   } catch (error) {
     logError(ERROR_TYPE.API_ERROR, 'sendEscalationEmail', error.toString(), taskId);
@@ -287,7 +294,7 @@ Chief of Staff AI`;
       }
     );
     
-    logInteraction(taskId, `Confirmation email sent to Boss`);
+    appendSystemEvent(taskId, 'system_email_boss_confirmation_sent', 'Confirmation email sent to Boss', { source: 'email', to: bossEmail });
   } catch (error) {
     logError(ERROR_TYPE.API_ERROR, 'sendBossConfirmation', error.toString(), taskId);
   }
@@ -305,10 +312,6 @@ Chief of Staff AI`;
  * @returns {Object} { success: boolean, threadId: string|null, messageId: string|null }
  */
 function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
-  // #region agent log
-  Logger.log('[DEBUG] sendEmailToAssignee entry: ' + JSON.stringify({location:'EmailHelper.gs:282',message:'sendEmailToAssignee entry',data:{taskId:taskId,to:to,subject:subject,bodyLength:body.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'}));
-  // #endregion
-  
   try {
     const task = getTask(taskId);
     if (!task) {
@@ -316,37 +319,21 @@ function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
       return { success: false, threadId: null, messageId: null };
     }
     
-    // #region agent log
-    Logger.log('[DEBUG] sendEmailToAssignee task loaded: ' + JSON.stringify({location:'EmailHelper.gs:290',message:'sendEmailToAssignee task loaded',data:{taskId:taskId,primaryThreadId:task.Primary_Thread_ID,hasTaskIdInBody:body.includes('Task ID: ' + taskId)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'}));
-    // #endregion
-    
     // Ensure Task ID is in body
     let emailBody = body;
     if (!emailBody.includes(`Task ID: ${taskId}`)) {
       emailBody = `${emailBody}\n\n---\nTask ID: ${taskId}`;
     }
     
-    // #region agent log
-    Logger.log('[DEBUG] sendEmailToAssignee after Task ID check: ' + JSON.stringify({location:'EmailHelper.gs:297',message:'sendEmailToAssignee after Task ID check',data:{taskId:taskId,hasTaskIdInBody:emailBody.includes('Task ID: ' + taskId),emailBodyLength:emailBody.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'}));
-    // #endregion
-    
     // Get the original thread
     const thread = findTaskEmailThread(taskId);
     let threadId = null;
     let originalSubject = subject;
     
-    // #region agent log
-    Logger.log('[DEBUG] sendEmailToAssignee thread lookup result: ' + JSON.stringify({location:'EmailHelper.gs:301',message:'sendEmailToAssignee thread lookup result',data:{taskId:taskId,threadFound:!!thread,threadId:thread ? thread.getId() : null},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-    // #endregion
-    
     if (thread) {
       threadId = thread.getId();
       originalSubject = thread.getFirstMessageSubject();
       Logger.log(`Replying to existing thread: ${threadId}`);
-      
-      // #region agent log
-      Logger.log('[DEBUG] sendEmailToAssignee thread found, preparing reply: ' + JSON.stringify({location:'EmailHelper.gs:304',message:'sendEmailToAssignee thread found, preparing reply',data:{taskId:taskId,threadId:threadId,originalSubject:originalSubject,emailBodyHasTaskId:emailBody.includes('Task ID: ' + taskId)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'}));
-      // #endregion
       
       // Get the last message in thread for In-Reply-To header
       const messages = thread.getMessages();
@@ -377,10 +364,6 @@ function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
         // Add thread ID to email body (as requested)
         emailBody = `${emailBody}\n\n---\nThread ID: ${threadId}`;
         
-        // #region agent log
-        Logger.log('[DEBUG] sendEmailToAssignee before Gmail API send: ' + JSON.stringify({location:'EmailHelper.gs:333',message:'sendEmailToAssignee before Gmail API send',data:{taskId:taskId,threadId:threadId,hasTaskIdInBody:emailBody.includes('Task ID: ' + taskId),hasThreadIdInBody:emailBody.includes('Thread ID: ' + threadId),inReplyTo:inReplyTo},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'}));
-        // #endregion
-        
         emailLines.push(''); // Empty line before body
         emailLines.push(emailBody);
         
@@ -397,16 +380,17 @@ function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
         const sentMessageId = sentMessage.id;
         Logger.log(`Email sent in thread ${threadId}, message ID: ${sentMessageId}`);
         
-        // #region agent log
-        Logger.log('[DEBUG] sendEmailToAssignee Gmail API send success: ' + JSON.stringify({location:'EmailHelper.gs:349',message:'sendEmailToAssignee Gmail API send success',data:{taskId:taskId,threadId:threadId,sentMessageId:sentMessageId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'D'}));
-        // #endregion
-        
         // Update Last_Reply_Check timestamp
         updateTask(taskId, {
           Last_Reply_Check: new Date().toISOString()
         });
         
-        logInteraction(taskId, `Email sent to ${to} in thread ${threadId} (Message ID: ${sentMessageId})`);
+        appendSystemEvent(
+          taskId,
+          'system_email_sent',
+          `Email sent to ${to} in thread ${threadId} (Message ID: ${sentMessageId})`,
+          { source: 'email', to: to, threadId: threadId, messageId: sentMessageId }
+        );
         
         return { 
           success: true, 
@@ -417,11 +401,6 @@ function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
       } catch (apiError) {
         Logger.log(`Error sending via Gmail API: ${apiError.toString()}`);
         Logger.log(`Falling back to GmailApp.sendEmail`);
-        
-        // #region agent log
-        Logger.log('[DEBUG] sendEmailToAssignee Gmail API failed, falling back: ' + JSON.stringify({location:'EmailHelper.gs:365',message:'sendEmailToAssignee Gmail API failed, falling back',data:{taskId:taskId,threadId:threadId,error:apiError.toString()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'}));
-        // #endregion
-        
         // Fall through to fallback
       }
     }
@@ -429,20 +408,12 @@ function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
     // Fallback: Send new email if thread not found or API failed
     Logger.log(`Sending new email (no thread found or API failed)`);
     
-    // #region agent log
-    Logger.log('[DEBUG] sendEmailToAssignee fallback path: ' + JSON.stringify({location:'EmailHelper.gs:372',message:'sendEmailToAssignee fallback path',data:{taskId:taskId,threadId:threadId,hasTaskIdInBody:emailBody.includes('Task ID: ' + taskId),subject:subject},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'E'}));
-    // #endregion
-    
     // Add thread ID to body if we have one (even if sending new email)
     if (threadId) {
       emailBody = `${emailBody}\n\n---\nThread ID: ${threadId}`;
     } else {
       emailBody = `${emailBody}\n\n---\nThread ID: (New thread - will be created)`;
     }
-    
-    // #region agent log
-    Logger.log('[DEBUG] sendEmailToAssignee before GmailApp.sendEmail: ' + JSON.stringify({location:'EmailHelper.gs:380',message:'sendEmailToAssignee before GmailApp.sendEmail',data:{taskId:taskId,hasTaskIdInBody:emailBody.includes('Task ID: ' + taskId),emailBodyLength:emailBody.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'}));
-    // #endregion
     
     // Regenerate htmlBody from emailBody (which now includes Task ID) to ensure Task ID is in HTML version too
     const emailOptions = {
@@ -474,7 +445,12 @@ function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
       }
     }
     
-    logInteraction(taskId, `Email sent to ${to}${threadId ? ` (Thread ID: ${threadId})` : ' (New thread)'}`);
+    appendSystemEvent(
+      taskId,
+      'system_email_sent',
+      `Email sent to ${to}${threadId ? ` (Thread ID: ${threadId})` : ' (New thread)'}`,
+      { source: 'email', to: to, threadId: threadId || null, messageId: null }
+    );
     
     return { 
       success: true, 
@@ -496,18 +472,9 @@ function sendEmailToAssignee(taskId, to, subject, body, options = {}) {
  * Returns the PRIMARY thread (original assignment email thread)
  */
 function findTaskEmailThread(taskId) {
-  // #region agent log
-  Logger.log('[DEBUG] findTaskEmailThread entry: ' + JSON.stringify({location:'EmailHelper.gs:431',message:'findTaskEmailThread entry',data:{taskId:taskId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-  // #endregion
-  
   const task = getTask(taskId);
   if (!task || !task.Assignee_Email) {
     Logger.log(`findTaskEmailThread: Task ${taskId} not found or no assignee email`);
-    
-    // #region agent log
-    Logger.log('[DEBUG] findTaskEmailThread task not found: ' + JSON.stringify({location:'EmailHelper.gs:436',message:'findTaskEmailThread task not found',data:{taskId:taskId,hasTask:!!task,hasAssigneeEmail:task && !!task.Assignee_Email},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-    // #endregion
-    
     return null;
   }
   
@@ -515,10 +482,6 @@ function findTaskEmailThread(taskId) {
   
   // METHOD 1: Use Primary_Thread_ID (fastest - direct access)
   if (task.Primary_Thread_ID) {
-    // #region agent log
-    Logger.log('[DEBUG] findTaskEmailThread trying Primary_Thread_ID: ' + JSON.stringify({location:'EmailHelper.gs:441',message:'findTaskEmailThread trying Primary_Thread_ID',data:{taskId:taskId,primaryThreadId:task.Primary_Thread_ID},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-    // #endregion
-    
     try {
       const thread = GmailApp.getThreadById(task.Primary_Thread_ID);
       if (thread) {
@@ -526,32 +489,16 @@ function findTaskEmailThread(taskId) {
         Logger.log(`  Subject: "${thread.getFirstMessageSubject()}"`);
         Logger.log(`  Messages: ${thread.getMessages().length}`);
         
-        // #region agent log
-        Logger.log('[DEBUG] findTaskEmailThread found by Primary_Thread_ID: ' + JSON.stringify({location:'EmailHelper.gs:448',message:'findTaskEmailThread found by Primary_Thread_ID',data:{taskId:taskId,threadId:thread.getId(),messageCount:thread.getMessages().length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-        // #endregion
-        
         return thread;
       }
     } catch (error) {
       Logger.log(`Thread ${task.Primary_Thread_ID} not found, trying fallback`);
-      
-      // #region agent log
-      Logger.log('[DEBUG] findTaskEmailThread Primary_Thread_ID failed: ' + JSON.stringify({location:'EmailHelper.gs:451',message:'findTaskEmailThread Primary_Thread_ID failed',data:{taskId:taskId,primaryThreadId:task.Primary_Thread_ID,error:error.toString()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-      // #endregion
     }
   } else {
-    // #region agent log
-    Logger.log('[DEBUG] findTaskEmailThread no Primary_Thread_ID: ' + JSON.stringify({location:'EmailHelper.gs:454',message:'findTaskEmailThread no Primary_Thread_ID',data:{taskId:taskId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-    // #endregion
   }
   
   // METHOD 2: Search by Task ID (fallback)
   const searchQuery = `"Task ID: ${taskId}" in:inbox`;
-  
-  // #region agent log
-  Logger.log('[DEBUG] findTaskEmailThread searching by Task ID: ' + JSON.stringify({location:'EmailHelper.gs:456',message:'findTaskEmailThread searching by Task ID',data:{taskId:taskId,searchQuery:searchQuery},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-  // #endregion
-  
   const threads = GmailApp.search(searchQuery, 0, 1);
   
   if (threads.length > 0) {
@@ -566,21 +513,11 @@ function findTaskEmailThread(taskId) {
       });
       
       Logger.log(`✓ Found thread by search, stored Primary_Thread_ID`);
-      
-      // #region agent log
-      Logger.log('[DEBUG] findTaskEmailThread found by search: ' + JSON.stringify({location:'EmailHelper.gs:470',message:'findTaskEmailThread found by search',data:{taskId:taskId,threadId:thread.getId()},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-      // #endregion
-      
       return thread;
     }
   }
   
   Logger.log(`❌ No matching thread found for task ${taskId}`);
-  
-  // #region agent log
-  Logger.log('[DEBUG] findTaskEmailThread no thread found: ' + JSON.stringify({location:'EmailHelper.gs:475',message:'findTaskEmailThread no thread found',data:{taskId:taskId,searchResultsCount:threads.length},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-  // #endregion
-  
   return null;
 }
 
@@ -780,7 +717,12 @@ function sendEmployeeApprovalRequest(taskId, newDateFormatted, bossMessage) {
     );
     
     Logger.log(`Approval request email sent to ${task.Assignee_Email}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
-    logInteraction(taskId, `Employee approval request sent for new date: ${newDateFormatted}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+    appendSystemEvent(
+      taskId,
+      'system_employee_approval_request_sent',
+      `Employee approval request sent for new date: ${newDateFormatted}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+      { source: 'email', to: task.Assignee_Email, threadId: result.threadId || null, messageId: result.messageId || null, proposedDueDate: newDateFormatted }
+    );
     
   } catch (error) {
     Logger.log(`ERROR sending approval request: ${error.toString()}`);

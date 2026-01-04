@@ -228,7 +228,7 @@ function executeActions(actions, context, workflowId) {
         case 'log_interaction':
           if (taskId && params.message) {
             try {
-              logInteraction(taskId, params.message);
+              appendSystemEvent(taskId, 'system_workflow_event', String(params.message), { source: 'workflow' });
               result.executed = true;
               result.message = 'Interaction logged';
             } catch (e) {

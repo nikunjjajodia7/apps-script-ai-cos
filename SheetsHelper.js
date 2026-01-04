@@ -269,7 +269,7 @@ function updateTask(taskId, updates) {
       'Review_Summary'
     ];
     forbidden.forEach(k => {
-      if (updates && Object.prototype.hasOwnProperty.call(updates, k)) delete updates[k];
+      if (updates && updates.hasOwnProperty(k)) delete updates[k];
     });
   } catch (e) {
     // non-fatal
@@ -831,17 +831,8 @@ function findProjectTagByName(searchText) {
   }
 }
 
-/**
- * Legacy name kept to avoid breaking older call sites, but it no longer writes Interaction_Log.
- * Canonical audit trail is Conversation_History (append-only).
- */
-function logInteraction(taskId, message) {
-  try {
-    appendSystemEvent(taskId, 'audit', String(message || ''), { deprecated: true });
-  } catch (e) {
-    // Don't throw - logging failures shouldn't break the system
-  }
-}
+// NOTE: Legacy Interaction_Log has been removed.
+// Use appendSystemEvent(taskId, type, content, metadata) to record system/audit events in Conversation_History.
 
 /**
  * Get processed message IDs from dedicated field

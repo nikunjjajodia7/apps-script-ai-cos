@@ -114,19 +114,32 @@ function appendToConversationHistory(taskId, message) {
 
 /**
  * Append a system event to the canonical Conversation_History.
- * Use this instead of any legacy Interaction_Log.
+ * Used to replace legacy Interaction_Log for internal/audit events.
  */
 function appendSystemEvent(taskId, type, content, metadata) {
   const nowIso = new Date().toISOString();
+
+  // Normalize type to always start with "system_" so actor inference + UI filtering are consistent.
+  const rawType = String(type || 'event');
+  const normalizedType = rawType.indexOf('system_') === 0 ? rawType : `system_${rawType}`;
+
+  // Stable messageId is critical: prevents duplicate system/audit rows when triggers retry/double-fire.
+  // Prefer correlating to a Gmail message id when provided by the caller.
+  const md = metadata || {};
+  const correlationId = md.messageId || md.gmailMessageId || md.sentMessageId || null;
+  const stableMessageId = correlationId
+    ? `${String(correlationId)}:${normalizedType}`
+    : `system_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+
   return appendToConversationHistory(taskId, {
-    id: `system_${Date.now()}`,
+    id: stableMessageId,
+    messageId: stableMessageId,
     timestamp: nowIso,
     senderEmail: '',
     senderName: 'System',
-    type: type || 'system_event',
+    type: normalizedType,
     content: content || '',
-    messageId: null,
-    metadata: metadata || {}
+    metadata: md
   });
 }
 

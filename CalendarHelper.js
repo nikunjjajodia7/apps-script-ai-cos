@@ -133,14 +133,14 @@ function scheduleOneOnOne(taskId, preferredDate, preferredTime, durationMinutes)
       updateTask(taskId, {
         Status: TASK_STATUS.AI_ASSIST,
       });
-      logInteraction(taskId, 'Could not find available slot for 1-on-1 meeting');
+      appendSystemEvent(taskId, 'system_calendar_no_slot', 'Could not find available slot for 1-on-1 meeting', { source: 'calendar' });
       return null;
     }
     
     // Create calendar event
     const calendar = CalendarApp.getDefaultCalendar();
     const eventTitle = `1-on-1: ${task.Task_Name}`;
-    const eventDescription = `Task: ${task.Task_Name}\n\nContext: ${task.Context_Hidden || task.Derived_Scope_Summary || 'No additional context'}`;
+    const eventDescription = `Task: ${task.Task_Name}\n\nContext: ${task.Context_Hidden || 'No additional context'}`;
     
     const event = calendar.createEvent(
       eventTitle,
@@ -162,7 +162,12 @@ function scheduleOneOnOne(taskId, preferredDate, preferredTime, durationMinutes)
       Previous_Status: task.Status, // Store previous status for reverting if event deleted
     });
     
-    logInteraction(taskId, `1-on-1 meeting scheduled: ${Utilities.formatDate(slot.start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')} (Event ID: ${event.getId()})`);
+    appendSystemEvent(
+      taskId,
+      'system_calendar_one_on_one_scheduled',
+      `1-on-1 meeting scheduled: ${Utilities.formatDate(slot.start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')} (Event ID: ${event.getId()})`,
+      { source: 'calendar', eventId: event.getId() }
+    );
     
     return event.getId();
     
@@ -238,7 +243,12 @@ function addToWeeklyAgenda(taskId, preferredDate) {
       Previous_Status: task.Status, // Store previous status for reverting if event deleted
     });
     
-    logInteraction(taskId, `Added to weekly agenda: ${weeklyEvent.getTitle()} (Event ID: ${weeklyEvent.getId()})`);
+    appendSystemEvent(
+      taskId,
+      'system_calendar_weekly_agenda_added',
+      `Added to weekly agenda: ${weeklyEvent.getTitle()} (Event ID: ${weeklyEvent.getId()})`,
+      { source: 'calendar', eventId: weeklyEvent.getId() }
+    );
     
     return weeklyEvent.getId();
     
@@ -300,7 +310,7 @@ function scheduleFocusTime(taskId, preferredDate, preferredTime, durationMinutes
       updateTask(taskId, {
         Status: TASK_STATUS.AI_ASSIST,  // Conflict needs review
       });
-      logInteraction(taskId, 'Could not find available slot for focus time');
+      appendSystemEvent(taskId, 'system_calendar_no_slot', 'Could not find available slot for focus time', { source: 'calendar' });
       return null;
     }
     
@@ -326,7 +336,12 @@ function scheduleFocusTime(taskId, preferredDate, preferredTime, durationMinutes
       Previous_Status: task.Status, // Store previous status for reverting if event deleted
     });
     
-    logInteraction(taskId, `Focus time scheduled: ${Utilities.formatDate(slot.start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')} (Event ID: ${event.getId()})`);
+    appendSystemEvent(
+      taskId,
+      'system_calendar_focus_time_scheduled',
+      `Focus time scheduled: ${Utilities.formatDate(slot.start, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm')} (Event ID: ${event.getId()})`,
+      { source: 'calendar', eventId: event.getId() }
+    );
     
     return event.getId();
     
@@ -771,7 +786,12 @@ function handleCalendarEventDeleted(task) {
       Previous_Status: '',
     });
     
-    logInteraction(taskId, `Calendar event was deleted. Task reverted to status: ${previousStatus}`);
+    appendSystemEvent(
+      taskId,
+      'system_calendar_event_deleted',
+      `Calendar event was deleted. Task reverted to status: ${previousStatus}`,
+      { source: 'calendar', previousStatus: previousStatus }
+    );
     
     // Notify boss about the deletion
     notifyBossOfCalendarChange(task, 'deleted');
@@ -801,7 +821,12 @@ function handleCalendarEventRescheduled(task, newStartTime) {
       Scheduled_Time: newStartTime,
     });
     
-    logInteraction(taskId, `Calendar event rescheduled: ${oldTimeStr} → ${newTimeStr}`);
+    appendSystemEvent(
+      taskId,
+      'system_calendar_event_rescheduled',
+      `Calendar event rescheduled: ${oldTimeStr} → ${newTimeStr}`,
+      { source: 'calendar', oldTime: oldTimeStr, newTime: newTimeStr }
+    );
     
     // Notify boss about the reschedule
     notifyBossOfCalendarChange(task, 'rescheduled', oldTimeStr, newTimeStr);

@@ -304,18 +304,6 @@ function handleApproveInterpretation(taskId, data) {
 }
 
 function handleModifyTask(taskId, data) {
-  // #region agent log
-  Logger.log(JSON.stringify({
-    sessionId: 'debug-session',
-    runId: 'run1',
-    hypothesisId: 'B',
-    location: 'DashboardActions.gs:218',
-    message: 'handleModifyTask entry',
-    data: { taskId: taskId, incomingData: data, dataKeys: Object.keys(data || {}) },
-    timestamp: Date.now()
-  }));
-  // #endregion
-  
   const updates = {};
   if (data.taskName) updates.Task_Name = data.taskName;
   if (data.dueDate) updates.Due_Date = data.dueDate;
@@ -326,18 +314,6 @@ function handleModifyTask(taskId, data) {
   // Handle assignee - support both email and name
   let finalAssigneeName = data.assigneeName;
   let finalAssigneeEmail = data.assigneeEmail;
-  
-  // #region agent log
-  Logger.log(JSON.stringify({
-    sessionId: 'debug-session',
-    runId: 'run1',
-    hypothesisId: 'B',
-    location: 'DashboardActions.gs:232',
-    message: 'handleModifyTask - assignee values',
-    data: { finalAssigneeName: finalAssigneeName, finalAssigneeEmail: finalAssigneeEmail, assigneeNameType: typeof finalAssigneeName, assigneeEmailType: typeof finalAssigneeEmail },
-    timestamp: Date.now()
-  }));
-  // #endregion
   
   if (finalAssigneeEmail !== undefined) {
     updates.Assignee_Email = finalAssigneeEmail;
@@ -389,32 +365,7 @@ function handleModifyTask(taskId, data) {
     updates.Assignee_Email = '';
   }
   
-  // #region agent log
-  Logger.log(JSON.stringify({
-    sessionId: 'debug-session',
-    runId: 'run1',
-    hypothesisId: 'B',
-    location: 'DashboardActions.gs:280',
-    message: 'handleModifyTask - updates before updateTask',
-    data: { updates: updates, updatesKeys: Object.keys(updates) },
-    timestamp: Date.now()
-  }));
-  // #endregion
-  
   updateTask(taskId, updates);
-  
-  // #region agent log
-  const updatedTask = getTask(taskId);
-  Logger.log(JSON.stringify({
-    sessionId: 'debug-session',
-    runId: 'run1',
-    hypothesisId: 'B',
-    location: 'DashboardActions.gs:290',
-    message: 'handleModifyTask - task after update',
-    data: { taskId: taskId, assigneeName: updatedTask?.Assignee_Name, assigneeEmail: updatedTask?.Assignee_Email },
-    timestamp: Date.now()
-  }));
-  // #endregion
   
   if (updates.Status === TASK_STATUS.NOT_ACTIVE && updates.Assignee_Email) {
     sendTaskAssignmentEmail(taskId);
@@ -469,28 +420,38 @@ function handleBossApproveDateChange(taskId, data) {
   if (!task) {
     return { success: false, message: 'Task not found' };
   }
-  
-  if (!task.Proposed_Date) {
-    return { success: false, message: 'No proposed date to approve' };
+
+  // New system: approve the pending dueDate change awaiting boss.
+  let pending = [];
+  try {
+    pending = task.Pending_Changes ? JSON.parse(task.Pending_Changes) : [];
+  } catch (e) {
+    pending = [];
   }
-  
-  // Format dates for display
+  const dueDateChange = (pending || []).find(c => {
+    if (!c) return false;
+    const param = String(c.parameter || '').toLowerCase();
+    const awaitingFrom = String(c.awaitingFrom || '').toLowerCase();
+    const status = String(c.status || 'pending').toLowerCase();
+    const requestedBy = String(c.requestedBy || '').toLowerCase();
+    return param === 'duedate' && awaitingFrom === 'boss' && status === 'pending' && requestedBy === 'employee';
+  });
+  if (!dueDateChange || !dueDateChange.proposedValue) {
+    return { success: false, message: 'No pending due date change awaiting approval' };
+  }
+
   const tz = Session.getScriptTimeZone();
-  const proposedDateFormatted = Utilities.formatDate(
-    new Date(task.Proposed_Date), 
-    tz, 
-    'EEEE, MMMM d, yyyy'
-  );
+  const proposedIso = String(dueDateChange.proposedValue);
+  const proposedDateFormatted = Utilities.formatDate(new Date(proposedIso), tz, 'EEEE, MMMM d, yyyy');
 
   // Apply immediately (employee requested; boss approved)
   updateTask(taskId, {
-    Due_Date: task.Proposed_Date,
-    Proposed_Date: '', // Clear proposal (now canonical)
+    Due_Date: proposedIso,
     Status: TASK_STATUS.ON_TIME,
     Conversation_State: CONVERSATION_STATE.RESOLVED,
-    Pending_Changes: '', // Clear pending changes (date is now applied)
-    Pending_Decision: '', // Defensive cleanup
-    Employee_Reply: '', // Clear employee reply after resolution
+    Pending_Changes: JSON.stringify((pending || []).filter(c => c !== dueDateChange)), // Remove only the applied item
+    Derived_Due_Date_Effective: proposedIso,
+    Derived_Due_Date_Proposed: '',
     Last_Updated: new Date()
   });
 
@@ -520,7 +481,12 @@ function handleBossApproveDateChange(taskId, data) {
     Logger.log(`Auto-email suppressed for boss-approved date change (task ${taskId})`);
   }
   
-  logInteraction(taskId, `Boss approved employee-requested date change. Due date updated to ${task.Proposed_Date}.${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+  appendSystemEvent(
+    taskId,
+    'system_boss_approved_due_date',
+    `Boss approved employee-requested date change. Due date updated to ${proposedIso}.${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+    { source: 'dashboard_action', action: 'approve_new_date', threadId: result.threadId || null, proposedDueDate: proposedIso }
+  );
   
   return { 
     success: true, 
@@ -539,25 +505,37 @@ function handleEmployeeConfirmDate(taskId) {
   if (!task) {
     return { success: false, message: 'Task not found' };
   }
-  
-  const pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
-  
-  if (!pendingDecision || pendingDecision.type !== 'date_change' || pendingDecision.awaitingFrom !== 'employee') {
+
+  let pending = [];
+  try {
+    pending = task.Pending_Changes ? JSON.parse(task.Pending_Changes) : [];
+  } catch (e) {
+    pending = [];
+  }
+  const dueDateChange = (pending || []).find(c => {
+    if (!c) return false;
+    const param = String(c.parameter || '').toLowerCase();
+    const awaitingFrom = String(c.awaitingFrom || '').toLowerCase();
+    const status = String(c.status || 'pending').toLowerCase();
+    const requestedBy = String(c.requestedBy || '').toLowerCase();
+    return param === 'duedate' && awaitingFrom === 'employee' && status === 'pending' && requestedBy === 'boss';
+  });
+  if (!dueDateChange || !dueDateChange.proposedValue) {
     return { success: false, message: 'No pending date confirmation found' };
   }
-  
-  // NOW update the actual due date
+
+  const proposedIso = String(dueDateChange.proposedValue);
   updateTask(taskId, {
-    Due_Date: pendingDecision.proposedValue,
-    Proposed_Date: '', // Clear proposal
+    Due_Date: proposedIso,
     Status: TASK_STATUS.ON_TIME,
     Conversation_State: CONVERSATION_STATE.RESOLVED,
-    Pending_Changes: '', // Clear pending changes
-    Employee_Reply: '', // Clear employee reply
+    Pending_Changes: JSON.stringify((pending || []).filter(c => c !== dueDateChange)),
+    Derived_Due_Date_Effective: proposedIso,
+    Derived_Due_Date_Proposed: '',
     Last_Updated: new Date()
   });
-  
-  logInteraction(taskId, `Employee confirmed date change. Due date updated to ${pendingDecision.proposedValue}`);
+
+  appendSystemEvent(taskId, 'system_employee_confirmed_due_date', `Employee confirmed date change. Due date updated to ${proposedIso}`, { source: 'dashboard_action', action: 'employee_confirm_date', proposedDueDate: proposedIso });
   
   return { 
     success: true, 
@@ -580,12 +558,26 @@ function handleRejectDateChange(taskId, data) {
     'Not set';
   
   // Update approval state - boss rejected, conversation continues
+  let pending = [];
+  try {
+    pending = task.Pending_Changes ? JSON.parse(task.Pending_Changes) : [];
+  } catch (e) {
+    pending = [];
+  }
+
   updateTask(taskId, {
     Status: TASK_STATUS.ON_TIME,
     Conversation_State: CONVERSATION_STATE.REJECTED,
-    Proposed_Date: '', // Clear proposal since rejected
-    Pending_Changes: '', // Clear pending changes
-    Employee_Reply: '', // Clear employee reply after resolution
+    Pending_Changes: JSON.stringify((pending || []).filter(c => {
+      if (!c) return false;
+      const param = String(c.parameter || '').toLowerCase();
+      const awaitingFrom = String(c.awaitingFrom || '').toLowerCase();
+      const status = String(c.status || 'pending').toLowerCase();
+      const requestedBy = String(c.requestedBy || '').toLowerCase();
+      // Remove only the dueDate item that was awaiting boss decision.
+      return !(param === 'duedate' && awaitingFrom === 'boss' && status === 'pending' && requestedBy === 'employee');
+    })),
+    Derived_Due_Date_Proposed: '',
     Last_Updated: new Date()
   });
   
@@ -617,7 +609,12 @@ function handleRejectDateChange(taskId, data) {
     Logger.log(`Auto-email suppressed for boss-rejected date change (task ${taskId})`);
   }
   
-  logInteraction(taskId, `Boss rejected date change: ${rejectionMessage}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+  appendSystemEvent(
+    taskId,
+    'system_boss_rejected_due_date',
+    `Boss rejected date change: ${rejectionMessage}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+    { source: 'dashboard_action', action: 'reject_date_change', threadId: result.threadId || null }
+  );
   
   return { 
     success: true, 
@@ -656,17 +653,21 @@ function handleBossProposeDate(taskId, data) {
   
   // Update task with boss's proposal
   updateTask(taskId, {
-    Proposed_Date: data.newDate,
     Status: TASK_STATUS.ON_TIME,
     Conversation_State: CONVERSATION_STATE.BOSS_PROPOSED,
     Pending_Changes: JSON.stringify([{
       id: 'date_change_' + Date.now(),
       parameter: 'dueDate',
+      changeType: 'date_change',
       currentValue: task.Due_Date,
       proposedValue: data.newDate,
       requestedBy: 'boss',
+      awaitingFrom: 'employee',
+      requiresApproval: true,
+      status: 'pending',
       reasoning: data.message || 'Boss proposed alternative date'
     }]),
+    Derived_Due_Date_Proposed: data.newDate,
     Last_Updated: new Date()
   });
   
@@ -702,7 +703,12 @@ function handleBossProposeDate(taskId, data) {
     Logger.log(`Auto-email suppressed for boss-proposed date (task ${taskId})`);
   }
   
-  logInteraction(taskId, `Boss proposed alternative date: ${data.newDate}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+  appendSystemEvent(
+    taskId,
+    'system_boss_proposed_due_date',
+    `Boss proposed alternative date: ${data.newDate}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+    { source: 'dashboard_action', action: 'negotiate_date', threadId: result.threadId || null, proposedDueDate: data.newDate }
+  );
   
   return { 
     success: true, 
@@ -725,19 +731,11 @@ function handleForceMeeting(taskId) {
 
 // Category C2: Review_Scope handlers
 function handleProvideClarification(taskId, data) {
-  // #region agent log
-  Logger.log('[DEBUG] handleProvideClarification entry: ' + JSON.stringify({location:'DashboardActions.gs:712',message:'handleProvideClarification entry',data:{taskId:taskId,hasClarification:!!data.clarification},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'}));
-  // #endregion
-  
   if (!data.clarification) {
     return { success: false, message: 'Clarification text required' };
   }
   
   const task = getTask(taskId);
-  
-  // #region agent log
-  Logger.log('[DEBUG] handleProvideClarification task loaded: ' + JSON.stringify({location:'DashboardActions.gs:720',message:'handleProvideClarification task loaded',data:{taskId:taskId,primaryThreadId:task.Primary_Thread_ID,assigneeEmail:task.Assignee_Email},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'A'}));
-  // #endregion
   
   const currentContext = task.Context_Hidden || '';
   const newContext = currentContext + '\n\nClarification: ' + data.clarification;
@@ -746,7 +744,6 @@ function handleProvideClarification(taskId, data) {
     Context_Hidden: newContext,
     Status: TASK_STATUS.ON_TIME,
     Conversation_State: CONVERSATION_STATE.RESOLVED, // Issue resolved after clarification
-    Employee_Reply: '', // Clear employee reply after review
   });
   
   // Send clarification email with context
@@ -754,16 +751,10 @@ function handleProvideClarification(taskId, data) {
   const assigneeName = staff ? staff.Name : task.Assignee_Email;
   let emailBody = `Hello ${assigneeName},\n\n`;
   
-  // Acknowledge their question
-  if (task.Employee_Reply) {
-    emailBody += `Thank you for your question about the task scope. `;
-  }
+  // Acknowledge their question (conversation history is canonical).
+  emailBody += `Thank you for your message. `;
   
   emailBody += `Here's additional clarification:\n\n${data.clarification}\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
-  
-  // #region agent log
-  Logger.log('[DEBUG] handleProvideClarification before sendEmailToAssignee: ' + JSON.stringify({location:'DashboardActions.gs:738',message:'handleProvideClarification before sendEmailToAssignee',data:{taskId:taskId,emailBodyLength:emailBody.length,hasTaskIdInBody:emailBody.includes('Task ID: ' + taskId)},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'B'}));
-  // #endregion
   
   const result = sendEmailToAssignee(
     taskId,
@@ -775,11 +766,12 @@ function handleProvideClarification(taskId, data) {
     }
   );
   
-  // #region agent log
-  Logger.log('[DEBUG] handleProvideClarification after sendEmailToAssignee: ' + JSON.stringify({location:'DashboardActions.gs:750',message:'handleProvideClarification after sendEmailToAssignee',data:{taskId:taskId,resultSuccess:result.success,resultThreadId:result.threadId,resultMessageId:result.messageId},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'C'}));
-  // #endregion
-  
-  logInteraction(taskId, `Clarification sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+  appendSystemEvent(
+    taskId,
+    'system_clarification_sent',
+    `Clarification sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+    { source: 'dashboard_action', action: 'provide_clarification', threadId: result.threadId || null, messageId: result.messageId || null }
+  );
 
   // Immediately record this outgoing boss message in conversation history so it shows up
   // in the dashboard without waiting for email polling/indexing.
@@ -855,18 +847,6 @@ function handleCancelTask(taskId) {
 
 // Task deletion handler
 function handleDeleteTask(taskId) {
-  // #region agent log
-  Logger.log(JSON.stringify({
-    sessionId: 'debug-session',
-    runId: 'run1',
-    hypothesisId: 'A',
-    location: 'DashboardActions.gs:502',
-    message: 'handleDeleteTask entry',
-    data: { taskId: taskId },
-    timestamp: Date.now()
-  }));
-  // #endregion
-  
   if (!taskId) {
     Logger.log('Error: taskId is required for deletion');
     return { success: false, message: 'Task ID is required' };
@@ -874,73 +854,17 @@ function handleDeleteTask(taskId) {
   
   const task = getTask(taskId);
   if (!task) {
-    // #region agent log
-    Logger.log(JSON.stringify({
-      sessionId: 'debug-session',
-      runId: 'run1',
-      hypothesisId: 'A',
-      location: 'DashboardActions.gs:515',
-      message: 'handleDeleteTask - task not found',
-      data: { taskId: taskId },
-      timestamp: Date.now()
-    }));
-    // #endregion
     return { success: false, message: 'Task not found' };
   }
-  
-  // #region agent log
-  Logger.log(JSON.stringify({
-    sessionId: 'debug-session',
-    runId: 'run1',
-    hypothesisId: 'A',
-    location: 'DashboardActions.gs:525',
-    message: 'handleDeleteTask - task found, deleting',
-    data: { taskId: taskId, taskName: task.Task_Name },
-    timestamp: Date.now()
-  }));
-  // #endregion
   
   try {
     const deleted = deleteRowByValue(SHEETS.TASKS_DB, 'Task_ID', taskId);
     if (deleted) {
-      // #region agent log
-      Logger.log(JSON.stringify({
-        sessionId: 'debug-session',
-        runId: 'run1',
-        hypothesisId: 'A',
-        location: 'DashboardActions.gs:533',
-        message: 'handleDeleteTask - deletion successful',
-        data: { taskId: taskId },
-        timestamp: Date.now()
-      }));
-      // #endregion
       return { success: true, message: 'Task deleted successfully' };
     } else {
-      // #region agent log
-      Logger.log(JSON.stringify({
-        sessionId: 'debug-session',
-        runId: 'run1',
-        hypothesisId: 'A',
-        location: 'DashboardActions.gs:541',
-        message: 'handleDeleteTask - deletion failed (row not found)',
-        data: { taskId: taskId },
-        timestamp: Date.now()
-      }));
-      // #endregion
       return { success: false, message: 'Failed to delete task - row not found in sheet' };
     }
   } catch (error) {
-    // #region agent log
-    Logger.log(JSON.stringify({
-      sessionId: 'debug-session',
-      runId: 'run1',
-      hypothesisId: 'A',
-      location: 'DashboardActions.gs:550',
-      message: 'handleDeleteTask - exception',
-      data: { taskId: taskId, error: error.toString(), stack: error.stack },
-      timestamp: Date.now()
-    }));
-    // #endregion
     Logger.log('Error deleting task: ' + error.toString());
     Logger.log('Stack trace: ' + (error.stack || 'No stack trace'));
     return { success: false, message: 'Error deleting task: ' + error.toString() };
@@ -973,10 +897,8 @@ function handleOverrideRole(taskId, data) {
   const assigneeName = staff ? staff.Name : task.Assignee_Email;
   let emailBody = `Hello ${assigneeName},\n\n`;
   
-  // Acknowledge their concern
-  if (task.Employee_Reply) {
-    emailBody += `Thank you for sharing your concerns. After reviewing the task assignment, `;
-  }
+  // Acknowledge their concern (canonical source is Conversation_History).
+  emailBody += `Thank you for sharing your concerns. After reviewing the task assignment, `;
   
   emailBody += `this task is indeed your responsibility. We expect you to proceed with it as assigned. If you have specific concerns, please let us know.\n\nThank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
   
@@ -993,10 +915,14 @@ function handleOverrideRole(taskId, data) {
   updateTask(taskId, { 
     Status: TASK_STATUS.ON_TIME,
     Conversation_State: CONVERSATION_STATE.RESOLVED, // Issue resolved after override
-    Employee_Reply: '', // Clear employee reply after review
   });
   
-  logInteraction(taskId, `Override email sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+  appendSystemEvent(
+    taskId,
+    'system_override_role_sent',
+    `Override email sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+    { source: 'dashboard_action', action: 'override_role', threadId: result.threadId || null, messageId: result.messageId || null }
+  );
   
   return { success: true, message: 'Override email sent' };
 }
@@ -1030,7 +956,6 @@ function handleApproveDone(taskId) {
   updateTask(taskId, { 
     Status: TASK_STATUS.CLOSED,
     Conversation_State: CONVERSATION_STATE.RESOLVED, // Completion approved, issue resolved
-    Employee_Reply: '', // Clear employee reply after approval
   });
   return { success: true, message: 'Task marked as done' };
 }
@@ -1064,7 +989,12 @@ function handleRequestProof(taskId, data) {
     }
   );
   
-  logInteraction(taskId, `Proof request sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+  appendSystemEvent(
+    taskId,
+    'system_proof_request_sent',
+    `Proof request sent${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+    { source: 'dashboard_action', action: 'request_proof', threadId: result.threadId || null, messageId: result.messageId || null }
+  );
   
   return { success: true, message: 'Proof request sent' };
 }
@@ -1094,7 +1024,6 @@ function handleAcknowledgeUpdate(taskId) {
   updateTask(taskId, { 
     Status: TASK_STATUS.ON_TIME,
     Conversation_State: CONVERSATION_STATE.RESOLVED, // Update acknowledged, issue resolved
-    Employee_Reply: '', // Clear employee reply after acknowledgment
   });
   return { success: true, message: 'Update acknowledged' };
 }
@@ -1104,7 +1033,7 @@ function handleClarifyUpdate(taskId, data) {
     return { success: false, message: 'Clarification required' };
   }
   
-  logInteraction(taskId, `Boss requested clarification: ${data.clarification}`);
+  appendSystemEvent(taskId, 'system_boss_requested_clarification', `Boss requested clarification: ${data.clarification}`, { source: 'dashboard_action', action: 'clarify_update' });
   return { success: true, message: 'Clarification logged' };
 }
 
@@ -1545,6 +1474,8 @@ function doGet(e) {
           // AI metadata
           aiConfidence: task.AI_Confidence || null,
           toneDetected: task.Tone_Detected || '',
+          
+          // No legacy fields: Conversation_History + derived snapshot are canonical.
         };
       });
       
@@ -2548,7 +2479,8 @@ function handleForceReprocess(taskId) {
     
     // Re-run AI processing on the task
     // This would typically call the AI processing function
-    logInteraction(taskId, 'Force reprocess initiated');
+    // Canonical audit trail belongs in Conversation_History (append-only).
+    appendSystemEvent(taskId, 'force_reprocess_initiated', 'Force reprocess initiated', { source: 'dashboard' });
     
     // For now, just log and return success
     // In a full implementation, this would call processVoiceNote or similar
@@ -2642,7 +2574,12 @@ function handleApproveChange(taskId, data) {
     
     // IMPORTANT: Do not apply or send here. Approvals are applied only AFTER the boss sends a message,
     // and only when AI-derived truth attributes the approved value to that boss message.
-    logInteraction(taskId, `${bossName} generated approval draft for ${parameter} (proposedValue=${proposedValue}). Not sent yet.`);
+    appendSystemEvent(
+      taskId,
+      'draft_generated',
+      `${bossName} generated approval draft for ${parameter} (proposedValue=${proposedValue}). Not sent yet.`,
+      { source: 'dashboard', kind: 'approve_change_draft', parameter: parameter, proposedValue: proposedValue }
+    );
     return {
       success: true,
       message: 'Draft generated (not sent). Review/edit and send via send_message.',
@@ -2680,7 +2617,12 @@ function handleRejectChange(taskId, data) {
     
     // IMPORTANT: Do not apply or send here. Rejections are applied only AFTER the boss sends a message,
     // and only when AI-derived truth attributes the rejection to that boss message.
-    logInteraction(taskId, `Generated rejection draft for ${parameter}. Not sent yet.`);
+    appendSystemEvent(
+      taskId,
+      'draft_generated',
+      `Generated rejection draft for ${parameter}. Not sent yet.`,
+      { source: 'dashboard', kind: 'reject_change_draft', parameter: parameter }
+    );
     return {
       success: true,
       message: 'Draft generated (not sent). Review/edit and send via send_message.',
@@ -2719,7 +2661,12 @@ function handleMixedResponse(taskId, data) {
     
     // IMPORTANT: Do not apply or send here. Mixed responses are applied only AFTER the boss sends a message,
     // and only when AI-derived truth attributes the approved values to that boss message.
-    logInteraction(taskId, `Generated mixed-response draft (${approvedChanges.length} approved, ${rejectedChanges.length} rejected). Not sent yet.`);
+    appendSystemEvent(
+      taskId,
+      'draft_generated',
+      `Generated mixed-response draft (${approvedChanges.length} approved, ${rejectedChanges.length} rejected). Not sent yet.`,
+      { source: 'dashboard', kind: 'mixed_response_draft', approvedCount: approvedChanges.length, rejectedCount: rejectedChanges.length }
+    );
     return {
       success: true,
       message: 'Draft generated (not sent). Review/edit and send via send_message.',
@@ -2932,7 +2879,12 @@ function handleSendMessage(taskId, data) {
     // Re-analyze conversation to update state
     const analysisResult = analyzeConversationAndUpdateState(taskId);
     
-    logInteraction(taskId, `Boss sent message to employee${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
+    appendSystemEvent(
+      taskId,
+      'boss_message_sent',
+      `Boss sent message to employee${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`,
+      { source: 'dashboard', threadId: result.threadId || null, gmailMessageId: result.messageId || null }
+    );
     
     return {
       success: true,

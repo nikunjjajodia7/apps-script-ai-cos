@@ -1168,7 +1168,7 @@ function processTestFile() {
   processFileByName('Test recording .m4a');
 }
 
-// NOTE: Legacy Interaction_Log cleanup utilities removed. The canonical audit trail is Conversation_History.
+// NOTE: Legacy Interaction_Log utilities removed. The canonical audit trail is Conversation_History.
 
 /**
  * List all tasks with assignees (helper function)

@@ -35,12 +35,7 @@ function processBossMessage(taskId, message) {
     }
     Logger.log(`Boss message preview: ${emailContent.substring(0, 300)}...`);
     
-    // Check if we've already processed this message
-    const log = task.Interaction_Log || '';
-    if (log.includes(`Message ID: ${messageId}`)) {
-      Logger.log(`Message ${messageId} already processed, skipping`);
-      return;
-    }
+    // Dedupe is handled upstream via Processed_Message_IDs (markMessageAsProcessed).
     
     // Analyze boss message for date changes and instructions
     const analysis = analyzeBossMessageForDateChange(taskId, emailContent);
@@ -68,19 +63,10 @@ function processBossMessage(taskId, message) {
       }
     });
     
-    // Update Last_Boss_Message timestamp
-    updateTask(taskId, {
-      Last_Boss_Message: new Date().toISOString(),
-      Last_Updated: new Date()
-    });
-    
     // If boss specified a new date, update task and request employee approval
     if (analysis.hasDateChange && analysis.newDate) {
       handleBossDateChange(taskId, analysis.newDate, emailContent, messageId);
     } else {
-      // Just log the boss message
-      logInteraction(taskId, `Boss message received: ${emailContent.substring(0, 100)}... (Message ID: ${messageId})`);
-
       // Ensure Conversation_State/Pending_Changes stay in sync for dashboard task cards.
       // Boss messages can change scope/plan without a date change; those should still reflect on the card.
       try {
@@ -117,9 +103,10 @@ function analyzeBossMessageForDateChange(taskId, messageContent) {
     const currentDueDate = task.Due_Date ? 
       Utilities.formatDate(new Date(task.Due_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
       'Not set';
-    const proposedDate = task.Proposed_Date ? 
-      Utilities.formatDate(new Date(task.Proposed_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
-      'None';
+    const derivedProposed = task.Derived_Due_Date_Proposed || '';
+    const proposedDate = derivedProposed
+      ? Utilities.formatDate(new Date(derivedProposed), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy')
+      : 'None';
     
     // Get conversation history to understand context
     let conversationContext = '';
@@ -144,7 +131,7 @@ function analyzeBossMessageForDateChange(taskId, messageContent) {
 Task Details:
 - Task Name: "${task.Task_Name}"
 - Current Due Date: ${currentDueDate}
-- Employee Proposed Date: ${proposedDate}
+- Proposed Due Date (if any): ${proposedDate}
 - Task Status: ${task.Status}
 
 ${conversationContext ? `Recent Conversation Context:\n${conversationContext}\n\n` : ''}
@@ -236,40 +223,35 @@ function handleBossDateChange(taskId, newDate, bossMessage, messageId) {
     const newDateFormatted = Utilities.formatDate(new Date(newDate), tz, 'EEEE, MMMM d, yyyy');
     
     // Boss-proposed date: NOT final until employee confirms.
-    // Record a structured Pending_Decision so employee "ACCEPTANCE" can deterministically confirm/apply.
-    const pendingDecision = {
-      type: 'date_change',
-      parameter: 'dueDate',
-      currentValue: task.Due_Date || null,
-      proposedValue: newDate,
-      requestedBy: 'boss',
-      awaitingFrom: 'employee',
-      messageId: messageId,
-      createdAt: new Date().toISOString()
-    };
-    
-    // Update task with new proposed date (not final until employee confirms)
+    // New system: store as Pending_Changes awaiting employee confirmation.
     updateTask(taskId, {
-      Proposed_Date: newDate,
       // Keep lifecycle status as-is (unless this is first response)
       Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
       // Await explicit assignee confirmation; do NOT treat as resolved
       Conversation_State: CONVERSATION_STATE.AWAITING_EMPLOYEE,
-      Pending_Decision: JSON.stringify(pendingDecision),
       Pending_Changes: JSON.stringify([{
         id: 'date_change_' + Date.now(),
         parameter: 'dueDate',
+        changeType: 'date_change',
         currentValue: task.Due_Date,
         proposedValue: newDate,
         requestedBy: 'boss',
         awaitingFrom: 'employee',
+        requiresApproval: true,
+        status: 'pending',
         reasoning: bossMessage || 'Boss proposed new date'
       }]),
+      Derived_Due_Date_Proposed: newDate,
       Last_Updated: new Date()
     });
     
     Logger.log(`Task ${taskId} proposed date updated to ${newDate}`);
-    logInteraction(taskId, `Boss changed proposed date from ${oldDateFormatted} to ${newDateFormatted} (Message ID: ${messageId})`);
+    appendSystemEvent(
+      taskId,
+      'system_boss_proposed_date',
+      `Boss proposed a new due date from ${oldDateFormatted} to ${newDateFormatted} (Message ID: ${messageId})`,
+      { source: 'email_ingestion', messageId: messageId, proposedDueDate: newDate }
+    );
     
     // Send approval request email to employee
     sendEmployeeApprovalRequest(taskId, newDateFormatted, bossMessage);
@@ -325,9 +307,7 @@ function onTaskAssigned(taskId) {
     
     // Send assignment email
     sendTaskAssignmentEmail(taskId);
-    
-    // Update task with email sent timestamp
-    logInteraction(taskId, 'Task assigned and email sent');
+    appendSystemEvent(taskId, 'system_assignment_email_sent', 'Task assigned and email sent', { source: 'workflow' });
     
   } catch (error) {
     logError(ERROR_TYPE.API_ERROR, 'onTaskAssigned', error.toString(), taskId, error.stack);
@@ -461,12 +441,7 @@ function processReplyEmail(taskId, message) {
       return;
     }
     
-    // Check if we've already processed this message
-    const log = task.Interaction_Log || '';
-    if (log.includes(`Message ID: ${messageId}`)) {
-      Logger.log(`Message ${messageId} already processed, skipping`);
-      return;
-    }
+    // Dedupe is handled upstream via Processed_Message_IDs (markMessageAsProcessed).
     
     // Classify reply type using AI (pass original due date for context)
     Logger.log('Classifying reply type using AI...');
@@ -542,9 +517,6 @@ function processReplyEmail(taskId, message) {
         confidence: classification.confidence
       }
     });
-    
-    // Log the interaction with message ID
-    logInteraction(taskId, `Reply received from ${senderEmail}: ${classification.type} (Message ID: ${messageId})`);
     
     // IMPORTANT: Analyze conversation and update state (new unified model)
     // This derives the conversation state from the full conversation history
@@ -794,43 +766,70 @@ function handleAcceptanceReply(taskId, emailContent, messageId) {
   
   const task = getTask(taskId);
   
-  // If we are awaiting explicit employee confirmation (boss proposed or boss approved),
-  // treat an ACCEPTANCE reply as confirmation and APPLY the change.
-  let pendingDecision = null;
+  // New system: confirmations are represented as Pending_Changes items awaiting the employee.
+  // Treat ACCEPTANCE as confirmation and apply any boss-requested pending changes awaiting employee.
+  let pendingChanges = [];
   try {
-    pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
+    pendingChanges = task.Pending_Changes ? JSON.parse(task.Pending_Changes) : [];
   } catch (e) {
-    pendingDecision = null;
+    pendingChanges = [];
   }
-  
-  if (pendingDecision && pendingDecision.type === 'date_change' && pendingDecision.awaitingFrom === 'employee') {
-    Logger.log(`Employee confirming pending date change`);
-    
-    // Apply the date change now
-    updateTask(taskId, {
-      Due_Date: pendingDecision.proposedValue,
-      Proposed_Date: '',
+
+  const awaitingEmployee = (pendingChanges || []).filter(c => {
+    if (!c) return false;
+    const awaitingFrom = String(c.awaitingFrom || '').toLowerCase();
+    const status = String(c.status || 'pending').toLowerCase();
+    return awaitingFrom === 'employee' && status === 'pending';
+  });
+
+  if (awaitingEmployee.length > 0) {
+    Logger.log(`Employee confirming ${awaitingEmployee.length} pending item(s) awaiting employee`);
+
+    // Apply dueDate confirmation deterministically when present.
+    const dueDateItems = awaitingEmployee.filter(c => String(c.parameter || '').toLowerCase() === 'duedate');
+    const dueDateToApply = dueDateItems.length ? (dueDateItems[dueDateItems.length - 1].proposedValue || '') : '';
+
+    const remaining = (pendingChanges || []).filter(c => {
+      if (!c) return false;
+      const awaitingFrom = String(c.awaitingFrom || '').toLowerCase();
+      const status = String(c.status || 'pending').toLowerCase();
+      // Remove the items we just confirmed
+      return !(awaitingFrom === 'employee' && status === 'pending');
+    });
+
+    const updates = {
       Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
       Conversation_State: CONVERSATION_STATE.RESOLVED,
-      Pending_Decision: '',
-      Pending_Changes: '',
-      Employee_Reply: '',
+      Pending_Changes: JSON.stringify(remaining),
+      Derived_Due_Date_Proposed: '',
       Last_Updated: new Date()
-    });
-    
-    logInteraction(taskId, `Employee confirmed date change. Due date updated to ${pendingDecision.proposedValue} (Message ID: ${messageId})`);
+    };
+
+    if (dueDateToApply) {
+      updates.Due_Date = dueDateToApply;
+      updates.Derived_Due_Date_Effective = dueDateToApply;
+    }
+
+    updateTask(taskId, updates);
+
+    appendSystemEvent(
+      taskId,
+      'system_employee_confirmation',
+      `Employee confirmed pending item(s) (Message ID: ${messageId})`,
+      { source: 'email_ingestion', messageId: messageId, appliedDueDate: dueDateToApply || null }
+    );
     
     // Send confirmation to boss
     try {
       const bossEmail = CONFIG.BOSS_EMAIL();
       const tz = Session.getScriptTimeZone();
       const confirmedDateFormatted = Utilities.formatDate(
-        new Date(pendingDecision.proposedValue), 
+        new Date(dueDateToApply || task.Due_Date), 
         tz, 
         'EEEE, MMMM d, yyyy'
       );
       
-      const subject = `Date Change Confirmed: ${task.Task_Name}`;
+      const subject = `Confirmation: ${task.Task_Name}`;
       const body = `The employee has confirmed the new due date:\n\n` +
         `Task: ${task.Task_Name}\n` +
         `Confirmed Due Date: ${confirmedDateFormatted}\n\n` +
@@ -858,8 +857,8 @@ function handleAcceptanceReply(taskId, emailContent, messageId) {
     Status: TASK_STATUS.ON_TIME,
     Conversation_State: CONVERSATION_STATE.ACTIVE,
   });
-  
-  logInteraction(taskId, `Assignee accepted task (Message ID: ${messageId})`);
+
+  appendSystemEvent(taskId, 'system_employee_acceptance', `Assignee accepted task (Message ID: ${messageId})`, { source: 'email_ingestion', messageId: messageId });
   
   // Optionally send confirmation to assignee
   try {
@@ -902,30 +901,35 @@ function handleDateChangeReply(taskId, proposedDate, emailContent, messageId) {
   
   const task = getTask(taskId);
 
-  // New system: do not write Proposed_Date / Pending_Decision / Employee_Reply / Interaction_Log.
-  // Append the reply to canonical Conversation_History and let Gemini derive Pending_Changes + Derived_*.
-  const nowIso = new Date().toISOString();
-  appendToConversationHistory(taskId, {
-    id: messageId || `reply_${Date.now()}`,
-    messageId: messageId || `reply_${Date.now()}`,
-    timestamp: nowIso,
-    senderEmail: task.Assignee_Email || '',
-    senderName: task.Assignee_Name || '',
-    type: 'email_reply',
-    content: emailContent || '',
-    metadata: { detectedType: 'DATE_CHANGE', extractedDate: finalProposedDate || null }
+  // New system: store as a typed pending change, awaiting boss approval.
+  const pendingItem = {
+    id: 'due_date_change_' + Date.now(),
+    parameter: 'dueDate',
+    changeType: 'date_change',
+    currentValue: task.Due_Date || '',
+    proposedValue: finalProposedDate || '',
+    requestedBy: 'employee',
+    awaitingFrom: 'boss',
+    requiresApproval: true,
+    status: 'pending',
+    reasoning: (emailContent || '').substring(0, 500)
+  };
+
+  updateTask(taskId, {
+    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status, // Move to active if first response
+    Conversation_State: CONVERSATION_STATE.CHANGE_REQUESTED,
+    Pending_Changes: JSON.stringify([pendingItem]),
+    Derived_Due_Date_Proposed: finalProposedDate || '',
+    Last_Updated: new Date()
   });
-
-  // Keep lifecycle active; conversation state is derived.
-  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
-    updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
-  }
-
-  // Derive Conversation_State/Pending_Changes/AI_Summary/Derived_* from canonical conversation
-  analyzeConversationAndUpdateState(taskId);
   
   Logger.log(`Task ${taskId} employee reply stored. Proposed date: ${finalProposedDate || 'none'}`);
-  logInteraction(taskId, `Assignee requested date change to ${finalProposedDate || 'unspecified date'} (Message ID: ${messageId})`);
+  appendSystemEvent(
+    taskId,
+    'system_employee_date_change_requested',
+    `Assignee requested date change to ${finalProposedDate || 'unspecified date'} (Message ID: ${messageId})`,
+    { source: 'email_ingestion', messageId: messageId, proposedDueDate: finalProposedDate || null }
+  );
   
   // Notify boss about date change request
   notifyBossOfReviewRequest(taskId, 'DATE_CHANGE', emailContent, finalProposedDate);
@@ -939,23 +943,27 @@ function handleScopeQuestionReply(taskId, emailContent, messageId) {
   Logger.log(`Handling SCOPE_QUESTION reply for task ${taskId}`);
   
   const task = getTask(taskId);
-  const nowIso = new Date().toISOString();
-  appendToConversationHistory(taskId, {
-    id: messageId || `reply_${Date.now()}`,
-    messageId: messageId || `reply_${Date.now()}`,
-    timestamp: nowIso,
-    senderEmail: task.Assignee_Email || '',
-    senderName: task.Assignee_Name || '',
-    type: 'email_reply',
-    content: emailContent || '',
-    metadata: { detectedType: 'SCOPE_QUESTION' }
+  const pendingItem = {
+    id: 'scope_clarification_' + Date.now(),
+    parameter: 'scope',
+    changeType: 'scope_clarification',
+    currentValue: task.Context_Hidden || '',
+    proposedValue: '',
+    requestedBy: 'employee',
+    awaitingFrom: 'boss',
+    requiresApproval: true,
+    status: 'pending',
+    reasoning: (emailContent || '').substring(0, 500)
+  };
+
+  updateTask(taskId, {
+    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
+    Conversation_State: CONVERSATION_STATE.CHANGE_REQUESTED,
+    Pending_Changes: JSON.stringify([pendingItem]),
+    Last_Updated: new Date()
   });
-  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
-    updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
-  }
-  analyzeConversationAndUpdateState(taskId);
-  
-  logInteraction(taskId, `Assignee has scope questions (Message ID: ${messageId})`);
+
+  appendSystemEvent(taskId, 'system_employee_scope_question', `Assignee has scope questions (Message ID: ${messageId})`, { source: 'email_ingestion', messageId: messageId });
   
   // Notify boss about scope question
   notifyBossOfReviewRequest(taskId, 'SCOPE_QUESTION', emailContent);
@@ -969,23 +977,27 @@ function handleRoleRejectionReply(taskId, emailContent, messageId) {
   Logger.log(`Handling ROLE_REJECTION reply for task ${taskId}`);
   
   const task = getTask(taskId);
-  const nowIso = new Date().toISOString();
-  appendToConversationHistory(taskId, {
-    id: messageId || `reply_${Date.now()}`,
-    messageId: messageId || `reply_${Date.now()}`,
-    timestamp: nowIso,
-    senderEmail: task.Assignee_Email || '',
-    senderName: task.Assignee_Name || '',
-    type: 'email_reply',
-    content: emailContent || '',
-    metadata: { detectedType: 'ROLE_REJECTION' }
+  const pendingItem = {
+    id: 'role_rejection_' + Date.now(),
+    parameter: 'assignee',
+    changeType: 'role_rejection',
+    currentValue: task.Assignee_Email || '',
+    proposedValue: '',
+    requestedBy: 'employee',
+    awaitingFrom: 'boss',
+    requiresApproval: true,
+    status: 'pending',
+    reasoning: (emailContent || '').substring(0, 500)
+  };
+
+  updateTask(taskId, {
+    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
+    Conversation_State: CONVERSATION_STATE.CHANGE_REQUESTED,
+    Pending_Changes: JSON.stringify([pendingItem]),
+    Last_Updated: new Date()
   });
-  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
-    updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
-  }
-  analyzeConversationAndUpdateState(taskId);
-  
-  logInteraction(taskId, `Assignee claims task is not their responsibility (Message ID: ${messageId})`);
+
+  appendSystemEvent(taskId, 'system_employee_role_rejection', `Assignee claims task is not their responsibility (Message ID: ${messageId})`, { source: 'email_ingestion', messageId: messageId });
   
   // Notify boss about role rejection
   notifyBossOfReviewRequest(taskId, 'ROLE_REJECTION', emailContent);
@@ -998,23 +1010,7 @@ function handleOtherReply(taskId, emailContent, messageId) {
   Logger.log(`Handling OTHER reply for task ${taskId}`);
   
   const task = getTask(taskId);
-  const nowIso = new Date().toISOString();
-  appendToConversationHistory(taskId, {
-    id: messageId || `reply_${Date.now()}`,
-    messageId: messageId || `reply_${Date.now()}`,
-    timestamp: nowIso,
-    senderEmail: task.Assignee_Email || '',
-    senderName: task.Assignee_Name || '',
-    type: 'email_reply',
-    content: emailContent || '',
-    metadata: { detectedType: 'OTHER' }
-  });
-  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
-    updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
-  }
-  analyzeConversationAndUpdateState(taskId);
-  
-  logInteraction(taskId, `Received reply (unclassified type) (Message ID: ${messageId})`);
+  appendSystemEvent(taskId, 'system_employee_reply_unclassified', `Received reply (unclassified type) (Message ID: ${messageId})`, { source: 'email_ingestion', messageId: messageId });
   
   // For unclassified replies, still notify boss if task is in NOT_ACTIVE status
   if (task.Status === TASK_STATUS.NOT_ACTIVE) {
@@ -1034,7 +1030,7 @@ function notifyBossOfReviewRequest(taskId, reviewType, emailContent, proposedDat
       return;
     }
 
-    // Optional: suppress DATE_CHANGE notification emails (still store Proposed_Date / conversation state).
+    // Optional: suppress DATE_CHANGE notification emails (the canonical pending change is still stored).
     if (reviewType === 'DATE_CHANGE' && !CONFIG.NOTIFY_BOSS_ON_DATE_CHANGE()) {
       Logger.log(`Boss notification suppressed for DATE_CHANGE (task ${taskId})`);
       return;
@@ -1616,22 +1612,28 @@ function handleSilenceEscalation() {
     assignedTasks.forEach(task => {
       // Check last interaction time
       const lastUpdated = new Date(task.Last_Updated);
+
+      // Parse canonical conversation history for dedupe of follow-up/escalation emails
+      let history = [];
+      try {
+        history = task.Conversation_History ? JSON.parse(task.Conversation_History) : [];
+      } catch (e) {
+        history = [];
+      }
+      const hasFollowupSent = (history || []).some(ev => ev && String(ev.type || '') === 'system_email_followup_sent');
+      const hasEscalationSent = (history || []).some(ev => ev && String(ev.type || '') === 'system_email_escalation_sent');
       
       // Check if we need to send follow-up
       if (lastUpdated < followupThreshold && lastUpdated >= bossAlertThreshold) {
-        // Check if we already sent a follow-up (check Interaction_Log)
-        const log = task.Interaction_Log || '';
-        if (!log.includes('Follow-up email sent')) {
+        if (!hasFollowupSent) {
           sendFollowUpEmail(task.Task_ID);
-          logInteraction(task.Task_ID, 'Follow-up email sent (no response in 24h)');
+          appendSystemEvent(task.Task_ID, 'system_silence_followup_sent', 'Follow-up email sent (no response within threshold)', { source: 'silence_escalation' });
         }
       }
       
       // Check if we need to alert Boss
       if (lastUpdated < bossAlertThreshold) {
-        // Check if we already escalated
-        const log = task.Interaction_Log || '';
-        if (!log.includes('Escalated to Boss')) {
+        if (!hasEscalationSent) {
           // Send escalation email
           sendEscalationEmail(task.Task_ID);
           
@@ -1640,7 +1642,7 @@ function handleSilenceEscalation() {
             Status: TASK_STATUS.PENDING_ACTION,
           });
           
-          logInteraction(task.Task_ID, 'Escalated to Boss (no response in 48h)');
+          appendSystemEvent(task.Task_ID, 'system_silence_escalated', 'Escalated to Boss (no response within threshold)', { source: 'silence_escalation' });
         }
       }
     });
@@ -2016,14 +2018,17 @@ function forceReprocessReply(taskId) {
       Logger.log(`Proceeding anyway (force reprocess mode)`);
     }
     
-    // Remove the Message ID from Interaction_Log to allow reprocessing
-    const currentLog = task.Interaction_Log || '';
-    const logLines = currentLog.split('\n');
-    const filteredLog = logLines.filter(line => !line.includes(`Message ID: ${messageId}`)).join('\n');
-    
-    if (currentLog !== filteredLog) {
-      Logger.log(`Removed Message ID ${messageId} from Interaction_Log to allow reprocessing`);
-      updateTask(taskId, { Interaction_Log: filteredLog });
+    // Remove the messageId from Processed_Message_IDs to allow reprocessing (canonical dedupe)
+    try {
+      const existing = task.Processed_Message_IDs ? JSON.parse(task.Processed_Message_IDs) : [];
+      const arr = Array.isArray(existing) ? existing : [];
+      const filtered = arr.filter(id => String(id) !== String(messageId));
+      if (filtered.length !== arr.length) {
+        Logger.log(`Removed Message ID ${messageId} from Processed_Message_IDs to allow reprocessing`);
+        updateTask(taskId, { Processed_Message_IDs: JSON.stringify(filtered), Last_Updated: new Date() });
+      }
+    } catch (e) {
+      Logger.log(`Warning: Failed to update Processed_Message_IDs during force reprocess: ${e.toString()}`);
     }
     
     // Classify reply type using AI (with improved classification, pass original due date for context)
@@ -2146,7 +2151,7 @@ function testProcessTaskReplies(taskId) {
     processReplyEmail(taskId, latestReply);
     
     Logger.log('✓ Reply processed!');
-    Logger.log('Check the task status and Interaction_Log in your spreadsheet.');
+    Logger.log('Check the task status and Conversation_History/Pending_Changes in your spreadsheet.');
     
   } catch (error) {
     Logger.log(`ERROR: ${error.toString()}`);

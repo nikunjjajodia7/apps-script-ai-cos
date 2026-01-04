@@ -398,7 +398,7 @@ function updateTasksFromMeeting(taskIds, updates) {
   taskIds.forEach(taskId => {
     try {
       updateTask(taskId, updates);
-      logInteraction(taskId, `Updated from meeting: ${JSON.stringify(updates)}`);
+      appendSystemEvent(taskId, 'system_meeting_update', `Updated from meeting: ${JSON.stringify(updates)}`, { source: 'meeting' });
     } catch (error) {
       logError(ERROR_TYPE.DATA_ERROR, 'updateTasksFromMeeting', error.toString(), taskId);
     }

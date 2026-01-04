@@ -1463,7 +1463,7 @@ function generateAssignmentEmail(task) {
 Task Name: ${task.Task_Name}
 Assignee: ${assigneeName}
 Due Date: ${task.Due_Date || 'Not specified'}
-Context: ${task.Context_Hidden || task.Interaction_Log || 'No additional context'}
+Context: ${task.Context_Hidden || 'No additional context'}
 
 Write an email that:
 1. Is polite but authoritative
@@ -1625,132 +1625,8 @@ Return ONLY a valid JSON object (no markdown, no code blocks):
  * Analyze task context and suggest appropriate actions
  * This replaces the simple "approve" button with context-aware actions
  */
-function analyzeTaskContextForActions(taskId) {
-  try {
-    const task = getTask(taskId);
-    if (!task) {
-      Logger.log(`Task ${taskId} not found`);
-      return null;
-    }
-    
-    // Get conversation history
-    let conversationHistory = [];
-    
-    // Parse Conversation_History JSON field (canonical)
-    if (task.Conversation_History) {
-      try {
-        conversationHistory = JSON.parse(task.Conversation_History);
-      } catch (e) {
-        Logger.log('Could not parse Conversation_History');
-      }
-    }
-    
-    if (conversationHistory.length === 0) {
-      Logger.log(`No conversation history found for task ${taskId}`);
-      return getDefaultActionsForStatus(task.Status);
-    }
-    
-    // Build conversation context
-    const conversationText = conversationHistory
-      .map((msg, idx) => {
-        const sender = msg.senderName || msg.senderEmail || (msg.type === 'boss_message' ? 'Boss' : 'Employee');
-        const timestamp = msg.timestamp ? new Date(msg.timestamp).toLocaleString() : `Message ${idx + 1}`;
-        return `[${timestamp}] ${sender}: ${msg.content}`;
-      })
-      .join('\n\n');
-    
-    // Get current state
-    const currentDueDate = task.Due_Date ? 
-      Utilities.formatDate(new Date(task.Due_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
-      'Not set';
-    const proposedDate = task.Derived_Due_Date_Proposed ? 
-      Utilities.formatDate(new Date(task.Derived_Due_Date_Proposed), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
-      'None';
-    
-    const prompt = `You are analyzing a task that requires action from the boss. Based on the conversation history and current state, determine what actions should be available.
-
-Task Details:
-- Task Name: "${task.Task_Name}"
-- Current Status: "${task.Status}"
-- Current Due Date: ${currentDueDate}
-- Proposed Date: ${proposedDate}
-- Employee: ${task.Assignee_Email}
-
-Conversation History:
-${conversationText || 'No conversation history yet'}
-
-Latest Employee Message:
-${task.Employee_Reply || 'None'}
-
-Based on this context, analyze:
-1. What is the employee asking for? (date change, clarification, etc.)
-2. What actions should the boss be able to take?
-3. Should the boss approve, reject, propose alternative, or message the employee?
-4. What is the current approval state? (awaiting_boss, boss_approved, negotiating, etc.)
-
-IMPORTANT: Look at the ENTIRE conversation, not just the latest message. Sometimes approval needs emerge across multiple messages.
-
-Return ONLY a valid JSON object:
-{
-  "primaryAction": {
-    "type": "APPROVE|REJECT|MESSAGE|PROPOSE_ALTERNATIVE|NONE",
-    "label": "Approve Date Change",
-    "description": "Approve the employee's requested date",
-    "icon": "check",
-    "confidence": 0.9,
-    "actionId": "approve_date_change"
-  },
-  "secondaryActions": [
-    {
-      "type": "MESSAGE",
-      "label": "Message Employee",
-      "description": "Send a message explaining why the date cannot be changed",
-      "icon": "message-square",
-      "actionId": "message_employee_reject"
-    },
-    {
-      "type": "PROPOSE_ALTERNATIVE",
-      "label": "Propose Different Date",
-      "description": "Suggest a compromise date",
-      "icon": "calendar",
-      "actionId": "propose_date"
-    }
-  ],
-  "approvalState": "awaiting_boss|boss_approved|boss_rejected|boss_proposed|negotiating",
-  "reasoning": "Employee requested date change to Jan 15. Boss should approve if feasible, or message to explain why not.",
-  "requiresEmployeeConfirmation": true/false,
-  "suggestedMessage": "Optional: Pre-filled message text if boss chooses to message"
-}`;
-
-    const response = callGeminiPro(prompt, { temperature: 0.3 });
-    let jsonText = response.trim();
-    
-    // Clean JSON response
-    if (jsonText.startsWith('```')) {
-      jsonText = jsonText.replace(/^```json\n?/, '').replace(/```$/, '');
-      jsonText = jsonText.replace(/^```\n?/, '').replace(/```$/, '');
-    }
-    
-    const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      jsonText = jsonMatch[0];
-    }
-    
-    const analysis = JSON.parse(jsonText);
-    
-    Logger.log(`Context analysis for ${taskId}:`);
-    Logger.log(`  Primary Action: ${analysis.primaryAction.type} - ${analysis.primaryAction.label}`);
-    Logger.log(`  Approval State: ${analysis.approvalState}`);
-    Logger.log(`  Requires Employee Confirmation: ${analysis.requiresEmployeeConfirmation}`);
-    
-    return analysis;
-    
-  } catch (error) {
-    Logger.log(`Error analyzing context: ${error.toString()}`);
-    // Fallback to default actions based on status
-    return getDefaultActionsForStatus(task.Status);
-  }
-}
+// NOTE: Legacy "context-aware actions" inference has been removed.
+// The new system derives required actions from Conversation_State + Pending_Changes.
 
 /**
  * Analyze conversation history and update task state
@@ -1810,16 +1686,7 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
       });
     }
     
-    // Also include Employee_Reply if not already in history
-    if (task.Employee_Reply && !conversationHistory.some(m => m.content === task.Employee_Reply)) {
-      conversationHistory.push({
-        timestamp: task.Last_Updated || new Date().toISOString(),
-        senderEmail: task.Assignee_Email,
-        senderName: task.Assignee_Name || task.Assignee_Email,
-        type: 'employee_reply',
-        content: task.Employee_Reply
-      });
-    }
+    // No legacy fallbacks: Conversation_History is the sole canonical input.
 
     // Ensure we analyze in chronological order (critical for "last sender" logic and AI context).
     // Some ingestion paths historically used "now" instead of the email's actual timestamp.
@@ -1853,7 +1720,7 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
         Conversation_History: JSON.stringify(conversationHistory),
         Derived_Task_Name: task.Task_Name || '',
         Derived_Due_Date_Effective: task.Due_Date || '',
-        Derived_Due_Date_Proposed: task.Proposed_Date || '',
+        Derived_Due_Date_Proposed: task.Derived_Due_Date_Proposed || '',
         Derived_Scope_Summary: task.Context_Hidden || '',
         Derived_Field_Provenance: JSON.stringify({}),
         Derived_Last_Analyzed_At: new Date().toISOString()
@@ -1862,9 +1729,23 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
       return { success: true, data: result };
     }
     
-    // Build conversation text for AI analysis
+    // Build conversation text for AI analysis.
+    // Root fix: exclude system/audit events so they don't pollute the model's understanding of boss↔employee intent.
     const bossEmail = CONFIG.BOSS_EMAIL();
-    const conversationText = conversationHistory
+    const conversationForAi = (conversationHistory || []).filter(msg => {
+      if (!msg) return false;
+      const actor = (msg.actor || '').toString().trim().toLowerCase();
+      if (actor === 'system' || actor === 'ai') return false;
+      const type = (msg.type || '').toString().trim().toLowerCase();
+      if (type.indexOf('system_') === 0 || type.indexOf('system') !== -1) return false;
+      // Defensive: many system events have empty senderEmail and senderName "System"
+      const senderEmail = (msg.senderEmail || '').toString().trim();
+      const senderName = (msg.senderName || '').toString().trim().toLowerCase();
+      if (!senderEmail && senderName === 'system') return false;
+      return true;
+    });
+
+    const conversationText = conversationForAi
       .map((msg, idx) => {
         const isBoss = msg.senderEmail && msg.senderEmail.toLowerCase() === bossEmail.toLowerCase();
         const sender = isBoss ? 'Boss' : (msg.senderName || 'Employee');
@@ -2061,17 +1942,8 @@ Return ONLY valid JSON:
       analysis.pendingChanges = existingPendingChanges;
     }
 
-    // If we have a Pending_Decision awaiting employee, force the appropriate state.
-    let pendingDecision = null;
-    try {
-      pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
-    } catch (e) {
-      pendingDecision = null;
-    }
-
     const hasAwaitingEmployeePending =
-      (pendingDecision && pendingDecision.awaitingFrom === 'employee') ||
-      (analysis.pendingChanges || []).some(c => c && c.awaitingFrom === 'employee');
+      (analysis.pendingChanges || []).some(c => c && String(c.awaitingFrom || '').toLowerCase() === 'employee' && String(c.status || 'pending').toLowerCase() === 'pending');
 
     if (hasAwaitingEmployeePending && (analysis.conversationState === CONVERSATION_STATE.RESOLVED || analysis.conversationState === CONVERSATION_STATE.ACTIVE)) {
       analysis.conversationState = CONVERSATION_STATE.AWAITING_EMPLOYEE;
@@ -2208,12 +2080,12 @@ Return ONLY valid JSON:
       const fromModelProposed =
         analysis && analysis.taskSnapshot ? _toIsoDate_(analysis.taskSnapshot.dueDateProposed) : '';
       const fromStoredProposed =
-        _toIsoDate_(task.Derived_Due_Date_Proposed || task.Proposed_Date);
+        _toIsoDate_(task.Derived_Due_Date_Proposed);
 
       const fromAnalysisChanges = _extractAcceptedFromChanges_(analysis.pendingChanges || []);
       const fromStoredChanges = _extractAcceptedFromChanges_(existingPendingChanges || []);
 
-      // Prefer: model-proposed (extracted from conversation) → stored Proposed_Date → pending changes
+      // Prefer: model-proposed (extracted from conversation) → stored derived proposed → pending changes
       committedDueDateIso =
         fromModelProposed ||
         fromStoredProposed ||
@@ -2255,7 +2127,7 @@ Return ONLY valid JSON:
     const prevSnapshot = {
       taskName: task.Derived_Task_Name || task.Task_Name || '',
       dueDateEffective: task.Derived_Due_Date_Effective || task.Due_Date || null,
-      dueDateProposed: task.Derived_Due_Date_Proposed || task.Proposed_Date || null,
+      dueDateProposed: task.Derived_Due_Date_Proposed || null,
       scopeSummary: task.Derived_Scope_Summary || task.Context_Hidden || ''
     };
 
@@ -2364,9 +2236,8 @@ Return ONLY valid JSON:
 
     if (shouldWriteBackCanonicalDueDate) {
       updates.Due_Date = effectiveDueDate;
-      updates.Proposed_Date = '';
-      // Defensive cleanup; boss-proposed flows are protected by hasAwaitingEmployeePending above.
-      updates.Pending_Decision = '';
+      // Clear any derived proposed value once committed.
+      updates.Derived_Due_Date_Proposed = '';
     }
 
     // Commit approved scope deltas (idempotent append) when the boss resolved the conversation.
@@ -2455,7 +2326,7 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
     const taskSnapshot = {
       taskName: task.Derived_Task_Name || task.Task_Name || '',
       dueDateEffective: task.Derived_Due_Date_Effective || task.Due_Date || '',
-      dueDateProposed: task.Derived_Due_Date_Proposed || task.Proposed_Date || '',
+      dueDateProposed: task.Derived_Due_Date_Proposed || '',
       scopeSummary: task.Derived_Scope_Summary || task.Context_Hidden || ''
     };
     let provenance = {};
@@ -2570,37 +2441,7 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
   }
 }
 
-/**
- * Extract messages from Interaction_Log format
- * Helper function to parse log entries into structured messages
- */
-function extractMessagesFromInteractionLog(log) {
-  const messages = [];
-  const lines = log.split('\n');
-  let currentMessage = null;
-  
-  for (const line of lines) {
-    // Look for timestamp patterns: "2025-12-20 09:00 - ..."
-    const timestampMatch = line.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})/);
-    if (timestampMatch) {
-      if (currentMessage) {
-        messages.push(currentMessage);
-      }
-      currentMessage = {
-        timestamp: timestampMatch[1],
-        content: line.substring(timestampMatch[0].length + 3).trim()
-      };
-    } else if (currentMessage && line.trim()) {
-      currentMessage.content += '\n' + line.trim();
-    }
-  }
-  
-  if (currentMessage) {
-    messages.push(currentMessage);
-  }
-  
-  return messages;
-}
+// NOTE: Legacy Interaction_Log parsing removed (Conversation_History is canonical).
 
 /**
  * Fallback: Get default actions based on status
