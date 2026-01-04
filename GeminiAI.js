@@ -1636,29 +1636,13 @@ function analyzeTaskContextForActions(taskId) {
     // Get conversation history
     let conversationHistory = [];
     
-    // Try to parse Conversation_History JSON field
+    // Parse Conversation_History JSON field (canonical)
     if (task.Conversation_History) {
       try {
         conversationHistory = JSON.parse(task.Conversation_History);
       } catch (e) {
-        Logger.log('Could not parse Conversation_History, trying Interaction_Log');
+        Logger.log('Could not parse Conversation_History');
       }
-    }
-    
-    // Fallback: Extract from Interaction_Log if Conversation_History not available
-    if (conversationHistory.length === 0 && task.Interaction_Log) {
-      conversationHistory = extractMessagesFromInteractionLog(task.Interaction_Log);
-    }
-    
-    // Also get latest employee reply if available
-    if (task.Employee_Reply && !conversationHistory.some(m => m.content === task.Employee_Reply)) {
-      conversationHistory.push({
-        timestamp: task.Last_Updated || new Date().toISOString(),
-        senderEmail: task.Assignee_Email,
-        senderName: task.Assignee_Name || task.Assignee_Email,
-        type: 'email_reply',
-        content: task.Employee_Reply
-      });
     }
     
     if (conversationHistory.length === 0) {
@@ -1679,8 +1663,8 @@ function analyzeTaskContextForActions(taskId) {
     const currentDueDate = task.Due_Date ? 
       Utilities.formatDate(new Date(task.Due_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
       'Not set';
-    const proposedDate = task.Proposed_Date ? 
-      Utilities.formatDate(new Date(task.Proposed_Date), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
+    const proposedDate = task.Derived_Due_Date_Proposed ? 
+      Utilities.formatDate(new Date(task.Derived_Due_Date_Proposed), Session.getScriptTimeZone(), 'EEEE, MMMM d, yyyy') : 
       'None';
     
     const prompt = `You are analyzing a task that requires action from the boss. Based on the conversation history and current state, determine what actions should be available.
@@ -1691,7 +1675,6 @@ Task Details:
 - Current Due Date: ${currentDueDate}
 - Proposed Date: ${proposedDate}
 - Employee: ${task.Assignee_Email}
-- Approval State: ${task.Approval_State || 'none'}
 
 Conversation History:
 ${conversationText || 'No conversation history yet'}
@@ -1837,6 +1820,21 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
         content: task.Employee_Reply
       });
     }
+
+    // Ensure we analyze in chronological order (critical for "last sender" logic and AI context).
+    // Some ingestion paths historically used "now" instead of the email's actual timestamp.
+    try {
+      conversationHistory = (conversationHistory || []).slice().sort((a, b) => {
+        const ta = new Date((a && a.timestamp) || 0).getTime();
+        const tb = new Date((b && b.timestamp) || 0).getTime();
+        if (!ta && !tb) return 0;
+        if (!ta) return -1;
+        if (!tb) return 1;
+        return ta - tb;
+      });
+    } catch (e) {
+      // If sorting fails, keep original order (better than throwing).
+    }
     
     // If no conversation, default to active state
     if (conversationHistory.length === 0) {
@@ -1880,6 +1878,32 @@ function analyzeConversationAndUpdateState(taskId, newMessage = null) {
     const lastMessage = conversationHistory[conversationHistory.length - 1];
     const lastSenderIsBoss = lastMessage && lastMessage.senderEmail && 
       lastMessage.senderEmail.toLowerCase() === bossEmail.toLowerCase();
+
+    // Determine whether the conversation contains any employee message at all.
+    // This is used to deterministically label the "awaiting first response" state after assignment.
+    const assigneeEmailNorm = (task.Assignee_Email || '').toString().trim().toLowerCase();
+    const hasAnyEmployeeMessage = (conversationHistory || []).some(m => {
+      if (!m) return false;
+      const actor = (m.actor || '').toString().trim().toLowerCase();
+      if (actor === 'employee') return true;
+      const sender = (m.senderEmail || '').toString().trim().toLowerCase();
+      if (assigneeEmailNorm && sender && sender === assigneeEmailNorm) return true;
+      const t = (m.type || '').toString().toLowerCase();
+      if (t.indexOf('employee') !== -1) return true;
+      if (t.indexOf('email_reply') !== -1) return true;
+      return false;
+    });
+
+    // Debug: commit gating visibility (helps diagnose why "resolved" didn't commit effective fields)
+    try {
+      Logger.log(`[COMMIT_DEBUG] bossEmail=${bossEmail || 'unknown'}`);
+      Logger.log(`[COMMIT_DEBUG] conversationHistory.length=${conversationHistory.length}`);
+      Logger.log(`[COMMIT_DEBUG] lastMessage.id=${(lastMessage && (lastMessage.messageId || lastMessage.id)) || 'none'}`);
+      Logger.log(`[COMMIT_DEBUG] lastMessage.senderEmail=${(lastMessage && lastMessage.senderEmail) || 'none'}`);
+      Logger.log(`[COMMIT_DEBUG] lastSenderIsBoss=${!!lastSenderIsBoss}`);
+    } catch (e) {
+      Logger.log(`[COMMIT_DEBUG] failed to log last-sender debug: ${e.toString()}`);
+    }
     
     // Format current task state
     const tz = Session.getScriptTimeZone();
@@ -2054,6 +2078,175 @@ Return ONLY valid JSON:
       analysis.requiresAction = false;
       analysis.summary = analysis.summary || 'Awaiting employee confirmation on proposed change.';
     }
+
+    // If there are still pending items, do NOT allow the state machine to become active/resolved.
+    // This is the core invariant that keeps "pending changes" visible on the task card until agreement is reached.
+    const pendingArr = Array.isArray(analysis.pendingChanges) ? analysis.pendingChanges : [];
+    const hasStillPending = pendingArr.some(c => {
+      if (!c) return false;
+      const status = (c.status || 'pending').toString().toLowerCase();
+      const awaitingFrom = (c.awaitingFrom || '').toString().toLowerCase();
+      // Treat missing status as pending (conservative).
+      const isPendingStatus = status === 'pending' || status === '';
+      const isAwaitingSomeone = awaitingFrom === 'boss' || awaitingFrom === 'employee';
+      return isPendingStatus && (isAwaitingSomeone || c.requiresApproval === true);
+    });
+
+    if (hasStillPending && (analysis.conversationState === CONVERSATION_STATE.RESOLVED || analysis.conversationState === CONVERSATION_STATE.ACTIVE)) {
+      const awaitingEmployee = pendingArr.some(c => c && String(c.awaitingFrom || '').toLowerCase() === 'employee');
+      analysis.conversationState = awaitingEmployee ? CONVERSATION_STATE.AWAITING_EMPLOYEE : CONVERSATION_STATE.CHANGE_REQUESTED;
+      analysis.requiresAction = !awaitingEmployee;
+      analysis.summary = analysis.summary || (awaitingEmployee ? 'Awaiting employee response on pending items.' : 'Pending changes require boss review.');
+    }
+
+    // Deterministic "awaiting first response" rule:
+    // If only boss/system messages exist so far, we are awaiting the employee.
+    if (!hasAnyEmployeeMessage && lastSenderIsBoss && pendingArr.length === 0) {
+      if (analysis.conversationState === CONVERSATION_STATE.ACTIVE || analysis.conversationState === CONVERSATION_STATE.RESOLVED) {
+        analysis.conversationState = CONVERSATION_STATE.AWAITING_EMPLOYEE;
+        analysis.requiresAction = false;
+        analysis.summary = analysis.summary || 'Awaiting employee response.';
+      }
+    }
+
+    // Debug: commit gating inputs
+    try {
+      Logger.log(`[COMMIT_DEBUG] analysis.conversationState=${analysis && analysis.conversationState}`);
+      Logger.log(`[COMMIT_DEBUG] hasAwaitingEmployeePending=${!!hasAwaitingEmployeePending}`);
+      Logger.log(`[COMMIT_DEBUG] pendingChanges.length=${(analysis && analysis.pendingChanges && analysis.pendingChanges.length) || 0}`);
+    } catch (e) {
+      Logger.log(`[COMMIT_DEBUG] failed to log analysis debug: ${e.toString()}`);
+    }
+
+    // ------------------------------------------------------------------
+    // Commit accepted changes on boss-resolved conversations (deterministic)
+    //
+    // Why: The model can correctly summarize "boss approved X" while leaving the
+    // accepted value in a proposed/pending field (e.g. dueDateProposed) and not
+    // moving it into the effective field. Since the UI + writeback pipeline
+    // treat "effective" as the committed truth, we promote/commit here when the
+    // boss is the last sender and the conversation is resolved.
+    // ------------------------------------------------------------------
+    let committedDueDateIso = '';
+    let approvedScopeDelta = '';
+
+    function _isNonEmpty_(v) {
+      return v !== undefined && v !== null && String(v).trim() !== '';
+    }
+
+    function _toIsoDate_(value) {
+      if (!_isNonEmpty_(value)) return '';
+      const s = String(value).trim();
+      const tz2 = Session.getScriptTimeZone();
+      // Already ISO yyyy-MM-dd
+      if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+      // dd-MM-yyyy (Indian)
+      const m1 = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+      if (m1) {
+        const day = parseInt(m1[1], 10);
+        const month = parseInt(m1[2], 10);
+        const year = parseInt(m1[3], 10);
+        const dt = new Date(year, month - 1, day);
+        if (!isNaN(dt.getTime())) return Utilities.formatDate(dt, tz2, 'yyyy-MM-dd');
+      }
+      // dd/MM/yyyy
+      const m2 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (m2) {
+        const day = parseInt(m2[1], 10);
+        const month = parseInt(m2[2], 10);
+        const year = parseInt(m2[3], 10);
+        const dt = new Date(year, month - 1, day);
+        if (!isNaN(dt.getTime())) return Utilities.formatDate(dt, tz2, 'yyyy-MM-dd');
+      }
+      // Fallback: native parsing
+      try {
+        const dt2 = new Date(s);
+        if (!isNaN(dt2.getTime())) return Utilities.formatDate(dt2, tz2, 'yyyy-MM-dd');
+      } catch (e) {}
+      return '';
+    }
+
+    // Collect best-effort candidates from pending changes and proposed fields
+    function _extractAcceptedFromChanges_(changes) {
+      const arr = Array.isArray(changes) ? changes : [];
+      let dueDateCandidate = '';
+      const scopeParts = [];
+      arr.forEach(c => {
+        if (!c) return;
+        const param = String(c.parameter || '').toLowerCase();
+        const changeType = String(c.changeType || '').toLowerCase();
+        const proposed = c.proposedValue;
+        if ((param === 'duedate' || param === 'due_date') && _isNonEmpty_(proposed)) {
+          dueDateCandidate = _toIsoDate_(proposed) || dueDateCandidate;
+        }
+        if (
+          param === 'scope' ||
+          param === 'scopesummary' ||
+          changeType.indexOf('scope') !== -1
+        ) {
+          if (_isNonEmpty_(proposed)) scopeParts.push(String(proposed).trim());
+        }
+      });
+      return { dueDateCandidate: dueDateCandidate, scopeDelta: scopeParts.join('\n') };
+    }
+
+    const lastMsgIdForCommit =
+      (lastMessage && (lastMessage.messageId || lastMessage.id))
+        ? (lastMessage.messageId || lastMessage.id)
+        : null;
+
+    const isBossResolved =
+      lastSenderIsBoss &&
+      analysis.conversationState === CONVERSATION_STATE.RESOLVED &&
+      !hasAwaitingEmployeePending;
+
+    try {
+      Logger.log(`[COMMIT_DEBUG] isBossResolved=${!!isBossResolved}`);
+    } catch (e) {}
+
+    if (isBossResolved) {
+      const fromModelProposed =
+        analysis && analysis.taskSnapshot ? _toIsoDate_(analysis.taskSnapshot.dueDateProposed) : '';
+      const fromStoredProposed =
+        _toIsoDate_(task.Derived_Due_Date_Proposed || task.Proposed_Date);
+
+      const fromAnalysisChanges = _extractAcceptedFromChanges_(analysis.pendingChanges || []);
+      const fromStoredChanges = _extractAcceptedFromChanges_(existingPendingChanges || []);
+
+      // Prefer: model-proposed (extracted from conversation) → stored Proposed_Date → pending changes
+      committedDueDateIso =
+        fromModelProposed ||
+        fromStoredProposed ||
+        fromAnalysisChanges.dueDateCandidate ||
+        fromStoredChanges.dueDateCandidate ||
+        '';
+
+      // Scope delta: prefer explicit pending changes (delta text), not model summary
+      approvedScopeDelta =
+        fromAnalysisChanges.scopeDelta ||
+        fromStoredChanges.scopeDelta ||
+        '';
+
+      if (committedDueDateIso) {
+        analysis.taskSnapshot = analysis.taskSnapshot || {};
+        analysis.taskSnapshot.dueDateEffective = committedDueDateIso;
+        analysis.taskSnapshot.dueDateProposed = null;
+
+        analysis.provenance = analysis.provenance || {};
+        // Ensure writeback gates can pass (provenance ties to last boss message)
+        analysis.provenance.dueDateEffective = {
+          sourceMessageId: lastMsgIdForCommit || '',
+          sourceSnippet: 'Boss approved due date change; system committed proposed → effective.',
+          confidence: 0.85,
+          extractedAt: new Date().toISOString()
+        };
+      }
+
+      // If resolved after a change request, clear pending changes so UI doesn't keep showing proposals.
+      if (analysis.pendingChanges && Array.isArray(analysis.pendingChanges)) {
+        analysis.pendingChanges = [];
+      }
+    }
     
     // -----------------------------
     // Derived truth snapshot write
@@ -2090,15 +2283,61 @@ Return ONLY valid JSON:
     const derivedDueDateProposed = chooseField('dueDateProposed', extractedSnapshot.dueDateProposed, prevSnapshot.dueDateProposed);
     const derivedScopeSummary = chooseField('scopeSummary', extractedSnapshot.scopeSummary, prevSnapshot.scopeSummary);
 
-    // If resolved and not awaiting employee confirmation, we can safely write back the effective due date
-    // into canonical Due_Date (so sheets + dashboard are consistent even for message-driven approvals).
+    // ------------------------------------------------------------------
+    // Apply-after-send (boss-message-driven): write AI-derived values back
+    // to canonical fields ONLY when the boss sent a message and the model's
+    // provenance attributes the derived field to that boss message with
+    // sufficient confidence.
+    // ------------------------------------------------------------------
     const existingDueDate = (task.Due_Date || '').toString().trim();
     const effectiveDueDate = (derivedDueDateEffective || '').toString().trim();
+
+    const lastMsgId = (lastMessage && (lastMessage.messageId || lastMessage.id))
+      ? (lastMessage.messageId || lastMessage.id)
+      : null;
+
+    function getProv_(fieldName) {
+      try {
+        return extractedProv && extractedProv[fieldName] ? extractedProv[fieldName] : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function provMatchesLastBossMessage_(fieldName) {
+      const prov = getProv_(fieldName);
+      if (!prov || !lastMsgId) return false;
+      return String(prov.sourceMessageId || '').trim() === String(lastMsgId).trim();
+    }
+
+    function provConfidenceOk_(fieldName) {
+      const prov = getProv_(fieldName);
+      const conf = prov && typeof prov.confidence === 'number' ? prov.confidence : null;
+      const minConf = (CONFIG.APPLY_AFTER_SEND_MIN_CONFIDENCE && CONFIG.APPLY_AFTER_SEND_MIN_CONFIDENCE()) ? CONFIG.APPLY_AFTER_SEND_MIN_CONFIDENCE() : 0.75;
+      // If confidence missing, be conservative (don't apply).
+      if (conf === null) return false;
+      return conf >= minConf;
+    }
+
+    function shouldWriteBackCanonical_(fieldName, newValue, currentValue) {
+      if (!lastSenderIsBoss) return false;
+      if (analysis.conversationState !== CONVERSATION_STATE.RESOLVED) return false;
+      if (hasAwaitingEmployeePending) return false;
+      if (!newValue || String(newValue).trim() === '') return false;
+      if (String(newValue).trim() === String(currentValue || '').trim()) return false;
+      if (!provMatchesLastBossMessage_(fieldName)) return false;
+      if (!provConfidenceOk_(fieldName)) return false;
+      return true;
+    }
+
     const shouldWriteBackCanonicalDueDate =
-      analysis.conversationState === CONVERSATION_STATE.RESOLVED &&
-      !hasAwaitingEmployeePending &&
-      !!effectiveDueDate &&
-      effectiveDueDate !== existingDueDate;
+      shouldWriteBackCanonical_('dueDateEffective', effectiveDueDate, existingDueDate);
+
+    const shouldWriteBackCanonicalTaskName =
+      shouldWriteBackCanonical_('taskName', derivedTaskName, task.Task_Name);
+
+    const shouldWriteBackCanonicalScopeSummary =
+      shouldWriteBackCanonical_('scopeSummary', derivedScopeSummary, task.Context_Hidden);
 
     // If the proposed due date equals the effective due date in a resolved state, suppress the proposed display.
     const finalDerivedDueDateProposed =
@@ -2128,6 +2367,33 @@ Return ONLY valid JSON:
       updates.Proposed_Date = '';
       // Defensive cleanup; boss-proposed flows are protected by hasAwaitingEmployeePending above.
       updates.Pending_Decision = '';
+    }
+
+    // Commit approved scope deltas (idempotent append) when the boss resolved the conversation.
+    // This is more reliable than relying on the model to emit a perfect final scope summary.
+    if (isBossResolved && approvedScopeDelta) {
+      const existingCtx = (task.Context_Hidden || '').toString().trim();
+      const marker2 = `[Scope Update Approved msg:${lastMsgId || 'unknown'}]`;
+      if (!existingCtx.includes(marker2)) {
+        updates.Context_Hidden =
+          (existingCtx ? (existingCtx + '\n\n') : '') + `${marker2}\n${approvedScopeDelta}`;
+      }
+    }
+
+    if (shouldWriteBackCanonicalTaskName) {
+      updates.Task_Name = String(derivedTaskName || '').trim();
+    }
+
+    // Scope: keep the full scope/history; append an approved scope update note rather than overwriting.
+    if (shouldWriteBackCanonicalScopeSummary) {
+      const existing = (task.Context_Hidden || '').toString().trim();
+      const addition = String(derivedScopeSummary || '').trim();
+      // Idempotency: key the append marker to the boss message id so re-analysis won't duplicate.
+      const marker = `[Scope Update Approved msg:${lastMsgId || 'unknown'}]`;
+      // Avoid duplicate appends if re-analysis runs multiple times.
+      if (addition && !existing.includes(marker)) {
+        updates.Context_Hidden = (existing ? (existing + '\n\n') : '') + `${marker}\n${addition}`;
+      }
     }
 
     // Update task with analyzed state + derived snapshot
@@ -2215,12 +2481,18 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
       
       const conversationState = task.Conversation_State;
       
-      // Determine if approvals should be shown based on state
-      const showApprovals = [
-        CONVERSATION_STATE.CHANGE_REQUESTED,
-        CONVERSATION_STATE.COMPLETION_PENDING,
-        CONVERSATION_STATE.BLOCKER_REPORTED
-      ].includes(conversationState);
+      // Determine if approvals should be shown.
+      // Source-of-truth rule: show approvals when the boss is the next actor AND there is at least one pending item awaiting boss.
+      const pendingArr2 = Array.isArray(pendingChanges) ? pendingChanges : [];
+      const hasBossAwaitingPending = pendingArr2.some(c => {
+        if (!c) return false;
+        const awaitingFrom = (c.awaitingFrom || '').toString().toLowerCase();
+        const status = (c.status || 'pending').toString().toLowerCase();
+        const isPendingStatus = status === 'pending' || status === '';
+        return isPendingStatus && (awaitingFrom === 'boss' || (awaitingFrom === '' && c.requiresApproval === true));
+      });
+
+      const showApprovals = !!taskNeedsAttention(conversationState) && hasBossAwaitingPending;
       
       // Check if boss rejected last (for hiding approvals)
       const bossRejectedLast = conversationState === CONVERSATION_STATE.REJECTED || 
@@ -2228,7 +2500,7 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
       
       return {
         pendingChanges: pendingChanges,
-        showApprovals: showApprovals && pendingChanges.length > 0,
+        showApprovals: showApprovals,
         conversationState: conversationState,
         bossRejectedLast: bossRejectedLast,
         summary: task.AI_Summary || '',
@@ -2237,7 +2509,9 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
         provenance: provenance,
         lastMessageTimestamp: task.Last_Message_Timestamp || '',
         lastMessageSender: task.Last_Message_Sender || '',
-        lastMessageSnippet: task.Last_Message_Snippet || ''
+        lastMessageSnippet: task.Last_Message_Snippet || '',
+        lastMessageSenderEmail: task.Last_Message_Sender_Email || '',
+        lastMessageActor: task.Last_Message_Actor || ''
       };
     }
     
@@ -2279,7 +2553,9 @@ function detectParameterChanges(taskId, forceReanalyze = false) {
       provenance: analysis.provenance || provenance,
       lastMessageTimestamp: task.Last_Message_Timestamp || '',
       lastMessageSender: task.Last_Message_Sender || '',
-      lastMessageSnippet: task.Last_Message_Snippet || ''
+      lastMessageSnippet: task.Last_Message_Snippet || '',
+      lastMessageSenderEmail: task.Last_Message_Sender_Email || '',
+      lastMessageActor: task.Last_Message_Actor || ''
     };
     
   } catch (error) {

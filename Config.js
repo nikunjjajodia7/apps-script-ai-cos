@@ -130,6 +130,62 @@ function setConfigValue(key, value, description = '', category = 'System') {
   }
 }
 
+/**
+ * One-time migration helper: add new config keys to an existing Config sheet.
+ * Safe to run multiple times (idempotent).
+ */
+function addMissingConfigKeys() {
+  try {
+    // Use the same logic as getConfig() to access the spreadsheet
+    let spreadsheet;
+    try {
+      const active = SpreadsheetApp.getActiveSpreadsheet();
+      if (active) spreadsheet = active;
+    } catch (e) {}
+
+    if (!spreadsheet) {
+      const spreadsheetId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+      if (!spreadsheetId) {
+        throw new Error('SPREADSHEET_ID not found in Script Properties. Please run quickSetup() first.');
+      }
+      spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+    }
+
+    const configSheet = spreadsheet.getSheetByName('Config');
+    if (!configSheet) {
+      throw new Error('Config sheet not found. Please run createAllSheets() first.');
+    }
+
+    const data = configSheet.getDataRange().getValues();
+    const existingKeys = new Set();
+    for (let i = 1; i < data.length; i++) {
+      const key = (data[i][0] || '').toString().trim();
+      if (key) existingKeys.add(key);
+    }
+
+    const toAdd = [
+      ['NOTIFY_BOSS_ON_REVIEW_REQUESTS', 'false', 'If true, email boss for any review request (date/scope/role/other). Recommended false to avoid extra notifications.', 'Notifications'],
+      ['AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS', 'false', 'If true, auto-email employees for change-FYI actions (approve/reject/propose). Recommended false; send messages manually via dashboard.', 'Notifications'],
+      ['APPLY_AFTER_SEND_MIN_CONFIDENCE', '0.75', 'Min provenance confidence required to write AI-derived boss-approved values back to canonical fields after send_message.', 'AI'],
+    ];
+
+    const rowsToInsert = toAdd.filter(r => !existingKeys.has(r[0]));
+    if (rowsToInsert.length === 0) {
+      Logger.log('addMissingConfigKeys: nothing to add (all keys already present).');
+      return { success: true, message: 'No new config keys needed.' };
+    }
+
+    const startRow = configSheet.getLastRow() + 1;
+    configSheet.getRange(startRow, 1, rowsToInsert.length, 4).setValues(rowsToInsert);
+    Logger.log(`addMissingConfigKeys: added ${rowsToInsert.length} config keys.`);
+
+    return { success: true, message: `Added ${rowsToInsert.length} config keys.`, addedKeys: rowsToInsert.map(r => r[0]) };
+  } catch (error) {
+    Logger.log('Error in addMissingConfigKeys: ' + error.toString());
+    return { success: false, error: error.toString() };
+  }
+}
+
 // Configuration constants
 const CONFIG = {
   // System
@@ -171,6 +227,12 @@ const CONFIG = {
   // Notifications
   // If false, the system will still record DATE_CHANGE requests but will not email the boss about them.
   NOTIFY_BOSS_ON_DATE_CHANGE: () => getConfigValue('NOTIFY_BOSS_ON_DATE_CHANGE', 'false') === 'true',
+  // If false, suppress ALL boss notification emails for review requests (DATE_CHANGE, SCOPE_QUESTION, ROLE_REJECTION, OTHER).
+  NOTIFY_BOSS_ON_REVIEW_REQUESTS: () => getConfigValue('NOTIFY_BOSS_ON_REVIEW_REQUESTS', 'false') === 'true',
+  // If false, do not auto-email employees for change-FYI actions (approve/reject/propose date, etc.).
+  AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS: () => getConfigValue('AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS', 'false') === 'true',
+  // Apply-after-send: minimum provenance confidence required before writing AI-derived values back to canonical fields.
+  APPLY_AFTER_SEND_MIN_CONFIDENCE: () => parseFloat(getConfigValue('APPLY_AFTER_SEND_MIN_CONFIDENCE', '0.75')),
   
   // Vertex AI
   VERTEX_AI_PROJECT_ID: () => getConfigValue('VERTEX_AI_PROJECT_ID'),

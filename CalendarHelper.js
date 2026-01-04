@@ -140,7 +140,7 @@ function scheduleOneOnOne(taskId, preferredDate, preferredTime, durationMinutes)
     // Create calendar event
     const calendar = CalendarApp.getDefaultCalendar();
     const eventTitle = `1-on-1: ${task.Task_Name}`;
-    const eventDescription = `Task: ${task.Task_Name}\n\nContext: ${task.Context_Hidden || task.Interaction_Log || 'No additional context'}`;
+    const eventDescription = `Task: ${task.Task_Name}\n\nContext: ${task.Context_Hidden || task.Derived_Scope_Summary || 'No additional context'}`;
     
     const event = calendar.createEvent(
       eventTitle,

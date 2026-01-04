@@ -213,7 +213,13 @@ function createTask(taskData) {
   taskData.Initial_Parameters = JSON.stringify(initialSnapshot);
   
   const rowNum = addRow(SHEETS.TASKS_DB, taskData);
-  logInteraction(taskData.Task_ID, `Task created: ${taskData.Task_Name}`);
+  // New system: audit/system events belong in Conversation_History (append-only).
+  // (We intentionally do not maintain Interaction_Log.)
+  try {
+    appendSystemEvent(taskData.Task_ID, 'task_created', `Task created: ${taskData.Task_Name || taskData.Task_ID}`, {});
+  } catch (e) {
+    // Non-fatal: task already created in sheet.
+  }
   
   // Auto-link staff to project if both are present
   if (taskData.Assignee_Email && taskData.Project_Tag) {
@@ -244,13 +250,35 @@ function createTask(taskData) {
  * Update a task
  */
 function updateTask(taskId, updates) {
+  // Hard cutover: never write legacy/back-compat negotiation fields.
+  // If these columns still exist in the sheet, they are ignored by the system and safe to delete.
+  try {
+    const forbidden = [
+      'Employee_Reply',
+      'Interaction_Log',
+      'Proposed_Date',
+      'Pending_Decision',
+      'Approval_State',
+      'Boss_Reply_Draft',
+      'Progress_Update',
+      'Progress_Percentage',
+      'Last_Progress_Update',
+      'Last_Boss_Message',
+      'Last_Employee_Message',
+      'Negotiation_History',
+      'Review_Summary'
+    ];
+    forbidden.forEach(k => {
+      if (updates && Object.prototype.hasOwnProperty.call(updates, k)) delete updates[k];
+    });
+  } catch (e) {
+    // non-fatal
+  }
+
   updates.Last_Updated = new Date();
   const rowNum = updateRowByValue(SHEETS.TASKS_DB, 'Task_ID', taskId, updates);
   if (rowNum) {
-    // Only log if we're not updating Interaction_Log itself (to avoid recursive loop)
-    if (!updates.hasOwnProperty('Interaction_Log')) {
-      logInteraction(taskId, `Task updated: ${JSON.stringify(updates)}`);
-    }
+    // New system: no Interaction_Log; callers should append canonical events to Conversation_History when needed.
     
     // Auto-link staff to project if both are being updated or one is new
     const task = getTask(taskId);
@@ -804,110 +832,13 @@ function findProjectTagByName(searchText) {
 }
 
 /**
- * Log interaction to task's Interaction_Log
- * This function directly updates the sheet to avoid recursive loops
+ * Legacy name kept to avoid breaking older call sites, but it no longer writes Interaction_Log.
+ * Canonical audit trail is Conversation_History (append-only).
  */
 function logInteraction(taskId, message) {
   try {
-    const task = getTask(taskId);
-    if (!task) return;
-    
-    const timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss');
-    const logEntry = `${timestamp} - ${message}`;
-    
-    let currentLog = task.Interaction_Log || '';
-    
-    // Check size BEFORE adding new entry (Google Sheets limit is 50,000 characters)
-    const maxLogSize = 45000; // Leave buffer before 50k limit
-    const estimatedNewSize = currentLog.length + logEntry.length + 1; // +1 for newline
-    
-    // If adding this entry would exceed limit, truncate first
-    if (estimatedNewSize > maxLogSize) {
-      // Extract important data before truncating (Thread IDs, Message IDs)
-      const threadIds = [];
-      const messageIds = [];
-      
-      // Extract Thread IDs
-      const threadIdMatches = currentLog.match(/Thread ID:\s*([a-zA-Z0-9_-]+)/gi);
-      if (threadIdMatches) {
-        threadIdMatches.forEach(match => {
-          const threadId = match.replace(/Thread ID:\s*/i, '').trim();
-          if (threadId && !threadIds.includes(threadId)) {
-            threadIds.push(threadId);
-          }
-        });
-      }
-      
-      // Extract Message IDs
-      const messageIdMatches = currentLog.match(/Message ID:\s*([a-zA-Z0-9_-]+)/gi);
-      if (messageIdMatches) {
-        messageIdMatches.forEach(match => {
-          const messageId = match.replace(/Message ID:\s*/i, '').trim();
-          if (messageId && !messageIds.includes(messageId)) {
-            messageIds.push(messageId);
-          }
-        });
-      }
-      
-      // Split log into lines and keep only most recent entries
-      const logLines = currentLog.split('\n');
-      const maxLines = 150; // Keep last 150 entries
-      
-      // Keep most recent lines
-      let truncatedLines = logLines.slice(-maxLines);
-      
-      // Reconstruct log with preserved Thread IDs and Message IDs
-      let truncatedLog = truncatedLines.join('\n');
-      
-      // Add preserved Thread IDs if not already in truncated log
-      threadIds.forEach(threadId => {
-        if (!truncatedLog.includes(`Thread ID: ${threadId}`)) {
-          truncatedLog = `${truncatedLog}\n${timestamp} - Thread ID: ${threadId} [preserved from truncated log]`;
-        }
-      });
-      
-      // Add preserved Message IDs if not already in truncated log
-      messageIds.forEach(messageId => {
-        if (!truncatedLog.includes(`Message ID: ${messageId}`)) {
-          truncatedLog = `${truncatedLog}\n${timestamp} - Message ID: ${messageId} [preserved from truncated log]`;
-        }
-      });
-      
-      // Add truncation notice
-      const truncationNotice = `${timestamp} - [Log truncated: kept last ${truncatedLines.length} entries, preserved ${threadIds.length} thread ID(s) and ${messageIds.length} message ID(s)]`;
-      truncatedLog = `${truncatedLog}\n${truncationNotice}`;
-      
-      currentLog = truncatedLog;
-      Logger.log(`Interaction_Log truncated for task ${taskId}: kept last ${truncatedLines.length} entries`);
-    }
-    
-    const newLog = currentLog ? `${currentLog}\n${logEntry}` : logEntry;
-    
-    // Final safety check
-    if (newLog.length > maxLogSize) {
-      // Emergency truncation - keep only last 100 lines
-      const logLines = newLog.split('\n');
-      const emergencyLog = logLines.slice(-100).join('\n');
-      const emergencyNotice = `${timestamp} - [Emergency truncation: kept last 100 entries]`;
-      const finalLog = `${emergencyLog}\n${emergencyNotice}\n${logEntry}`;
-      
-      const updates = {
-        Interaction_Log: finalLog,
-        Last_Updated: new Date()
-      };
-      updateRowByValue(SHEETS.TASKS_DB, 'Task_ID', taskId, updates);
-      Logger.log(`Emergency truncation applied for task ${taskId}`);
-      return;
-    }
-    
-    // Directly update the sheet without calling updateTask to avoid recursive loop
-    const updates = {
-      Interaction_Log: newLog,
-      Last_Updated: new Date()
-    };
-    updateRowByValue(SHEETS.TASKS_DB, 'Task_ID', taskId, updates);
-  } catch (error) {
-    Logger.log('Error in logInteraction: ' + error.toString());
+    appendSystemEvent(taskId, 'audit', String(message || ''), { deprecated: true });
+  } catch (e) {
     // Don't throw - logging failures shouldn't break the system
   }
 }

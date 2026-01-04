@@ -27,6 +27,7 @@ function appendToConversationHistory(taskId, message) {
     if (!task) return false;
 
     const normalized = _normalizeConversationEvent_(message);
+    normalized.actor = _inferConversationActor_(task, normalized);
 
     // Parse existing conversation history
     let history = [];
@@ -86,7 +87,9 @@ function appendToConversationHistory(taskId, message) {
     }
 
     const lastSnippet = _makeSnippet_(normalized.content || '');
-    const lastSender = normalized.senderEmail || normalized.senderName || normalized.type || 'unknown';
+    const lastSenderEmail = normalized.senderEmail || '';
+    const lastSender = lastSenderEmail || normalized.senderName || normalized.type || 'unknown';
+    const lastActor = normalized.actor || 'system';
 
     const updateData = {
       Conversation_History: historyJson,
@@ -95,15 +98,11 @@ function appendToConversationHistory(taskId, message) {
       Last_Message_Timestamp: normalized.timestamp,
       Last_Message_Sender: lastSender,
       Last_Message_Snippet: lastSnippet,
+      // Canonical last-message identity fields (avoid name heuristics)
+      Last_Message_Sender_Email: lastSenderEmail,
+      Last_Message_Actor: lastActor,
       Last_Updated: new Date()
     };
-
-    // Preserve existing legacy timestamps (still used in UI/logic)
-    if (normalized.type === 'boss_message' || normalized.type === 'boss_approval' || normalized.type === 'boss_rejection' || normalized.type === 'boss_mixed_response') {
-      updateData.Last_Boss_Message = normalized.timestamp;
-    } else if (normalized.type === 'email_reply' || normalized.type === 'employee_reply') {
-      updateData.Last_Employee_Message = normalized.timestamp;
-    }
 
     updateTask(taskId, updateData);
     return true;
@@ -111,6 +110,24 @@ function appendToConversationHistory(taskId, message) {
     Logger.log(`Error appending to conversation history for task ${taskId}: ${error.toString()}`);
     return false;
   }
+}
+
+/**
+ * Append a system event to the canonical Conversation_History.
+ * Use this instead of any legacy Interaction_Log.
+ */
+function appendSystemEvent(taskId, type, content, metadata) {
+  const nowIso = new Date().toISOString();
+  return appendToConversationHistory(taskId, {
+    id: `system_${Date.now()}`,
+    timestamp: nowIso,
+    senderEmail: '',
+    senderName: 'System',
+    type: type || 'system_event',
+    content: content || '',
+    messageId: null,
+    metadata: metadata || {}
+  });
 }
 
 function _normalizeConversationEvent_(message) {
@@ -145,10 +162,42 @@ function _normalizeConversationEvent_(message) {
   return normalized;
 }
 
+/**
+ * Infer canonical actor (boss|employee|system) for a conversation event.
+ * Root-cause fix: never rely on display names to decide boss vs employee.
+ */
+function _inferConversationActor_(task, normalized) {
+  const type = (normalized.type || '').toString().toLowerCase();
+  const senderEmail = (normalized.senderEmail || '').toString().trim().toLowerCase();
+  const assigneeEmail = (task.Assignee_Email || '').toString().trim().toLowerCase();
+  const bossEmail = (CONFIG.BOSS_EMAIL ? CONFIG.BOSS_EMAIL() : '') || '';
+  const bossEmailNorm = bossEmail.toString().trim().toLowerCase();
+
+  // System events (explicit)
+  if (type.indexOf('system') !== -1 || type.indexOf('ai_') === 0) return 'system';
+
+  // Explicit message types (strongest signal)
+  if (type.indexOf('boss') !== -1) return 'boss';
+  if (type.indexOf('employee') !== -1) return 'employee';
+
+  // Email identity (canonical)
+  if (assigneeEmail && senderEmail && senderEmail === assigneeEmail) return 'employee';
+  if (bossEmailNorm && senderEmail && senderEmail === bossEmailNorm) return 'boss';
+
+  // If we can't tell, fall back safely based on presence of assignee email:
+  // - If the task has an assignee, any non-assignee sender is treated as boss.
+  // - Otherwise default to system.
+  if (assigneeEmail && senderEmail && senderEmail !== assigneeEmail) return 'boss';
+  return 'system';
+}
+
 function _makeSnippet_(text) {
   if (!text) return '';
   const clean = String(text).replace(/\s+/g, ' ').trim();
   return clean.length > 160 ? clean.substring(0, 157) + '...' : clean;
 }
+
+// NOTE: New-system assumption: we do NOT backfill/migrate old tasks.
+// Canonical last-message identity fields are always written on new messages via appendToConversationHistory().
 
 

@@ -540,6 +540,9 @@ function calculateReliabilityScore(staffEmail) {
     
     let completedOnTime = 0;
     let totalCompleted = 0;
+    // New system: do not parse legacy Interaction_Log. If we want an "extensions requested"
+    // signal, derive it from canonical conversation-derived structures.
+    // (Current implementation approximates this from current Pending_Changes.)
     let extensionsRequested = 0;
     let stagnations = 0;
     
@@ -554,9 +557,15 @@ function calculateReliabilityScore(staffEmail) {
         }
       }
       
-      // Count extensions requested
-      if (task.Interaction_Log && task.Interaction_Log.includes('requested date change')) {
-        extensionsRequested++;
+      // Count (current) date-change requests as "extensions requested"
+      try {
+        const pending = task.Pending_Changes ? JSON.parse(task.Pending_Changes) : [];
+        if (Array.isArray(pending)) {
+          const anyDateChange = pending.some(p => p && (p.changeType === 'date_change' || p.parameter === 'dueDate'));
+          if (anyDateChange) extensionsRequested++;
+        }
+      } catch (e) {
+        // ignore parse errors
       }
       
       // Count stagnations (now pending_action)
@@ -746,22 +755,27 @@ function createAllSheets() {
   // Create or get Tasks_DB sheet
   let tasksSheet = spreadsheet.getSheetByName('Tasks_DB');
   const expectedColumns = [
-    'Task_ID', 'Task_Name', 'Status', 'Assignee_Name', 'Assignee_Email', 'Due_Date', 
-    'Proposed_Date', 'Project_Tag', 'Meeting_Action', 'AI_Confidence', 
-    'Tone_Detected', 'Context_Hidden', 'Interaction_Log', 'Boss_Reply_Draft',
-    'Employee_Reply', 'Created_Date', 'Last_Updated', 'Priority',
+    // Core task fields
+    'Task_ID', 'Task_Name', 'Status', 'Assignee_Name', 'Assignee_Email', 'Due_Date',
+    'Project_Tag', 'Meeting_Action', 'AI_Confidence', 'Tone_Detected', 'Context_Hidden',
+    'Created_Date', 'Last_Updated', 'Priority',
     'Calendar_Event_ID', 'Scheduled_Time', 'Previous_Status',
+    
+    // Canonical conversation model (source of truth for negotiation/approval)
     'Conversation_History', 'Conversation_State', 'Pending_Changes', 'AI_Summary',
-    'Approval_State', 'Pending_Decision',
-    'Progress_Update', 'Progress_Percentage', 'Last_Progress_Update',
-    'Last_Boss_Message', 'Last_Employee_Message', 'Message_Count', 'Negotiation_History',
+    'Message_Count',
     'Initial_Parameters',
+
+    // Email thread + dedupe (canonical)
     'Primary_Thread_ID', 'Processed_Message_IDs', 'Last_Reply_Check',
+
     // AI-derived truth snapshot (conversation-as-truth)
     'Derived_Task_Name', 'Derived_Due_Date_Effective', 'Derived_Due_Date_Proposed',
     'Derived_Scope_Summary', 'Derived_Field_Provenance', 'Derived_Last_Analyzed_At',
     // Cheap last-message summary fields (for Task Card snippet)
-    'Last_Message_Timestamp', 'Last_Message_Sender', 'Last_Message_Snippet'
+    'Last_Message_Timestamp', 'Last_Message_Sender', 'Last_Message_Snippet',
+    // Canonical last-message identity fields (no heuristics needed in UI)
+    'Last_Message_Sender_Email', 'Last_Message_Actor'
   ];
   
   if (!tasksSheet) {
@@ -931,7 +945,10 @@ function createAllSheets() {
       ['RELIABILITY_UPDATE_INTERVAL_HOURS', '24', 'Reliability score update interval', 'Scoring'],
       ['EMAIL_SIGNATURE', '[Boss\'s Chief of Staff AI]', 'Email signature', 'Email'],
       ['WEEKLY_MEETING_TITLE', 'Weekly Ops', 'Recurring weekly meeting title', 'Scheduling'],
-      ['NOTIFY_BOSS_ON_DATE_CHANGE', 'false', 'If true, email boss when employee requests a due date change', 'Notifications']
+      ['NOTIFY_BOSS_ON_DATE_CHANGE', 'false', 'If true, email boss when employee requests a due date change', 'Notifications'],
+      ['NOTIFY_BOSS_ON_REVIEW_REQUESTS', 'false', 'If true, email boss for any review request (date/scope/role/other). Recommended false to avoid extra notifications.', 'Notifications'],
+      ['AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS', 'false', 'If true, auto-email employees for change-FYI actions (approve/reject/propose). Recommended false; send messages manually via dashboard.', 'Notifications'],
+      ['APPLY_AFTER_SEND_MIN_CONFIDENCE', '0.75', 'Min provenance confidence required to write AI-derived boss-approved values back to canonical fields after send_message.', 'AI']
     ];
     configSheet.getRange(2, 1, defaultConfig.length, 4).setValues(defaultConfig);
     Logger.log('Created Config sheet with default values');
@@ -1151,215 +1168,7 @@ function processTestFile() {
   processFileByName('Test recording .m4a');
 }
 
-/**
- * Diagnostic function to inspect Interaction_Log entries
- * Run this first to see what's in the logs
- */
-function inspectInteractionLogs() {
-  try {
-    Logger.log('=== Inspecting Interaction_Log entries ===');
-    
-    const tasks = getSheetData(SHEETS.TASKS_DB);
-    Logger.log(`Found ${tasks.length} tasks`);
-    
-    tasks.forEach((task, index) => {
-      if (!task.Interaction_Log) {
-        Logger.log(`Task ${index + 1} (${task.Task_ID}): No Interaction_Log`);
-        return;
-      }
-      
-      const log = task.Interaction_Log;
-      const logLength = log.length;
-      const lineCount = log.split('\n').length;
-      
-      Logger.log(`\nTask ${index + 1} (${task.Task_ID}):`);
-      Logger.log(`  Log length: ${logLength} characters`);
-      Logger.log(`  Line count: ${lineCount}`);
-      Logger.log(`  Contains "Interaction_Log": ${log.includes('"Interaction_Log"')}`);
-      Logger.log(`  Contains "Last_Updated": ${log.includes('"Last_Updated"')}`);
-      Logger.log(`  Contains nested JSON: ${log.includes('"Interaction_Log"') && log.includes('"Last_Updated"')}`);
-      Logger.log(`  First 200 chars: ${log.substring(0, 200)}...`);
-      
-      // Check if it looks corrupted (very long or has nested JSON)
-      if (logLength > 500 || (log.includes('"Interaction_Log"') && log.includes('"Last_Updated"'))) {
-        Logger.log(`  -> This log looks CORRUPTED`);
-      }
-    });
-    
-    Logger.log('\n=== Inspection complete ===');
-    
-  } catch (error) {
-    Logger.log('ERROR in inspectInteractionLogs: ' + error.toString());
-    Logger.log('Stack: ' + (error.stack || 'No stack trace'));
-  }
-}
-
-/**
- * Clean up corrupted Interaction_Log entries
- * This removes the recursive JSON nesting that occurred due to the bug
- */
-function cleanupInteractionLogs() {
-  try {
-    Logger.log('=== Cleaning up Interaction_Log entries ===');
-    
-    const tasks = getSheetData(SHEETS.TASKS_DB);
-    let cleanedCount = 0;
-    
-    tasks.forEach(task => {
-      if (!task.Interaction_Log) return;
-      
-      const log = task.Interaction_Log;
-      const logLength = log.length;
-      
-      // Check if log is corrupted (either has nested JSON or is suspiciously long)
-      const hasNestedJSON = log.includes('"Interaction_Log"') && log.includes('"Last_Updated"');
-      const isSuspiciouslyLong = logLength > 500; // Normal logs should be < 500 chars
-      
-      if (hasNestedJSON || isSuspiciouslyLong) {
-        Logger.log(`Found corrupted log for task: ${task.Task_ID} (${logLength} chars)`);
-        
-        // Extract just the first meaningful log entry
-        const lines = log.split('\n');
-        const firstRealEntry = lines.find(line => 
-          line.includes(' - ') && 
-          !line.includes('"Interaction_Log"') &&
-          !line.includes('"Last_Updated"') &&
-          !line.includes('Task updated:')
-        );
-        
-        if (firstRealEntry) {
-          const cleanLog = firstRealEntry.trim();
-          updateTask(task.Task_ID, { Interaction_Log: cleanLog });
-          cleanedCount++;
-          Logger.log(`  -> Cleaned: "${cleanLog.substring(0, 50)}..."`);
-        } else {
-          // If no clean entry found, create a simple summary
-          const taskName = task.Task_Name || 'Unknown task';
-          const cleanLog = `${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm:ss')} - Task created: ${taskName} (log cleaned)`;
-          updateTask(task.Task_ID, { Interaction_Log: cleanLog });
-          cleanedCount++;
-          Logger.log(`  -> Replaced with summary: "${cleanLog}"`);
-        }
-      }
-    });
-    
-    Logger.log(`=== Cleanup complete: ${cleanedCount} logs cleaned ===`);
-    
-    if (cleanedCount === 0) {
-      Logger.log('No corrupted logs found. All logs appear clean!');
-    }
-    
-  } catch (error) {
-    Logger.log('ERROR in cleanupInteractionLogs: ' + error.toString());
-    Logger.log('Stack: ' + (error.stack || 'No stack trace'));
-  }
-}
-
-/**
- * Clean up verbose JSON logs (simplifies "Task updated" entries)
- * This removes the JSON dumps from update logs, keeping only essential info
- */
-function cleanupVerboseLogs() {
-  try {
-    Logger.log('=== Cleaning up verbose Interaction_Log entries ===');
-    
-    const tasks = getSheetData(SHEETS.TASKS_DB);
-    let cleanedCount = 0;
-    
-    tasks.forEach(task => {
-      if (!task.Interaction_Log) return;
-      
-      const log = task.Interaction_Log;
-      const lines = log.split('\n');
-      const cleanedLines = [];
-      
-      lines.forEach(line => {
-        // If line contains "Task updated:" with JSON, simplify it
-        if (line.includes('Task updated:') && line.includes('{')) {
-          // Extract just the timestamp and action, remove JSON
-          const timestamp = line.split(' - ')[0];
-          cleanedLines.push(`${timestamp} - Task updated`);
-        } else {
-          // Keep other lines as-is
-          cleanedLines.push(line);
-        }
-      });
-      
-      const newLog = cleanedLines.join('\n');
-      
-      // Only update if we actually changed something
-      if (newLog !== log) {
-        updateTask(task.Task_ID, { Interaction_Log: newLog });
-        cleanedCount++;
-        Logger.log(`Cleaned verbose log for task: ${task.Task_ID}`);
-        Logger.log(`  Before: ${log.length} chars, After: ${newLog.length} chars`);
-      }
-    });
-    
-    Logger.log(`=== Cleanup complete: ${cleanedCount} logs cleaned ===`);
-    
-  } catch (error) {
-    Logger.log('ERROR in cleanupVerboseLogs: ' + error.toString());
-    Logger.log('Stack: ' + (error.stack || 'No stack trace'));
-  }
-}
-
-/**
- * Clean a specific task's log by Task_ID
- * Usage: cleanTaskLog('TASK-20251221022155')
- */
-function cleanTaskLog(taskId) {
-  try {
-    Logger.log(`=== Cleaning log for task: ${taskId} ===`);
-    
-    const task = getTask(taskId);
-    if (!task) {
-      Logger.log(`ERROR: Task ${taskId} not found`);
-      return;
-    }
-    
-    if (!task.Interaction_Log) {
-      Logger.log(`Task ${taskId} has no Interaction_Log`);
-      return;
-    }
-    
-    const log = task.Interaction_Log;
-    const lines = log.split('\n');
-    const cleanedLines = [];
-    
-    lines.forEach(line => {
-      // Keep only essential log entries
-      if (line.includes('Task created:')) {
-        cleanedLines.push(line);
-      } else if (line.includes('Task updated:')) {
-        // Simplify update entries
-        const timestamp = line.split(' - ')[0];
-        cleanedLines.push(`${timestamp} - Task updated`);
-      } else if (line.includes('Assignment') || line.includes('Email sent')) {
-        cleanedLines.push(line);
-      }
-      // Skip verbose JSON entries
-    });
-    
-    const newLog = cleanedLines.join('\n');
-    updateTask(taskId, { Interaction_Log: newLog });
-    
-    Logger.log(`✓ Cleaned log for task: ${taskId}`);
-    Logger.log(`  Before: ${log.length} chars, ${log.split('\n').length} lines`);
-    Logger.log(`  After: ${newLog.length} chars, ${newLog.split('\n').length} lines`);
-    
-  } catch (error) {
-    Logger.log('ERROR in cleanTaskLog: ' + error.toString());
-    Logger.log('Stack: ' + (error.stack || 'No stack trace'));
-  }
-}
-
-/**
- * Clean all logs - removes verbose JSON from all tasks
- */
-function cleanAllLogs() {
-  cleanupVerboseLogs();
-}
+// NOTE: Legacy Interaction_Log cleanup utilities removed. The canonical audit trail is Conversation_History.
 
 /**
  * List all tasks with assignees (helper function)
@@ -1599,95 +1408,5 @@ function addCalendarColumnsToTasksDB() {
   }
 }
 
-/**
- * Migration script: Migrate to simplified email tracking system
- * Adds new fields and migrates existing thread IDs from Interaction_Log
- * Run this once after deploying the new schema
- */
-function migrateToSimplifiedEmailTracking() {
-  try {
-    Logger.log('=== Starting migration to simplified email tracking ===');
-    
-    // First, ensure schema is up to date (adds new columns if needed)
-    createAllSheets();
-    Logger.log('Schema updated');
-    
-    // Get all tasks
-    const tasks = getSheetData(SHEETS.TASKS_DB);
-    let migratedCount = 0;
-    let skippedCount = 0;
-    let errorCount = 0;
-    
-    Logger.log(`Found ${tasks.length} task(s) to process`);
-    
-    tasks.forEach(task => {
-      if (!task.Task_ID) {
-        skippedCount++;
-        return;
-      }
-      
-      try {
-        const interactionLog = task.Interaction_Log || '';
-        const updates = {};
-        let hasUpdates = false;
-        
-        // Extract first Thread ID from log if Primary_Thread_ID not set
-        if (!task.Primary_Thread_ID) {
-          const threadIdMatch = interactionLog.match(/Thread ID:\s*([a-zA-Z0-9_-]+)/i);
-          if (threadIdMatch) {
-            const threadId = threadIdMatch[1];
-            
-            // Verify thread still exists
-            try {
-              const thread = GmailApp.getThreadById(threadId);
-              if (thread) {
-                updates.Primary_Thread_ID = threadId;
-                hasUpdates = true;
-                Logger.log(`Task ${task.Task_ID}: Extracted Primary_Thread_ID = ${threadId}`);
-              } else {
-                Logger.log(`Task ${task.Task_ID}: Thread ${threadId} not found, skipping`);
-              }
-            } catch (e) {
-              Logger.log(`Task ${task.Task_ID}: Could not access thread ${threadId}: ${e.toString()}`);
-            }
-          }
-        }
-        
-        // Initialize Processed_Message_IDs if not set
-        if (!task.Processed_Message_IDs) {
-          updates.Processed_Message_IDs = '[]';
-          hasUpdates = true;
-        }
-        
-        // Set Last_Reply_Check if not set
-        if (!task.Last_Reply_Check) {
-          updates.Last_Reply_Check = task.Last_Updated || task.Created_Date || new Date().toISOString();
-          hasUpdates = true;
-        }
-        
-        // Apply updates if any
-        if (hasUpdates) {
-          updateTask(task.Task_ID, updates);
-          migratedCount++;
-        } else {
-          skippedCount++;
-        }
-        
-      } catch (error) {
-        Logger.log(`Error migrating task ${task.Task_ID}: ${error.toString()}`);
-        errorCount++;
-      }
-    });
-    
-    Logger.log(`\n=== Migration complete ===`);
-    Logger.log(`Migrated: ${migratedCount} task(s)`);
-    Logger.log(`Skipped: ${skippedCount} task(s)`);
-    Logger.log(`Errors: ${errorCount} task(s)`);
-    
-  } catch (error) {
-    Logger.log(`ERROR in migration: ${error.toString()}`);
-    Logger.log(`Stack: ${error.stack || 'No stack trace'}`);
-    throw error;
-  }
-}
+// NOTE: Legacy email-tracking migration removed. Threading is handled via Primary_Thread_ID + Task ID search.
 

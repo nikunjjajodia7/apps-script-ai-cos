@@ -109,39 +109,64 @@ function sendTaskAssignmentEmail(taskId) {
     
     // Add Task ID to email body for correlation (in case subject changes)
     emailBody = `${emailBody}\n\n---\nTask ID: ${taskId}`;
-    
-    const emailOptions = {
-      htmlBody: emailBody.replace(/\n/g, '<br>'),
-      name: 'Chief of Staff AI',
-      replyTo: CONFIG.BOSS_EMAIL(),
-    };
-    
-    // Send email
-    GmailApp.sendEmail(
+
+    // Send using canonical helper (handles threading + thread id visibility + Primary_Thread_ID capture)
+    const result = sendEmailToAssignee(
+      taskId,
       task.Assignee_Email,
       subject,
       emailBody,
-      emailOptions
+      {
+        htmlBody: emailBody.replace(/\n/g, '<br>')
+      }
     );
-    
-    // Store email thread ID for correlation
-    // Wait a moment for Gmail to index the email
-    Utilities.sleep(1000);
-    
-    const emailThread = GmailApp.search(`to:${task.Assignee_Email} subject:"${subject}"`, 0, 1)[0];
-    if (emailThread) {
-      const threadId = emailThread.getId();
-      // Store thread ID in dedicated field and Interaction_Log
-      updateTask(taskId, {
-        Primary_Thread_ID: threadId,
-        Last_Reply_Check: new Date().toISOString()
+
+    // Record the outgoing assignment as a canonical conversation event so:
+    // - Last_Message_* is populated immediately
+    // - the dashboard can show "last sender" even before any reply
+    // - AI can derive Conversation_State = awaiting_employee from conversation alone
+    const ts = new Date().toISOString();
+    const assignmentEventId = `assignment_${Date.now()}`;
+    const dueIso = task.Due_Date ? Utilities.formatDate(new Date(task.Due_Date), Session.getScriptTimeZone(), 'yyyy-MM-dd') : '';
+    const assignmentSummary =
+      `Task assigned.\n` +
+      `Task: ${task.Task_Name || ''}\n` +
+      `Due: ${dueIso || 'Not set'}\n` +
+      `Context: ${(task.Context_Hidden || '').toString().substring(0, 500)}`;
+
+    try {
+      appendToConversationHistory(taskId, {
+        id: assignmentEventId,
+        messageId: assignmentEventId,
+        timestamp: ts,
+        senderEmail: CONFIG.BOSS_EMAIL(),
+        senderName: CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss',
+        type: 'assignment_email_sent',
+        content: assignmentSummary,
+        metadata: {
+          source: 'system',
+          emailType: 'assignment',
+          to: task.Assignee_Email,
+          subject: subject,
+          threadId: result.threadId || null,
+          gmailMessageId: result.messageId || null
+        }
       });
-      logInteraction(taskId, `Assignment email sent to ${task.Assignee_Email}. Thread ID: ${threadId}`);
-      Logger.log(`Stored Primary Thread ID: ${threadId} for task ${taskId}`);
-    } else {
-      logInteraction(taskId, `Assignment email sent to ${task.Assignee_Email} (Thread ID lookup failed)`);
-      Logger.log(`Warning: Could not find thread for task ${taskId} immediately after sending`);
+    } catch (e) {
+      Logger.log(`Warning: Failed to append assignment email to conversation history: ${e.toString()}`);
     }
+
+    // Derive conversation state immediately (so new tasks show as awaiting_employee).
+    try {
+      analyzeConversationAndUpdateState(taskId);
+    } catch (e) {
+      Logger.log(`Warning: Failed to analyze conversation after assignment email: ${e.toString()}`);
+    }
+
+    logInteraction(
+      taskId,
+      `Assignment email sent to ${task.Assignee_Email}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}${result.messageId ? ` (Message ID: ${result.messageId})` : ''}`
+    );
     
     return true;
   } catch (error) {

@@ -21,6 +21,9 @@ function processBossMessage(taskId, message) {
     const rawEmailContent = message.getPlainBody();
     const emailContent = cleanEmailContent(rawEmailContent);
     const messageId = message.getId();
+    const messageTsIso = (message && typeof message.getDate === 'function' && message.getDate())
+      ? new Date(message.getDate()).toISOString()
+      : new Date().toISOString();
     
     // Log cleaning results for debugging
     const cleaningPercent = Math.round((1 - emailContent.length / rawEmailContent.length) * 100);
@@ -51,7 +54,7 @@ function processBossMessage(taskId, message) {
     // Store boss message in conversation history (include raw content for debugging)
     appendToConversationHistory(taskId, {
       id: messageId,
-      timestamp: new Date().toISOString(),
+      timestamp: messageTsIso,
       senderEmail: CONFIG.BOSS_EMAIL(),
       senderName: 'Boss',
       type: 'boss_message',
@@ -428,6 +431,9 @@ function processReplyEmail(taskId, message) {
     const rawEmailContent = message.getPlainBody();
     const senderEmail = extractEmailFromString(message.getFrom());
     const messageId = message.getId();
+    const messageTsIso = (message && typeof message.getDate === 'function' && message.getDate())
+      ? new Date(message.getDate()).toISOString()
+      : new Date().toISOString();
     
     Logger.log(`Sender: ${senderEmail}`);
     Logger.log(`Message ID: ${messageId}`);
@@ -523,7 +529,7 @@ function processReplyEmail(taskId, message) {
     // Append to conversation history (include raw content for debugging truncation issues)
     appendToConversationHistory(taskId, {
       id: messageId,
-      timestamp: new Date().toISOString(),
+      timestamp: messageTsIso,
       senderEmail: senderEmail,
       senderName: message.getFrom().match(/^(.+?)\s*</)?.[1] || senderEmail,
       type: 'email_reply',
@@ -896,42 +902,27 @@ function handleDateChangeReply(taskId, proposedDate, emailContent, messageId) {
   
   const task = getTask(taskId);
 
-  // If we were awaiting employee confirmation on a boss-proposed date,
-  // and the employee replied with a (new) date change request, treat this as
-  // a counter-proposal: clear the pending decision and surface as boss action needed.
-  let pendingDecision = null;
-  try {
-    pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
-  } catch (e) {
-    pendingDecision = null;
-  }
-  
-  const isCounterProposal =
-    pendingDecision &&
-    pendingDecision.type === 'date_change' &&
-    pendingDecision.awaitingFrom === 'employee' &&
-    pendingDecision.requestedBy === 'boss';
-  
-  // Keep task active (ON_TIME) - Conversation_State will be set by analyzeConversationAndUpdateState()
-  // Legacy: Also set REVIEW_DATE for backward compatibility with old frontend
-  updateTask(taskId, {
-    Proposed_Date: finalProposedDate || '',
-    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status, // Move to active if first response
-    Employee_Reply: emailContent,
-    Last_Employee_Message: new Date().toISOString(),
-    ...(isCounterProposal ? {
-      Pending_Decision: '',
-      Conversation_State: CONVERSATION_STATE.CHANGE_REQUESTED,
-      Pending_Changes: JSON.stringify([{
-        id: 'date_change_' + Date.now(),
-        parameter: 'dueDate',
-        currentValue: task.Due_Date,
-        proposedValue: finalProposedDate || '',
-        requestedBy: 'employee',
-        reasoning: emailContent.substring(0, 500)
-      }])
-    } : {})
+  // New system: do not write Proposed_Date / Pending_Decision / Employee_Reply / Interaction_Log.
+  // Append the reply to canonical Conversation_History and let Gemini derive Pending_Changes + Derived_*.
+  const nowIso = new Date().toISOString();
+  appendToConversationHistory(taskId, {
+    id: messageId || `reply_${Date.now()}`,
+    messageId: messageId || `reply_${Date.now()}`,
+    timestamp: nowIso,
+    senderEmail: task.Assignee_Email || '',
+    senderName: task.Assignee_Name || '',
+    type: 'email_reply',
+    content: emailContent || '',
+    metadata: { detectedType: 'DATE_CHANGE', extractedDate: finalProposedDate || null }
   });
+
+  // Keep lifecycle active; conversation state is derived.
+  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
+    updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
+  }
+
+  // Derive Conversation_State/Pending_Changes/AI_Summary/Derived_* from canonical conversation
+  analyzeConversationAndUpdateState(taskId);
   
   Logger.log(`Task ${taskId} employee reply stored. Proposed date: ${finalProposedDate || 'none'}`);
   logInteraction(taskId, `Assignee requested date change to ${finalProposedDate || 'unspecified date'} (Message ID: ${messageId})`);
@@ -948,16 +939,21 @@ function handleScopeQuestionReply(taskId, emailContent, messageId) {
   Logger.log(`Handling SCOPE_QUESTION reply for task ${taskId}`);
   
   const task = getTask(taskId);
-  const currentLog = task.Interaction_Log || '';
-  const newLog = currentLog + `\n\nScope question from assignee: ${emailContent.substring(0, 500)}`;
-  
-  // Keep task active (ON_TIME) - Conversation_State will be set by analyzeConversationAndUpdateState()
-  updateTask(taskId, {
-    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
-    Interaction_Log: newLog,
-    Employee_Reply: emailContent,
-    Last_Employee_Message: new Date().toISOString(),
+  const nowIso = new Date().toISOString();
+  appendToConversationHistory(taskId, {
+    id: messageId || `reply_${Date.now()}`,
+    messageId: messageId || `reply_${Date.now()}`,
+    timestamp: nowIso,
+    senderEmail: task.Assignee_Email || '',
+    senderName: task.Assignee_Name || '',
+    type: 'email_reply',
+    content: emailContent || '',
+    metadata: { detectedType: 'SCOPE_QUESTION' }
   });
+  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
+    updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
+  }
+  analyzeConversationAndUpdateState(taskId);
   
   logInteraction(taskId, `Assignee has scope questions (Message ID: ${messageId})`);
   
@@ -973,16 +969,21 @@ function handleRoleRejectionReply(taskId, emailContent, messageId) {
   Logger.log(`Handling ROLE_REJECTION reply for task ${taskId}`);
   
   const task = getTask(taskId);
-  const currentLog = task.Interaction_Log || '';
-  const newLog = currentLog + `\n\nRole rejection from assignee: ${emailContent.substring(0, 500)}`;
-  
-  // Keep task active (ON_TIME) - Conversation_State will be set by analyzeConversationAndUpdateState()
-  updateTask(taskId, {
-    Status: task.Status === TASK_STATUS.NOT_ACTIVE ? TASK_STATUS.ON_TIME : task.Status,
-    Interaction_Log: newLog,
-    Employee_Reply: emailContent,
-    Last_Employee_Message: new Date().toISOString(),
+  const nowIso = new Date().toISOString();
+  appendToConversationHistory(taskId, {
+    id: messageId || `reply_${Date.now()}`,
+    messageId: messageId || `reply_${Date.now()}`,
+    timestamp: nowIso,
+    senderEmail: task.Assignee_Email || '',
+    senderName: task.Assignee_Name || '',
+    type: 'email_reply',
+    content: emailContent || '',
+    metadata: { detectedType: 'ROLE_REJECTION' }
   });
+  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
+    updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
+  }
+  analyzeConversationAndUpdateState(taskId);
   
   logInteraction(taskId, `Assignee claims task is not their responsibility (Message ID: ${messageId})`);
   
@@ -997,12 +998,21 @@ function handleOtherReply(taskId, emailContent, messageId) {
   Logger.log(`Handling OTHER reply for task ${taskId}`);
   
   const task = getTask(taskId);
-  const currentLog = task.Interaction_Log || '';
-  const newLog = currentLog + `\n\nReply from assignee: ${emailContent.substring(0, 500)}`;
-  
-  updateTask(taskId, {
-    Interaction_Log: newLog,
+  const nowIso = new Date().toISOString();
+  appendToConversationHistory(taskId, {
+    id: messageId || `reply_${Date.now()}`,
+    messageId: messageId || `reply_${Date.now()}`,
+    timestamp: nowIso,
+    senderEmail: task.Assignee_Email || '',
+    senderName: task.Assignee_Name || '',
+    type: 'email_reply',
+    content: emailContent || '',
+    metadata: { detectedType: 'OTHER' }
   });
+  if (task.Status === TASK_STATUS.NOT_ACTIVE) {
+    updateTask(taskId, { Status: TASK_STATUS.ON_TIME });
+  }
+  analyzeConversationAndUpdateState(taskId);
   
   logInteraction(taskId, `Received reply (unclassified type) (Message ID: ${messageId})`);
   
@@ -1018,6 +1028,12 @@ function handleOtherReply(taskId, emailContent, messageId) {
  */
 function notifyBossOfReviewRequest(taskId, reviewType, emailContent, proposedDate = null) {
   try {
+    // Global kill-switch: user prefers no additional notification emails for any change/review.
+    if (!CONFIG.NOTIFY_BOSS_ON_REVIEW_REQUESTS || !CONFIG.NOTIFY_BOSS_ON_REVIEW_REQUESTS()) {
+      Logger.log(`Boss notification suppressed for ${reviewType} (task ${taskId})`);
+      return;
+    }
+
     // Optional: suppress DATE_CHANGE notification emails (still store Proposed_Date / conversation state).
     if (reviewType === 'DATE_CHANGE' && !CONFIG.NOTIFY_BOSS_ON_DATE_CHANGE()) {
       Logger.log(`Boss notification suppressed for DATE_CHANGE (task ${taskId})`);

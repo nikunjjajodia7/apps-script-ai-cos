@@ -494,26 +494,31 @@ function handleBossApproveDateChange(taskId, data) {
     Last_Updated: new Date()
   });
 
-  // FYI email to employee (no confirmation required)
-  const staff = getStaff(task.Assignee_Email);
-  const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  
-  let emailBody = `Hello ${assigneeName},\n\n` +
-    `Approved — your due date has been updated.\n\n` +
-    `Task: ${task.Task_Name}\n` +
-    `New Due Date: ${proposedDateFormatted}\n\n` +
-    `If you have any concerns, please let me know.\n\n` +
-    `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
-  
-  const result = sendEmailToAssignee(
-    taskId,
-    task.Assignee_Email,
-    `Due Date Updated: ${task.Task_Name}`,
-    emailBody,
-    {
-      htmlBody: emailBody.replace(/\n/g, '<br>')
-    }
-  );
+  // FYI email to employee is optional; default is OFF.
+  let result = { success: true, threadId: null, messageId: null };
+  if (CONFIG.AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS && CONFIG.AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS()) {
+    const staff = getStaff(task.Assignee_Email);
+    const assigneeName = staff ? staff.Name : task.Assignee_Email;
+    
+    let emailBody = `Hello ${assigneeName},\n\n` +
+      `Approved — your due date has been updated.\n\n` +
+      `Task: ${task.Task_Name}\n` +
+      `New Due Date: ${proposedDateFormatted}\n\n` +
+      `If you have any concerns, please let me know.\n\n` +
+      `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+    
+    result = sendEmailToAssignee(
+      taskId,
+      task.Assignee_Email,
+      `Due Date Updated: ${task.Task_Name}`,
+      emailBody,
+      {
+        htmlBody: emailBody.replace(/\n/g, '<br>')
+      }
+    );
+  } else {
+    Logger.log(`Auto-email suppressed for boss-approved date change (task ${taskId})`);
+  }
   
   logInteraction(taskId, `Boss approved employee-requested date change. Due date updated to ${task.Proposed_Date}.${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
   
@@ -584,28 +589,33 @@ function handleRejectDateChange(taskId, data) {
     Last_Updated: new Date()
   });
   
-  // Send rejection email to employee
-  const staff = getStaff(task.Assignee_Email);
-  const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  
-  let emailBody = `Hello ${assigneeName},\n\n` +
-    `Thank you for your request to change the deadline.\n\n` +
-    `After reviewing your request, we need to maintain the original deadline:\n\n` +
-    `Task: ${task.Task_Name}\n` +
-    `Due Date: ${currentDateFormatted}\n\n` +
-    `${rejectionMessage}\n\n` +
-    `If you have concerns or need to discuss this further, please reply to this email.\n\n` +
-    `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
-  
-  const result = sendEmailToAssignee(
-    taskId,
-    task.Assignee_Email,
-    `Date Change Request: ${task.Task_Name}`,
-    emailBody,
-    {
-      htmlBody: emailBody.replace(/\n/g, '<br>')
-    }
-  );
+  // Rejection email to employee is optional; default is OFF.
+  let result = { success: true, threadId: null, messageId: null };
+  if (CONFIG.AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS && CONFIG.AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS()) {
+    const staff = getStaff(task.Assignee_Email);
+    const assigneeName = staff ? staff.Name : task.Assignee_Email;
+    
+    let emailBody = `Hello ${assigneeName},\n\n` +
+      `Thank you for your request to change the deadline.\n\n` +
+      `After reviewing your request, we need to maintain the original deadline:\n\n` +
+      `Task: ${task.Task_Name}\n` +
+      `Due Date: ${currentDateFormatted}\n\n` +
+      `${rejectionMessage}\n\n` +
+      `If you have concerns or need to discuss this further, please reply to this email.\n\n` +
+      `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+    
+    result = sendEmailToAssignee(
+      taskId,
+      task.Assignee_Email,
+      `Date Change Request: ${task.Task_Name}`,
+      emailBody,
+      {
+        htmlBody: emailBody.replace(/\n/g, '<br>')
+      }
+    );
+  } else {
+    Logger.log(`Auto-email suppressed for boss-rejected date change (task ${taskId})`);
+  }
   
   logInteraction(taskId, `Boss rejected date change: ${rejectionMessage}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
   
@@ -660,32 +670,37 @@ function handleBossProposeDate(taskId, data) {
     Last_Updated: new Date()
   });
   
-  // Send proposal email to employee
-  const staff = getStaff(task.Assignee_Email);
-  const assigneeName = staff ? staff.Name : task.Assignee_Email;
-  const bossMessage = data.message || '';
-  
-  let emailBody = `Hello ${assigneeName},\n\n` +
-    `I'd like to propose a different due date for this task:\n\n` +
-    `Task: ${task.Task_Name}\n` +
-    `Proposed Due Date: ${proposedDateFormatted}\n\n`;
-  
-  if (bossMessage) {
-    emailBody += `Message:\n"${bossMessage}"\n\n`;
-  }
-  
-  emailBody += `Please confirm if this date works for you by replying to this email.\n\n` +
-    `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
-  
-  const result = sendEmailToAssignee(
-    taskId,
-    task.Assignee_Email,
-    `Date Proposal: ${task.Task_Name}`,
-    emailBody,
-    {
-      htmlBody: emailBody.replace(/\n/g, '<br>')
+  // Proposal email to employee is optional; default is OFF.
+  let result = { success: true, threadId: null, messageId: null };
+  if (CONFIG.AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS && CONFIG.AUTO_EMAIL_EMPLOYEE_ON_CHANGE_ACTIONS()) {
+    const staff = getStaff(task.Assignee_Email);
+    const assigneeName = staff ? staff.Name : task.Assignee_Email;
+    const bossMessage = data.message || '';
+    
+    let emailBody = `Hello ${assigneeName},\n\n` +
+      `I'd like to propose a different due date for this task:\n\n` +
+      `Task: ${task.Task_Name}\n` +
+      `Proposed Due Date: ${proposedDateFormatted}\n\n`;
+    
+    if (bossMessage) {
+      emailBody += `Message:\n"${bossMessage}"\n\n`;
     }
-  );
+    
+    emailBody += `Please confirm if this date works for you by replying to this email.\n\n` +
+      `Thank you,\n${CONFIG.EMAIL_SIGNATURE()}`;
+    
+    result = sendEmailToAssignee(
+      taskId,
+      task.Assignee_Email,
+      `Date Proposal: ${task.Task_Name}`,
+      emailBody,
+      {
+        htmlBody: emailBody.replace(/\n/g, '<br>')
+      }
+    );
+  } else {
+    Logger.log(`Auto-email suppressed for boss-proposed date (task ${taskId})`);
+  }
   
   logInteraction(taskId, `Boss proposed alternative date: ${data.newDate}${result.threadId ? ` (Thread ID: ${result.threadId})` : ''}`);
   
@@ -1510,7 +1525,6 @@ function doGet(e) {
           assigneeEmail: task.Assignee_Email || '',
           status: task.Status || TASK_STATUS.AI_ASSIST,
           dueDate: task.Due_Date || '',
-          proposedDate: task.Proposed_Date || '',
           description: task.Context_Hidden || '',
           projectName: task.Project_Tag || '',
           createdAt: task.Created_Date || '',
@@ -1525,14 +1539,12 @@ function doGet(e) {
           lastMessageTimestamp: task.Last_Message_Timestamp || '',
           lastMessageSender: task.Last_Message_Sender || '',
           lastMessageSnippet: task.Last_Message_Snippet || '',
+          lastMessageSenderEmail: task.Last_Message_Sender_Email || '',
+          lastMessageActor: task.Last_Message_Actor || '',
           
           // AI metadata
           aiConfidence: task.AI_Confidence || null,
           toneDetected: task.Tone_Detected || '',
-          
-          // Legacy fields for compatibility
-          employeeReply: task.Employee_Reply || '',
-          interactionLog: task.Interaction_Log || ''
         };
       });
       
@@ -1716,38 +1728,13 @@ function doGet(e) {
       
       // Normalize task status to new system
       const normalizedStatus = normalizeStatus(task.Status);
-      
-      // Generate review summary if this is a review task with employee reply
-      let reviewSummary = null;
-      if ((normalizedStatus === TASK_STATUS.REVIEW_DATE || 
-           normalizedStatus === TASK_STATUS.REVIEW_SCOPE || 
-           normalizedStatus === TASK_STATUS.REVIEW_ROLE) && 
-          task.Employee_Reply) {
-        try {
-          const reviewType = normalizedStatus === TASK_STATUS.REVIEW_DATE ? 'DATE_CHANGE' :
-                           normalizedStatus === TASK_STATUS.REVIEW_SCOPE ? 'SCOPE_QUESTION' :
-                           normalizedStatus === TASK_STATUS.REVIEW_ROLE ? 'ROLE_REJECTION' : 'OTHER';
-          reviewSummary = summarizeReviewRequest(
-            reviewType,
-            task.Employee_Reply,
-            task.Task_Name,
-            task.Due_Date,
-            task.Proposed_Date
-          );
-        } catch (error) {
-          Logger.log('Error generating review summary: ' + error.toString());
-          // Continue without summary
-        }
-      }
-      
-      // Add review summary and normalized status to response
+
+      // Return normalized status (lifecycle) and the stored fields as-is.
+      // UI truth for negotiation/approval is Conversation_State + Pending_Changes + Conversation_History.
       const taskResponse = { 
         ...task,
         Status: normalizedStatus  // Return normalized status
       };
-      if (reviewSummary) {
-        taskResponse.Review_Summary = reviewSummary;
-      }
       
       return ContentService.createTextOutput(JSON.stringify({
         success: true,
@@ -2648,53 +2635,20 @@ function handleApproveChange(taskId, data) {
     if (!parameter || !proposedValue) {
       return { success: false, error: 'parameter and proposedValue are required' };
     }
-
-    // If boss is approving an employee-requested due date, apply it immediately (canonical Due_Date).
-    // Guard: do NOT auto-apply if we are in a boss-proposed flow awaiting employee confirmation.
-    if (parameter === 'dueDate') {
-      const proposedText = String(proposedValue).trim();
-      let newDueDate = null;
-      if (/^\d{4}-\d{2}-\d{2}$/.test(proposedText)) {
-        newDueDate = proposedText;
-      } else {
-        try {
-          const extracted = extractDateFromText(proposedText);
-          if (extracted && /^\d{4}-\d{2}-\d{2}$/.test(extracted)) newDueDate = extracted;
-        } catch (e) {
-          newDueDate = null;
-        }
-      }
-
-      let pendingDecision = null;
-      try {
-        pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
-      } catch (e) {
-        pendingDecision = null;
-      }
-      const isBossProposedAwaitingEmployee =
-        pendingDecision &&
-        pendingDecision.awaitingFrom === 'employee' &&
-        pendingDecision.requestedBy === 'boss' &&
-        pendingDecision.type === 'date_change';
-
-      if (newDueDate && !isBossProposedAwaitingEmployee) {
-        updateTask(taskId, {
-          Due_Date: newDueDate,
-          Proposed_Date: '', // Clear proposal (now canonical)
-          Pending_Decision: '', // Defensive cleanup
-          Status: TASK_STATUS.ON_TIME,
-          Last_Updated: new Date()
-        });
-      }
-    }
     
     const bossName = CONFIG.BOSS_NAME ? CONFIG.BOSS_NAME() : 'Boss';
     const message = buildApprovalMessage_(parameter, proposedValue, draftMessage);
     const subject = `Re: ${task.Task_Name}`;
-
-    const sendResult = handleSendMessage(taskId, { message, subject });
-    logInteraction(taskId, `${bossName} approved ${parameter} via message-driven send (proposedValue=${proposedValue})`);
-    return sendResult;
+    
+    // IMPORTANT: Do not apply or send here. Approvals are applied only AFTER the boss sends a message,
+    // and only when AI-derived truth attributes the approved value to that boss message.
+    logInteraction(taskId, `${bossName} generated approval draft for ${parameter} (proposedValue=${proposedValue}). Not sent yet.`);
+    return {
+      success: true,
+      message: 'Draft generated (not sent). Review/edit and send via send_message.',
+      draftMessage: message,
+      subject: subject
+    };
     
   } catch (error) {
     Logger.log('Error in handleApproveChange: ' + error.toString());
@@ -2723,9 +2677,16 @@ function handleRejectChange(taskId, data) {
 
     const message = buildRejectionMessage_(parameter, rejectionMessage);
     const subject = `Re: ${task.Task_Name}`;
-    const sendResult = handleSendMessage(taskId, { message, subject });
-    logInteraction(taskId, `Boss rejected ${parameter} via message-driven send`);
-    return sendResult;
+    
+    // IMPORTANT: Do not apply or send here. Rejections are applied only AFTER the boss sends a message,
+    // and only when AI-derived truth attributes the rejection to that boss message.
+    logInteraction(taskId, `Generated rejection draft for ${parameter}. Not sent yet.`);
+    return {
+      success: true,
+      message: 'Draft generated (not sent). Review/edit and send via send_message.',
+      draftMessage: message,
+      subject: subject
+    };
     
   } catch (error) {
     Logger.log('Error in handleRejectChange: ' + error.toString());
@@ -2752,53 +2713,19 @@ function handleMixedResponse(taskId, data) {
     if (approvedChanges.length === 0 && rejectedChanges.length === 0) {
       return { success: false, error: 'At least one approved or rejected change is required' };
     }
-
-    // If the mixed response approves an employee-requested due date, apply it immediately.
-    // Guard: do NOT auto-apply if we are in a boss-proposed flow awaiting employee confirmation.
-    try {
-      const dueApproval = (approvedChanges || []).find(c => c && c.parameter === 'dueDate' && c.proposedValue);
-      if (dueApproval) {
-        const proposedText = String(dueApproval.proposedValue).trim();
-        let newDueDate = null;
-        if (/^\d{4}-\d{2}-\d{2}$/.test(proposedText)) {
-          newDueDate = proposedText;
-        } else {
-          const extracted = extractDateFromText(proposedText);
-          if (extracted && /^\d{4}-\d{2}-\d{2}$/.test(extracted)) newDueDate = extracted;
-        }
-
-        let pendingDecision = null;
-        try {
-          pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
-        } catch (e) {
-          pendingDecision = null;
-        }
-        const isBossProposedAwaitingEmployee =
-          pendingDecision &&
-          pendingDecision.awaitingFrom === 'employee' &&
-          pendingDecision.requestedBy === 'boss' &&
-          pendingDecision.type === 'date_change';
-
-        if (newDueDate && !isBossProposedAwaitingEmployee) {
-          updateTask(taskId, {
-            Due_Date: newDueDate,
-            Proposed_Date: '',
-            Pending_Decision: '',
-            Status: TASK_STATUS.ON_TIME,
-            Last_Updated: new Date()
-          });
-        }
-      }
-    } catch (e) {
-      // Best-effort; mixed response should still send even if date parsing fails.
-      Logger.log(`Warning: Failed to auto-apply approved due date: ${e.toString()}`);
-    }
     
     const composed = buildMixedResponseMessage_(approvedChanges, rejectedChanges, message);
     const subject = `Re: ${task.Task_Name}`;
-    const sendResult = handleSendMessage(taskId, { message: composed, subject });
-    logInteraction(taskId, `Boss sent mixed response via message-driven send (${approvedChanges.length} approved, ${rejectedChanges.length} rejected)`);
-    return sendResult;
+    
+    // IMPORTANT: Do not apply or send here. Mixed responses are applied only AFTER the boss sends a message,
+    // and only when AI-derived truth attributes the approved values to that boss message.
+    logInteraction(taskId, `Generated mixed-response draft (${approvedChanges.length} approved, ${rejectedChanges.length} rejected). Not sent yet.`);
+    return {
+      success: true,
+      message: 'Draft generated (not sent). Review/edit and send via send_message.',
+      draftMessage: composed,
+      subject: subject
+    };
     
   } catch (error) {
     Logger.log('Error in handleMixedResponse: ' + error.toString());
@@ -2982,7 +2909,7 @@ function handleSendMessage(taskId, data) {
     }
     
     // Append to conversation history
-    const sentId = `sent_${Date.now()}`;
+    const sentId = result.messageId || `sent_${Date.now()}`;
     appendToConversationHistory(taskId, {
       id: sentId,
       messageId: sentId,
@@ -2993,84 +2920,14 @@ function handleSendMessage(taskId, data) {
       content: message,
       metadata: {
         threadId: result.threadId || null,
-        subject: subject
+        subject: subject,
+        gmailMessageId: result.messageId || null
       }
     });
 
-    // -------------------------------------------------------------
-    // Deterministic canonical apply: employee-requested due date
-    // When the boss uses the generic "send_message" pathway to approve a
-    // requested due date, we should update Due_Date immediately so the
-    // task card reflects the new effective due date (even if AI parsing
-    // is uncertain).
-    // Guard: do NOT auto-apply if we are in a boss-proposed flow awaiting
-    // employee confirmation.
-    // -------------------------------------------------------------
-    try {
-      // Parse existing pending changes
-      let pending = [];
-      try {
-        pending = task.Pending_Changes ? JSON.parse(task.Pending_Changes) : [];
-      } catch (e) {
-        pending = [];
-      }
-
-      const pendingDue = (pending || []).find(c =>
-        c && c.parameter === 'dueDate' && c.requestedBy === 'employee'
-      );
-
-      // Simple approval intent detection
-      const lower = String(message || '').toLowerCase();
-      const looksApproved =
-        (/\b(approved|approve|ok|okay|agreed|yes|sounds good|confirmed)\b/.test(lower)) &&
-        !(/\b(not approved|don'?t approve|cannot|can't|no)\b/.test(lower));
-
-      // Boss-proposed pending decision guard
-      let pendingDecision = null;
-      try {
-        pendingDecision = task.Pending_Decision ? JSON.parse(task.Pending_Decision) : null;
-      } catch (e) {
-        pendingDecision = null;
-      }
-      const isBossProposedAwaitingEmployee =
-        pendingDecision &&
-        pendingDecision.awaitingFrom === 'employee' &&
-        pendingDecision.requestedBy === 'boss' &&
-        pendingDecision.type === 'date_change';
-
-      if (pendingDue && looksApproved && !isBossProposedAwaitingEmployee) {
-        // Prefer an explicit date in the boss message; otherwise use pending proposed value
-        let newDueDate = null;
-        try {
-          const extracted = extractDateFromText(message);
-          if (extracted && /^\d{4}-\d{2}-\d{2}$/.test(extracted)) newDueDate = extracted;
-        } catch (e) {
-          newDueDate = null;
-        }
-
-        if (!newDueDate) {
-          const pv = (pendingDue.proposedValue || task.Proposed_Date || '').toString().trim();
-          if (/^\d{4}-\d{2}-\d{2}$/.test(pv)) newDueDate = pv;
-        }
-
-        if (newDueDate) {
-          updateTask(taskId, {
-            Due_Date: newDueDate,
-            Proposed_Date: '',
-            Pending_Changes: '',
-            Pending_Decision: '',
-            Conversation_State: CONVERSATION_STATE.RESOLVED,
-            // Ensure task card updates immediately (it prefers derived effective due date)
-            Derived_Due_Date_Effective: newDueDate,
-            Derived_Due_Date_Proposed: '',
-            Last_Updated: new Date()
-          });
-          logInteraction(taskId, `Auto-applied employee-requested due date approval via send_message. Due date updated to ${newDueDate}`);
-        }
-      }
-    } catch (e) {
-      Logger.log('Warning: send_message auto-apply failed: ' + e.toString());
-    }
+    // IMPORTANT:
+    // Canonical task updates must be applied ONLY by AI-derived truth after the boss sends the message.
+    // We intentionally avoid deterministic pre-apply here.
     
     // Re-analyze conversation to update state
     const analysisResult = analyzeConversationAndUpdateState(taskId);
